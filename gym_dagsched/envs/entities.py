@@ -8,6 +8,9 @@ class Stage:
     # each stage has a unique id
     id_: int
 
+    # id of job this stage belongs to
+    job_id: int
+
     # number of identical tasks to complete 
     # within the stage
     n_tasks: int
@@ -18,7 +21,7 @@ class Stage:
     worker_type: int
 
     # expected completion time of this stage
-    t_completion: np.ndarray
+    duration: np.ndarray
 
     # time at which a set of workers began
     # processing this stage
@@ -34,13 +37,15 @@ class Worker:
     # environments)
     type_: int
 
-    # current job assigned to this worker
-    job: int
+    # id of current job assigned to this worker
+    job_id: int
 
 
 @dataclass
 class Job:
-    # upper triangle of the dag's adgacency 
+    id_: int
+
+    # lower triangle of the dag's adgacency 
     # matrix stored as a flattened array
     dag: np.ndarray
 
@@ -51,20 +56,25 @@ class Job:
     # nodes of the dag
     stages: typing.Tuple[Stage, ...]
 
+    # number of stages this job consists of
     n_stages: int
 
         
 @dataclass
 class Obs:
-    frontier_stages: np.ndarray
+    wall_time: np.ndarray
     jobs: typing.Tuple[Job, ...]
+    job_count: int
+    frontier_stages_mask: np.ndarray
     workers: typing.Tuple[Worker, ...]
 
 
 @dataclass
 class Action:
+    job_id: int
+
     # which stage to execute next
-    stage: int
+    stage_id: int
 
     # which workers to assign to the stage's job
-    workers: np.ndarray
+    workers_mask: np.ndarray
