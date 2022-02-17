@@ -1,13 +1,17 @@
 from dataclasses import asdict
-import copy
+from copy import deepcopy as dcp
 
 import gym
 from gym.spaces import Dict, Tuple, MultiBinary, Discrete, Box
 import numpy as np
 from dacite import from_dict
-import networkx as nx
 
-from .entities import *
+from .entities.action import Action
+from .entities.obs import Obs
+from .entities.job import Job
+from .entities.stage import Stage
+from .entities.worker import Worker
+from .utils import invalid_time, to_wall_time
 
 class DagSchedEnv(gym.Env):
     def __init__(self,
@@ -45,8 +49,9 @@ class DagSchedEnv(gym.Env):
     """
 
     def reset(self):
-        self.current_state = copy.deepcopy(self.null_obs)
-        return asdict(self.current_state)
+        self.state = dcp(self.null_obs)
+        self._generate_workers()
+        return asdict(self.state)
 
 
     def step(self, action_dict):
@@ -62,25 +67,34 @@ class DagSchedEnv(gym.Env):
         if self.check_action_validity(action):
             self.take_action(action)
 
+        info = {}
+
         # sample time until next job arrival
-        dt = np.random.exponential(self.mean_job_interarrival_time)
-        dt = self.to_wall_time(dt)
+        if self.state.job_count < self.max_jobs:
+            dt = np.random.exponential(self.mean_job_interarrival_time)
+            dt = to_wall_time(dt)
+        else:
+            dt = invalid_time()
 
         # check if event (2) occurs before next arrival
-        
         soonest_completed_stage, soonest_t_completion = \
             self.get_soonest_stage_completion(dt)
 
         if soonest_completed_stage is not None:
+            self.state.wall_time = soonest_t_completion
             self.process_stage_completion(soonest_completed_stage)
-            self.current_state.wall_time = soonest_t_completion
-        else:
+            info['event'] = 'stage completion'
+        elif dt != invalid_time():
+            self.state.wall_time += dt
             job = self.generate_job()
-            self.add_src_nodes_to_frontier(job)
-            self.current_state.wall_time += dt
+            self.state.add_job(job)
+            info['event'] = 'new job arrival'
+        else:
+            info['event'] = 'bruh'
 
-        obs = asdict(self.current_state)
-        return obs, None, None, None
+        # obs = asdict(self.state)
+        obs = self.state
+        return obs, None, None, info
 
 
 
@@ -111,8 +125,9 @@ class DagSchedEnv(gym.Env):
             'n_tasks': self.discrete_inv_space(self.max_tasks),
             'worker_type': self.discrete_inv_space(self.n_workers),
             'duration': self.time_space,
+            'n_workers': self.discrete_inv_space(self.n_workers),
             't_accepted': self.time_space,
-            'n_workers': self.discrete_inv_space(self.n_workers)
+            't_completed': self.time_space
         })
 
         self.job_space = Dict({
@@ -154,53 +169,42 @@ class DagSchedEnv(gym.Env):
             job_id=-1,
             n_tasks=-1, 
             worker_type=-1, 
-            duration=self.invalid_time(),
-            t_accepted=self.invalid_time(),
-            n_workers=-1
+            duration=invalid_time(),
+            n_workers=-1,
+            t_accepted=invalid_time(),
+            t_completed=invalid_time()
         )        
 
         self.null_job = Job(
             id_=-1,
             dag=np.zeros(self.triangle(self.max_stages)), 
-            t_arrival=self.invalid_time(),
-            stages=tuple(self.max_stages*[self.null_stage]),
+            t_arrival=invalid_time(),
+            stages=tuple([dcp(self.null_stage) for _ in range(self.max_stages)]),
             n_stages=-1
         )
 
+        null_jobs = [dcp(self.null_job) for _ in range(self.max_jobs)]
+        null_workers = [dcp(self.null_worker) for _ in range(self.n_workers)]
+
         self.null_obs = Obs(
-            wall_time=self.to_wall_time(0),
-            jobs=tuple(self.max_jobs * [self.null_job]),
+            wall_time=to_wall_time(0),
+            jobs=tuple(null_jobs),
             job_count=0,
             frontier_stages_mask=np.zeros(self.max_jobs * self.max_stages),
-            workers=tuple(self.n_workers * [self.null_worker])
+            workers=tuple(null_workers)
         )
 
 
-    def to_wall_time(self, t):
-        """converts a float to a singleton array to
-        comply with the Box space"""
-        assert(t >= 0)
-        return np.array([t], dtype=np.float32)
-
-    def invalid_time(self):
-        '''invalid time is defined to be infinity.'''
-        return self.to_wall_time(np.inf)
+    def _generate_workers(self):
+        for worker in self.state.workers:
+            worker.type_ = np.random.randint(low=1, high=self.n_worker_types+1)
 
 
-    def get_stage_idx(self, job_id, stage_id):
-        return job_id * self.max_stages + stage_id
-
-
-    def get_stage_from_idx(self, stage_idx):
-        stage_id = stage_idx % self.max_stages
-        job_id = (stage_idx - stage_id) // self.max_stages
-        return self.current_state.jobs[job_id].stages[stage_id]
-
-
-    def generate_job(self, t_arrival):
-        id_ = self.current_state.job_count
+    def generate_job(self):
+        id_ = self.state.job_count
         stages, n_stages = self.generate_stages(id_)
         dag = self.dag_space.sample()
+        t_arrival = self.state.wall_time.copy()
         job = Job(
             id_=id_,
             dag=dag,
@@ -208,7 +212,6 @@ class DagSchedEnv(gym.Env):
             stages=stages,
             n_stages=n_stages
         )
-        self.current_state.job_count += 1
         return job
 
 
@@ -216,17 +219,18 @@ class DagSchedEnv(gym.Env):
         n_stages = np.random.randint(low=2, high=self.max_stages+1)
         stages = []
         for i in range(n_stages):
-            n_tasks = np.random.randint(low=1, high=self.max_tasks)
-            worker_type = np.random.randint(low=1, high=self.n_worker_types)
-            duration = np.random.normal(loc=8., scale=4., size=(1,))
+            n_tasks = np.random.randint(low=1, high=self.max_tasks+1)
+            worker_type = np.random.randint(low=1, high=self.n_worker_types+1)
+            duration = np.random.normal(loc=8., scale=2.)
             stages += [Stage(
                 id_=i,
                 job_id=job_id,
                 n_tasks=n_tasks, 
                 worker_type=worker_type, 
-                duration=duration,
-                t_accepted=self.invalid_time(),
-                n_workers=0
+                duration=to_wall_time(duration),
+                n_workers=0,
+                t_accepted=invalid_time(),
+                t_completed=invalid_time()
             )]
 
         stages += (self.max_stages-n_stages) * [self.null_stage]
@@ -234,80 +238,52 @@ class DagSchedEnv(gym.Env):
         stages = tuple(stages)
         return stages, n_stages
 
-    def job_dag_to_nx(self, job):
-        # construct adjacency matrix from flattend
-        # lower triangle array
-        n = self.max_stages
-        T = np.zeros((n,n))
-        T[np.tril_indices(n,-1)] = job.dag
-
-        # truncate adjacency matrix to only include valid nodes
-        n = job.n_stages
-        T = T[:n,:n]
-
-        G = nx.convert_matrix.from_numpy_matrix(T, create_using=nx.DiGraph)
-        assert(nx.is_directed_acyclic_graph(G))
-        return G
-
-
-    def find_src_nodes(self, job):
-        '''`dag` is a flattened lower triangle'''
-        G = self.job_dag_to_nx(job)
-        sources = [node for node,in_deg in G.in_degree() if in_deg==0]
-        return sources
-
-
-    def add_src_nodes_to_frontier(self, job):
-        source_ids = self.find_src_nodes(job)
-        source_ids = np.array(source_ids)
-        indices = job.id_ * self.max_stages + source_ids
-        self.current_state.frontier_stages[indices] = 1
-
 
     def check_action_validity(self, action):
-        stage = self.current_state.jobs[action.job_id].stages[action.stage_id]
+        stage = self.state.jobs[action.job_id].stages[action.stage_id]
 
-        worker_indices = (action.workers==1)
-        for i in worker_indices:
-            worker = self.current_state.workers[i]
-            if worker.job != -1 or worker.type_ != stage.worker_type:
+        workers = self.state.get_workers_from_mask(action.workers_mask)
+        for worker in workers:
+            if worker.job_id != -1 or worker.type_ != stage.worker_type:
                 # either one of the selected workers is currently busy,
                 # or worker type is not suitible for stage
                 return False
 
-        stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
-        if not self.stage_in_frontier(stage_idx):
+        stage_idx = self.state.get_stage_idx(action.job_id, action.stage_id)
+        if not self.state.stage_in_frontier(stage_idx):
             return False
 
         return True
 
 
-    def add_stage_to_frontier(self, stage_idx):
-        self.current_state.frontier_stages_mask[stage_idx] = 1
-
-    def remove_stage_from_frontier(self, stage_idx):
-        self.current_state.frontier_stages_mask[stage_idx] = 0
-
-    def stage_in_frontier(self, stage_idx):
-        return self.current_state.frontier_stages[stage_idx]
-
-
     def take_action(self, action):
-        worker_indices = (action.workers_mask==1)
-        for i in worker_indices:
-            worker = self.current_state.workers[i]
-            worker.job = action.job
+        workers = self.state.get_workers_from_mask(action.workers_mask)
+        for worker in workers:
+            worker.job_id = action.job_id
 
-        stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
-        self.add_stage_to_frontier(stage_idx)
+        stage_idx = self.state.get_stage_idx(action.job_id, action.stage_id)
+        self.state.add_stage_to_frontier(stage_idx)
 
-        stage = self.current_state.jobs[action.job_id].stages[action.stage_id]
-        stage.n_workers = worker_indices.size
+        stage = self.state.jobs[action.job_id].stages[action.stage_id]
+        stage.n_workers = len(workers)
+        stage.t_accepted = self.state.wall_time.copy()
 
 
     def process_stage_completion(self, stage):
-        # TODO
-        pass
+        stage.t_completed = self.state.wall_time.copy()
+
+        stage_idx = self.state.get_stage_idx(stage.job_id, stage.id_)
+        self.state.remove_stage_from_frontier(stage_idx)
+
+        job = self.state.jobs[stage.job_id]
+        new_frontier_stages = job.find_new_frontiers(stage)
+        for new_stage in new_frontier_stages:
+            self.state.add_stage_to_frontier(new_stage)
+
+        # free the workers
+        for worker in self.state.workers:
+            pass
+        
 
 
     def get_soonest_stage_completion(self, dt):
@@ -316,16 +292,13 @@ class DagSchedEnv(gym.Env):
         its time of completion. Otherwise, return (None, invalid time)
         '''
         soonest_completed_stage, soonest_t_completion = \
-            None, self.invalid_time()
+            None, invalid_time()
 
-        msk = self.current_state.frontier_stages_mask
-        stage_indices = msk[msk==1]
+        frontier_stages = self.state.get_frontier_stages()
 
-        for stage_idx in stage_indices:
-            stage = self.get_stage_from_idx(stage_idx)
-
+        for stage in frontier_stages:
             # if this stage hasn't even started processing then move on
-            if stage.t_accepted == self.invalid_time():
+            if stage.t_accepted == invalid_time():
                 continue
 
             # expected completion time of this task
@@ -333,7 +306,7 @@ class DagSchedEnv(gym.Env):
 
             # search for stage with soonest completion time, if
             # such a stage exists.
-            if (t_completion - self.current_state.wall_time) < dt:
+            if (t_completion - self.state.wall_time) < dt:
                 # stage has completed within the `dt` interval
                 if t_completion < soonest_t_completion:
                     soonest_completed_stage = stage
