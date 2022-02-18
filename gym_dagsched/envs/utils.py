@@ -10,3 +10,7 @@ def to_wall_time(t):
         comply with the Box space"""
         assert(t >= 0)
         return np.array([t], dtype=np.float32)
+
+
+def triangle(n):
+    return n*(n-1)//2
