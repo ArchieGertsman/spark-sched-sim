@@ -35,6 +35,8 @@ class DagSchedEnv(gym.Env):
         self._init_observation_space()
         self._init_action_space()
 
+        self.prev_t = 0
+
 
 
 
@@ -44,7 +46,6 @@ class DagSchedEnv(gym.Env):
 
     def reset(self):
         self.state = dcp(self.null_state)
-        self._generate_workers()
         self._init_timeline()
         return dcp(self.state)
 
@@ -63,6 +64,11 @@ class DagSchedEnv(gym.Env):
             t_completion, stage = self.state.take_action(action)
             self.timeline.push(t_completion, stage)
 
+        if self.state.actions_available():
+            # TODO: add time it takes for agent to take
+            # the action to `t` using real time
+            self.timeline.push(self.prev_t, None)
+
         if self.timeline.empty:
             return None, None, True, None
             
@@ -74,11 +80,15 @@ class DagSchedEnv(gym.Env):
             job = obj
             self.state.add_job(job)
         elif isinstance(obj, Stage):
-            print(f'{t}: stage completion')
+            print(f'{t}: task completion')
             stage = obj
+            # worker = self.state.get_worker(task.worker_id)
+            # worker.avail = 1
             self.state.process_stage_completion(stage)
         else:
-            pass
+            print(f'{t}: actions available')
+
+        self.prev_t = t
 
         obs = dcp(self.state)
         return obs, None, False, None
@@ -117,8 +127,9 @@ class DagSchedEnv(gym.Env):
             'id_': self.discrete_inv_space(self.max_stages),
             'job_id': self.discrete_inv_space(self.max_jobs),
             'n_tasks': self.discrete_inv_space(self.max_tasks),
+            'n_completed_tasks': self.discrete_inv_space(self.max_tasks),
+            'task_duration': self.time_space,
             'worker_type': self.discrete_inv_space(self.n_workers),
-            'duration': self.time_space,
             'n_workers': self.discrete_inv_space(self.n_workers),
             't_accepted': self.time_space,
             't_completed': self.time_space
@@ -163,8 +174,9 @@ class DagSchedEnv(gym.Env):
             id_=-1,
             job_id=-1,
             n_tasks=-1, 
+            n_completed_tasks=-1,
+            task_duration=invalid_time(),
             worker_type=-1, 
-            duration=invalid_time(),
             n_workers=-1,
             t_accepted=invalid_time(),
             t_completed=invalid_time()
@@ -200,10 +212,9 @@ class DagSchedEnv(gym.Env):
             job = self._generate_job(id_, to_wall_time(t))
             self.timeline.push(t, job)
 
-
-    def _generate_workers(self):
         for worker in self.state.workers:
             worker.type_ = np.random.randint(low=0, high=self.n_worker_types)
+            # self.timeline.push
 
 
     def _generate_job(self, id_, t_arrival):
@@ -230,19 +241,24 @@ class DagSchedEnv(gym.Env):
                 id_=i,
                 job_id=job_id,
                 n_tasks=n_tasks, 
+                n_completed_tasks=0,
+                task_duration=to_wall_time(duration),
                 worker_type=worker_type, 
-                duration=to_wall_time(duration),
                 n_workers=0,
                 t_accepted=invalid_time(),
                 t_completed=invalid_time()
             )]
 
         stages += (self.max_stages-n_stages) * [self.null_stage]
-        assert(len(stages) == self.max_stages)
+        assert len(stages) == self.max_stages
         stages = tuple(stages)
         return stages, n_stages
 
         
+    def _push_avail_workers(self, t):
+        for worker in self.state.workers:
+            if worker.is_available:
+                self.timeline.push(t, worker)
 
 
     

@@ -43,7 +43,7 @@ class Job:
         T = T[:n,:n]
 
         G = nx.convert_matrix.from_numpy_matrix(T, create_using=nx.DiGraph)
-        assert(nx.is_directed_acyclic_graph(G))
+        assert nx.is_directed_acyclic_graph(G)
         return G
 
 

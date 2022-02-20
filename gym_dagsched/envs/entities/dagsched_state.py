@@ -118,7 +118,7 @@ class DagSchedState:
 
         workers = self.get_workers_from_mask(action.workers_mask)
         for worker in workers:
-            if worker.job_id != -1 or worker.type_ != stage.worker_type:
+            if not worker.is_available or not worker.compatible_with(stage):
                 # either one of the selected workers is currently busy,
                 # or worker type is not suitible for stage
                 return False
@@ -131,10 +131,12 @@ class DagSchedState:
 
 
     def take_action(self, action):
+        # assign worker to selected stage's job
         workers = self.get_workers_from_mask(action.workers_mask)
         for worker in workers:
             worker.job_id = action.job_id
 
+        # retrieve selected stage object, update it
         stage = self.jobs[action.job_id].stages[action.stage_id]
         stage.n_workers = len(workers)
         stage.t_accepted = self.wall_time.copy()
@@ -145,11 +147,7 @@ class DagSchedState:
 
         # TODO: mark stage as saturated
 
-        # expected completion time of this task
-        # TODO: do a more complex calculation given 
-        # number of workers assigned to stage, as well
-        # as rating of worker (future feature)
-        t_completion = stage.t_accepted + stage.duration
+        t_completion = stage.generate_completion_time()
 
         return t_completion[0], stage
 
@@ -168,4 +166,24 @@ class DagSchedState:
 
         # free the workers
         for worker in self.workers:
-            worker.job_id = -1
+            if worker.job_id == stage.job_id:
+                worker.job_id = -1
+
+
+    def actions_available(self):
+        frontier_stages = self.get_frontier_stages()
+        avail_workers_mask = self.get_avail_workers_mask()
+        avail_worker_idxs = \
+            np.argwhere(avail_workers_mask==1).flatten()
+
+        if len(avail_worker_idxs) == 0 or len(frontier_stages) == 0:
+            return False
+        
+        avail_workers = [self.workers[i] for i in avail_worker_idxs]
+
+        for stage in frontier_stages:
+            for worker in avail_workers:
+                if stage.worker_type == worker.type_:
+                    return True
+
+        return False
