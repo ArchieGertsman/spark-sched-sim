@@ -25,6 +25,8 @@ class Job:
     # number of stages this job consists of
     n_stages: int
 
+    # TODO: t_accepted, t_completed, n_completed_stages
+
 
     @property
     def max_stages(self):

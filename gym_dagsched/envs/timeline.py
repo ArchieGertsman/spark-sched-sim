@@ -1,5 +1,19 @@
 import heapq
 import itertools
+from dataclasses import dataclass
+
+@dataclass
+class Event:
+    obj: object
+
+@dataclass
+class JobArrival(Event):
+    pass
+
+@dataclass
+class TaskCompletion(Event):
+    task_id: int
+
 
 
 class Timeline(object):

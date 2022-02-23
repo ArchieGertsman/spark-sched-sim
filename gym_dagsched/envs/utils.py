@@ -14,3 +14,7 @@ def to_wall_time(t):
 
 def triangle(n):
     return n*(n-1)//2
+
+
+def mask_to_indices(mask):
+    return np.argwhere(mask==1).flatten()
