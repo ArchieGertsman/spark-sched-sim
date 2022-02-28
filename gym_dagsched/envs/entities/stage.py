@@ -47,16 +47,39 @@ class Stage:
     def is_complete(self):
         return self.n_completed_tasks == self.n_tasks
 
+    @property 
+    def n_active_workers(self):
+        from .worker import Worker
+        return (self.worker_ids != Worker.invalid_id).sum()
+
+    @property
+    def n_processing_tasks(self):
+        return self.n_active_workers
+
+    @property 
+    def n_saturated_tasks(self):
+        return self.n_completed_tasks + self.n_processing_tasks
+
+    @property
+    def n_remaining_tasks(self):
+        return self.n_tasks - self.n_saturated_tasks
+
+    @property
+    def saturated(self):
+        assert self.n_saturated_tasks <= self.n_tasks
+        return self.n_saturated_tasks == self.n_tasks
+
     @property
     def next_task_id(self):
-        assert self.n_completed_tasks <= self.n_tasks
-        return self.n_completed_tasks
+        assert self.n_saturated_tasks <= self.n_tasks
+        return self.n_saturated_tasks
 
 
     def add_task_completion(self, task_id):
         assert self.n_completed_tasks < self.n_tasks
         self.n_completed_tasks += 1
-        self.worker_ids[task_id] = -1
+        from .worker import Worker
+        self.worker_ids[task_id] = Worker.invalid_id
 
 
     def generate_task_duration(self):
@@ -74,24 +97,18 @@ class Stage:
 
 
     def remove_worker(self, worker):
-        assert worker.is_available
+        # assert worker.available
         assert worker.stage_id == self.id_
-        self.worker_ids[worker.task_id] = -1
+        from .worker import Worker
+        self.worker_ids[worker.task_id] = Worker.invalid_id
 
 
     def add_worker(self, worker):
-        assert self.n_completed_tasks < self.n_tasks
+        assert self.n_saturated_tasks < self.n_tasks
         assert worker.compatible_with(self)
         task_id = self.next_task_id
         self.worker_ids[task_id] = worker.id_
         return task_id
-
-
-    def is_saturated(self):
-        n_active_workers = (self.worker_ids != -1).sum()
-        n_saturated_tasks = self.n_completed_tasks + n_active_workers
-        assert n_saturated_tasks <= self.n_tasks
-        return n_saturated_tasks == self.n_tasks
 
 
     def complete(self, t_completion):

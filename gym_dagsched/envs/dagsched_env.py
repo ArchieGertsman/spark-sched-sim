@@ -1,6 +1,5 @@
 # from dataclasses import 
 from copy import deepcopy as dcp
-from queue import Queue
 
 import gym
 from gym.spaces import Dict, Tuple, MultiBinary, Discrete, Box, MultiDiscrete
@@ -26,13 +25,16 @@ class DagSchedEnv(gym.Env):
         mean_job_interarrival_time=10.
     ):
         # fix a maximum state size
-        self.max_jobs = max_jobs
-        self.max_stages = max_stages
-        self.max_tasks = max_tasks
+        self.max_jobs = Job.invalid_id = max_jobs
+
+        self.max_stages = Stage.invalid_id = max_stages
+
+        self.max_tasks = Stage.invalid_task_id = max_tasks
 
         # fixed workers
-        self.n_workers = n_workers
-        self.n_worker_types = n_worker_types
+        self.n_workers = Worker.invalid_id = n_workers
+
+        self.n_worker_types = Worker.invalid_type = n_worker_types
 
         self.mean_job_interarrival_time = \
             mean_job_interarrival_time
@@ -40,9 +42,6 @@ class DagSchedEnv(gym.Env):
         self._construct_null_entities()
 
         self._init_spaces()
-
-
-
 
 
     """
@@ -65,6 +64,8 @@ class DagSchedEnv(gym.Env):
         if self.state.check_action_validity(action):
             stage, task_ids = self.state.take_action(action)
             self._push_tasks(stage, task_ids)
+        else:
+            print('invalid action')
 
         if self.timeline.empty:
             return None, None, True, None
@@ -77,8 +78,13 @@ class DagSchedEnv(gym.Env):
             job = event.obj
             self.state.add_job(job)
         elif isinstance(event, TaskCompletion):
+            # TODO: problem is that worker_id for a task is reset 
+            # after task completion, so then that same task is 
+            # reassigned a worker later. Need to keep better track
+            # of completed tasks.
             print(f'{t}: task completion')
             stage, task_id = event.obj, event.task_id
+            print(f'({stage.job_id},{stage.id_},{task_id})')
             self.state.process_task_completion(stage, task_id)
             if stage.is_complete:
                 print(f'{t}: stage completion')
@@ -98,9 +104,12 @@ class DagSchedEnv(gym.Env):
         # time can be any non-negative real number
         self.time_space = Box(low=0., high=np.inf, shape=(1,))
 
-        # discrete space of size `n` with an additional 
-        # invalid state encoded as -1
-        self.discrete_space = lambda n: Discrete(n+1, start=-1)
+        # exclusive discrete space 0 <= k < n, with
+        # additional invalid state := n
+        self.discrete_x = lambda n: Discrete(n+1)
+
+        # inclusive discrete space 0 <= k <= n
+        self.discrete_i = lambda n: Discrete(n+1)
 
         # lower triangle of the dag's adgacency matrix stored 
         # as a flattened array
@@ -118,37 +127,37 @@ class DagSchedEnv(gym.Env):
         # the following spaces
 
         self.worker_space = Dict({
-            'id_': self.discrete_space(self.n_workers),
-            'type_': self.discrete_space(self.n_worker_types),
-            'job_id': self.discrete_space(self.max_jobs),
-            'stage_id': self.discrete_space(self.max_stages),
-            'task_id': self.discrete_space(self.max_tasks)
+            'id_': self.discrete_x(self.n_workers),
+            'type_': self.discrete_x(self.n_worker_types),
+            'job_id': self.discrete_x(self.max_jobs),
+            'stage_id': self.discrete_x(self.max_stages),
+            'task_id': self.discrete_x(self.max_tasks)
         })
 
         self.stage_space = Dict({
-            'id_': self.discrete_space(self.max_stages),
-            'job_id': self.discrete_space(self.max_jobs),
-            'n_tasks': self.discrete_space(self.max_tasks),
-            'n_completed_tasks': self.discrete_space(self.max_tasks),
+            'id_': self.discrete_x(self.max_stages),
+            'job_id': self.discrete_x(self.max_jobs),
+            'n_tasks': self.discrete_i(self.max_tasks),
+            'n_completed_tasks': self.discrete_i(self.max_tasks),
             'task_duration': self.time_space,
             'worker_types_mask': MultiBinary(self.n_worker_types),
-            'worker_ids': MultiDiscrete(self.max_tasks * [self.n_workers]),
+            'worker_ids': MultiDiscrete(self.max_tasks * [self.n_workers+1]),
             't_accepted': self.time_space,
             't_completed': self.time_space
         })
 
         self.job_space = Dict({
-            'id_': self.discrete_space(self.max_jobs),
+            'id_': self.discrete_x(self.max_jobs),
             'dag': self.dag_space,
             't_arrival': self.time_space,
             'stages': Tuple(self.max_stages * [self.stage_space]),
-            'n_stages': self.discrete_space(self.max_stages)
+            'n_stages': self.discrete_i(self.max_stages)
         })
 
         self.observation_space = Dict({
             'wall_time': self.time_space,
             'jobs': Tuple(self.max_jobs * [self.job_space]),
-            'job_count': Discrete(self.max_jobs),
+            'job_count': self.discrete_i(self.max_jobs),
             'workers': Tuple(self.n_workers * [self.worker_space]),
             'frontier_stages_mask': self.stages_mask_space,
             'saturated_stages_mask': self.stages_mask_space
@@ -156,9 +165,9 @@ class DagSchedEnv(gym.Env):
     
 
     def _init_action_space(self):
-        self.action_space = gym.spaces.Dict({
-            'job_id': self.discrete_space(self.max_jobs),
-            'stage_id': self.discrete_space(self.max_stages),
+        self.action_space = Dict({
+            'job_id': self.discrete_x(self.max_jobs),
+            'stage_id': self.discrete_x(self.max_stages),
             'worker_type_counts': MultiDiscrete(
                 self.n_worker_types * [self.n_workers])
         })
@@ -166,32 +175,37 @@ class DagSchedEnv(gym.Env):
 
     def _construct_null_entities(self):
         '''returns a 'null' observation where
-        - all discrete attributes are set to -1
-        - all time attributes are set to infinity
-        - all multi-binary attributes are zeroed out
+        - exclusive discrete attributes are set to largest (invalid) value
+        - invlusive discrete attributes are set to zero
+        - time attributes are set to infinity
+        - multi-binary attributes are zeroed out
         in object form. convert to dict using `asdict`
         '''
         self.null_worker = Worker(
-            id_=-1, type_=-1, job_id=-1, stage_id=-1, task_id=-1)
+            id_=Worker.invalid_id, 
+            type_=Worker.invalid_type, 
+            job_id=Job.invalid_id, 
+            stage_id=Stage.invalid_id, 
+            task_id=Stage.invalid_task_id)
 
         self.null_stage = Stage(
-            id_=-1,
-            job_id=-1,
-            n_tasks=-1, 
-            n_completed_tasks=-1,
+            id_=Stage.invalid_id,
+            job_id=Job.invalid_id,
+            n_tasks=0, 
+            n_completed_tasks=0,
             task_duration=invalid_time(),
             worker_types_mask=np.array(self.n_worker_types*[0]), 
-            worker_ids=np.array(self.max_tasks*[-1]),
+            worker_ids=np.array(self.max_tasks*[Worker.invalid_id]),
             t_accepted=invalid_time(),
             t_completed=invalid_time()
         )        
 
         self.null_job = Job(
-            id_=-1,
+            id_=Job.invalid_id,
             dag=np.zeros(triangle(self.max_stages)), 
             t_arrival=invalid_time(),
             stages=tuple([dcp(self.null_stage) for _ in range(self.max_stages)]),
-            n_stages=-1
+            n_stages=0
         )
 
         null_jobs = [dcp(self.null_job) for _ in range(self.max_jobs)]
@@ -243,11 +257,11 @@ class DagSchedEnv(gym.Env):
             stages += [Stage(
                 id_=i,
                 job_id=job_id,
-                n_tasks=n_tasks, 
+                n_tasks=n_tasks,
                 n_completed_tasks=0,
                 task_duration=to_wall_time(duration),
                 worker_types_mask=self._generate_worker_types_mask(), 
-                worker_ids=np.array(self.max_tasks*[-1]),
+                worker_ids=np.array(self.max_tasks*[Worker.invalid_id]),
                 t_accepted=invalid_time(),
                 t_completed=invalid_time()
             )]
@@ -260,7 +274,7 @@ class DagSchedEnv(gym.Env):
 
     def _generate_worker_types_mask(self):
         n_types = np.random.randint(low=1, high=self.n_worker_types+1)
-        worker_types = np.array(1*[n_types] + 0*[self.n_worker_types-n_types])
+        worker_types = np.array(n_types*[1] + (self.n_worker_types-n_types)*[0])
         np.random.shuffle(worker_types)
         return worker_types
 

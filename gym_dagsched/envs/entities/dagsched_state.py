@@ -5,6 +5,7 @@ import numpy as np
 
 from .job import Job
 from .worker import Worker
+from .stage import Stage
 from ..utils import invalid_time, mask_to_indices
 
 @dataclass
@@ -22,18 +23,9 @@ class DagSchedState:
     saturated_stages_mask: np.ndarray
 
 
-
     @property
     def max_stages(self):
-        return len(self.jobs[0].stages)
-
-    @property
-    def max_jobs(self):
-        return len(self.jobs)
-
-    @property
-    def n_workers(self):
-        return len(self.workers)
+        return Stage.invalid_id
 
 
     def is_stage_in_frontier(self, stage_idx):
@@ -66,7 +58,7 @@ class DagSchedState:
 
 
     def find_available_workers(self):
-        return [worker for worker in self.workers if worker.is_available]
+        return [worker for worker in self.workers if worker.available]
 
 
     def get_stage_indices(self, job_id, stage_ids):
@@ -107,6 +99,15 @@ class DagSchedState:
 
 
     def check_action_validity(self, action):
+        if action.job_id == Job.invalid_id or action.stage_id == Stage.invalid_id:
+            return False
+
+        stage = self.jobs[action.job_id].stages[action.stage_id]
+
+        # check that not too many workers are requested
+        if stage.n_remaining_tasks < action.worker_type_counts.sum():
+            return False
+
         # check that the selected stage is actually ready for scheduling
         stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
         if not self.is_stage_in_frontier(stage_idx):
@@ -117,12 +118,11 @@ class DagSchedState:
         n_worker_types = len(action.worker_type_counts)
         avail_worker_counts = self.get_avail_worker_counts(n_worker_types)
         requested_counts = np.array(action.worker_type_counts)
-        if not requested_counts <= avail_worker_counts:
+        if (requested_counts > avail_worker_counts).any():
             return False
 
         # check that the requested types are actually 
         # compatible with the stage's worker types
-        stage = self.jobs[action.job_id].stages[action.stage_id]
         for worker_type in stage.incompatible_worker_types():
             if action.worker_type_counts[worker_type] > 0:
                 return False
@@ -135,7 +135,7 @@ class DagSchedState:
         counts = np.zeros(n_worker_types)
         for worker_type in range(n_worker_types):
             for worker in self.workers:
-                if worker.type_ == worker_type and worker.is_available:
+                if worker.type_ == worker_type and worker.available:
                     counts[worker_type] += 1
         return counts
 
@@ -150,20 +150,20 @@ class DagSchedState:
         for worker_type in stage.compatible_worker_types():
             count = action.worker_type_counts[worker_type]
             for _ in range(count):
-                worker = self.find_closest_worker(stage)
+                worker = self.find_closest_worker(stage, worker_type)
                 task_id = self.schedule_worker(worker, stage)
                 task_ids += [task_id]
 
         # check if stage is now saturated; if so, remove from frontier
         stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
-        if stage.is_saturated():
+        if stage.saturated:
             self.remove_stage_from_frontier(stage_idx)
             self.saturate_stage(stage_idx)
 
         return stage, task_ids
 
 
-    def find_closest_worker(self, stage):
+    def find_closest_worker(self, stage, worker_type):
         '''chooses an available worker for a stage's 
         next task, according to the following priority:
         1. worker is already at stage
@@ -173,17 +173,17 @@ class DagSchedState:
 
         # try to find available worker already at the stage
         for worker_id in stage.worker_ids:
-            if worker_id == -1:
+            if worker_id == Worker.invalid_id:
                 continue
             worker = self.workers[worker_id]
-            if worker.is_available:
+            if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):
                 return worker
 
         # try to find available worker at stage's job;
         # if none is found then return any available worker
         avail_worker = None
         for worker in self.workers:
-            if worker.is_available:
+            if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):
                 if worker.job_id == stage.job_id:
                     return worker
                 elif avail_worker == None:
@@ -192,9 +192,9 @@ class DagSchedState:
 
 
     def schedule_worker(self, worker, stage):
-        if worker.job_id != -1 and worker.stage_id != -1:
-            old_stage = self.jobs[worker.job_id].stages[worker.stage_id]
-            old_stage.remove_worker(worker)
+        # if worker.job_id != Job.invalid_id and worker.stage_id != Stage.invalid_id:
+        #     old_stage = self.jobs[worker.job_id].stages[worker.stage_id]
+        #     old_stage.remove_worker(worker)
 
         worker.assign_new_stage(stage)
 
@@ -207,9 +207,11 @@ class DagSchedState:
     def process_task_completion(self, stage, task_id):
         worker_id = stage.worker_ids[task_id]
         worker = self.workers[worker_id]
-        worker.make_available()
 
+        stage.remove_worker(worker)
         stage.add_task_completion(task_id)
+        
+        worker.make_available()
 
 
     def process_stage_completion(self, stage):
