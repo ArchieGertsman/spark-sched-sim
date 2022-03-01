@@ -12,7 +12,9 @@ from ..utils import invalid_time, mask_to_indices
 class DagSchedState:
     wall_time: np.ndarray
 
-    job_count: int
+    n_jobs: int
+
+    n_completed_jobs: int
 
     jobs: typing.Tuple[Job, ...]
 
@@ -26,6 +28,10 @@ class DagSchedState:
     @property
     def max_stages(self):
         return Stage.invalid_id
+
+    @property
+    def all_jobs_complete(self):
+        return self.n_completed_jobs == self.n_jobs
 
 
     def is_stage_in_frontier(self, stage_idx):
@@ -82,7 +88,7 @@ class DagSchedState:
         
         self.add_src_nodes_to_frontier(new_job)
 
-        self.job_count += 1
+        self.n_jobs += 1
 
 
     def add_src_nodes_to_frontier(self, job):
@@ -172,10 +178,10 @@ class DagSchedState:
         '''
 
         # try to find available worker already at the stage
-        for worker_id in stage.worker_ids:
-            if worker_id == Worker.invalid_id:
+        for task in stage.tasks:
+            if task.worker_id == Worker.invalid_id:
                 continue
-            worker = self.workers[worker_id]
+            worker = self.workers[task.worker_id]
             if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):
                 return worker
 
@@ -192,30 +198,23 @@ class DagSchedState:
 
 
     def schedule_worker(self, worker, stage):
-        # if worker.job_id != Job.invalid_id and worker.stage_id != Stage.invalid_id:
-        #     old_stage = self.jobs[worker.job_id].stages[worker.stage_id]
-        #     old_stage.remove_worker(worker)
-
         worker.assign_new_stage(stage)
 
-        task_id = stage.add_worker(worker)
-        if stage.t_accepted == invalid_time():
-            stage.t_accepted = self.wall_time.copy()
+        task_id = stage.add_worker(worker, self.wall_time.copy())
         return task_id
 
 
     def process_task_completion(self, stage, task_id):
-        worker_id = stage.worker_ids[task_id]
+        worker_id = stage.tasks[task_id].worker_id
         worker = self.workers[worker_id]
 
-        stage.remove_worker(worker)
-        stage.add_task_completion(task_id)
+        stage.add_task_completion(task_id, self.wall_time.copy())
         
         worker.make_available()
 
 
     def process_stage_completion(self, stage):
-        stage.complete(self.wall_time.copy())
+        self.jobs[stage.job_id].add_stage_completion()
 
         stage_idx = self.get_stage_idx(stage.job_id, stage.id_)
         self.remove_stage_from_saturated(stage_idx)
@@ -227,6 +226,11 @@ class DagSchedState:
         new_stages_idxs = \
             self.get_stage_indices(job.id_, new_stages_ids)
         self.add_stages_to_frontier(new_stages_idxs)
+
+
+    def process_job_completion(self, job):
+        self.n_completed_jobs += 1
+        job.t_completed = self.wall_time.copy()
 
 
     def actions_available(self):

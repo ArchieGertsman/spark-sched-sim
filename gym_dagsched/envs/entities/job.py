@@ -18,6 +18,8 @@ class Job:
     # arrival time of this job
     t_arrival: np.ndarray
 
+    t_completed: np.ndarray
+
     # tuple of stages that make up the
     # nodes of the dag
     stages: typing.Tuple[Stage, ...]
@@ -25,12 +27,23 @@ class Job:
     # number of stages this job consists of
     n_stages: int
 
-    # TODO: t_accepted, t_completed, n_completed_stages
+    n_completed_stages: int
+
+    # TODO: t_accepted, t_completed,
 
 
     @property
     def max_stages(self):
         return len(self.stages)
+
+    @property
+    def is_complete(self):
+        return self.n_completed_stages == self.n_stages
+
+
+    def add_stage_completion(self):
+        assert self.n_completed_stages < self.n_stages
+        self.n_completed_stages += 1
 
 
     def dag_to_nx(self):
@@ -61,7 +74,7 @@ class Job:
         successors whose other dependencies are also 
         completed, if any exists.
         '''
-        if stage.t_completed == invalid_time():
+        if not stage.is_complete:
             return []
 
         G = self.dag_to_nx()
@@ -82,7 +95,7 @@ class Job:
         '''
         for dep_id in G.predecessors(stage_id):
             dep_stage = self.stages[dep_id]
-            if dep_stage.t_completed == invalid_time():
+            if not dep_stage.is_complete:
                 return False
 
         return True

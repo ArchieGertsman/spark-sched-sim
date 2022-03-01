@@ -1,7 +1,9 @@
 from dataclasses import dataclass
+import typing
 
 import numpy as np
 
+from .task import Task
 from ..utils import mask_to_indices
 
 
@@ -30,31 +32,16 @@ class Stage:
     # environments)
     worker_types_mask: np.ndarray
 
-    # worker_ids[i] is the id of the worker
-    # assigned to task i. -1 if none
-    worker_ids: np.ndarray
-
-    # time at which a set of workers began
-    # processing this stage
-    t_accepted: np.ndarray
-
-    # time at which this stage finished
-    # being processed
-    t_completed: np.ndarray
+    tasks: typing.Tuple[Task, ...]
 
 
     @property
     def is_complete(self):
         return self.n_completed_tasks == self.n_tasks
 
-    @property 
-    def n_active_workers(self):
-        from .worker import Worker
-        return (self.worker_ids != Worker.invalid_id).sum()
-
     @property
     def n_processing_tasks(self):
-        return self.n_active_workers
+        return np.array([task.is_processing for task in self.tasks]).sum()
 
     @property 
     def n_saturated_tasks(self):
@@ -75,11 +62,12 @@ class Stage:
         return self.n_saturated_tasks
 
 
-    def add_task_completion(self, task_id):
+    def add_task_completion(self, task_id, wall_time):
         assert self.n_completed_tasks < self.n_tasks
         self.n_completed_tasks += 1
-        from .worker import Worker
-        self.worker_ids[task_id] = Worker.invalid_id
+        task = self.tasks[task_id]
+        task.is_processing = 0
+        task.t_completed = wall_time
 
 
     def generate_task_duration(self):
@@ -96,21 +84,12 @@ class Stage:
         return mask_to_indices(1-self.worker_types_mask)
 
 
-    def remove_worker(self, worker):
-        # assert worker.available
-        assert worker.stage_id == self.id_
-        from .worker import Worker
-        self.worker_ids[worker.task_id] = Worker.invalid_id
-
-
-    def add_worker(self, worker):
+    def add_worker(self, worker, wall_time):
         assert self.n_saturated_tasks < self.n_tasks
         assert worker.compatible_with(self)
         task_id = self.next_task_id
-        self.worker_ids[task_id] = worker.id_
+        task = self.tasks[task_id]
+        task.worker_id = worker.id_
+        task.is_processing = 1
+        task.t_accepted = wall_time
         return task_id
-
-
-    def complete(self, t_completion):
-        assert self.n_completed_tasks == self.n_tasks
-        self.t_completed = t_completion
