@@ -288,7 +288,7 @@ class DagSchedEnv(gym.Env):
         stages = []
         for i in range(n_stages):
             n_tasks = np.random.randint(low=1, high=self.max_tasks+1)
-            duration = np.random.normal(loc=20., scale=2.)
+            duration = np.random.normal(loc=30., scale=10.)
             stages += [Stage(
                 id_=i,
                 job_id=job_id,
