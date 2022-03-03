@@ -2,6 +2,7 @@ import heapq
 import itertools
 from dataclasses import dataclass
 
+
 @dataclass
 class Event:
     obj: object

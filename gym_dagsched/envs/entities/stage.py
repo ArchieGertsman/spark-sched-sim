@@ -3,36 +3,41 @@ import typing
 
 import numpy as np
 
+from args import args
+from dagsched_utils import invalid_time, mask_to_indices
 from .task import Task
-from ..utils import mask_to_indices
 
 
 @dataclass 
 class Stage:
+    INVALID_ID = args.max_stages
+
+
     # each stage has a unique id
-    id_: int
+    id_: int = INVALID_ID
 
     # id of job this stage belongs to
-    job_id: int
+    job_id: int = args.n_jobs
 
     # number of identical tasks to complete 
     # within the stage
-    n_tasks: int
+    n_tasks: int = 0
 
     # number of tasks in this stage that 
     # have already been completed
-    n_completed_tasks: int
+    n_completed_tasks: int = 0
 
     # expected completion time of a single 
     # task in this stage
-    task_duration: np.ndarray
+    task_duration: np.ndarray = invalid_time()
 
     # which types of worker are compaitble with
     # this type of stage (for heterogeneous
     # environments)
-    worker_types_mask: np.ndarray
+    worker_types_mask: np.ndarray = invalid_time()
 
-    tasks: typing.Tuple[Task, ...]
+    tasks: typing.Tuple[Task, ...] = \
+        tuple([Task() for _ in range(args.max_tasks)])
 
 
     @property
@@ -68,12 +73,6 @@ class Stage:
         task = self.tasks[task_id]
         task.is_processing = 0
         task.t_completed = wall_time
-
-
-    def generate_task_duration(self):
-        # TODO: do a more complex calculation given 
-        # other properties of this stage
-        return self.task_duration
 
 
     def compatible_worker_types(self):

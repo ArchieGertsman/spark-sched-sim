@@ -4,32 +4,36 @@ from dataclasses import dataclass
 import numpy as np
 import networkx as nx
 
+from args import args
+from dagsched_utils import triangle, invalid_time
 from .stage import Stage
-from ..utils import invalid_time
+
 
 @dataclass
 class Job:
-    id_: int
+    INVALID_ID = args.n_jobs
+
+
+    id_: int = INVALID_ID
 
     # lower triangle of the dag's adgacency 
     # matrix stored as a flattened array
-    dag: np.ndarray
+    dag: np.ndarray = np.zeros(triangle(args.max_stages))
 
     # arrival time of this job
-    t_arrival: np.ndarray
+    t_arrival: np.ndarray = invalid_time()
 
-    t_completed: np.ndarray
+    t_completed: np.ndarray = invalid_time()
 
     # tuple of stages that make up the
     # nodes of the dag
-    stages: typing.Tuple[Stage, ...]
+    stages: typing.Tuple[Stage, ...] = \
+        tuple([Stage() for _ in range(args.max_stages)])
 
     # number of stages this job consists of
-    n_stages: int
+    n_stages: int = 0
 
-    n_completed_stages: int
-
-    # TODO: t_accepted, t_completed,
+    n_completed_stages: int = 0
 
 
     @property

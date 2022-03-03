@@ -3,31 +3,33 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
+from args import args
+from dagsched_utils import to_wall_time, mask_to_indices
 from .job import Job
 from .worker import Worker
 from .stage import Stage
-from ..utils import invalid_time, mask_to_indices
+
 
 @dataclass
 class DagSchedState:
-    wall_time: np.ndarray
+    wall_time: np.ndarray = to_wall_time(0.)
 
-    n_jobs: int
+    n_jobs: int = 0
 
-    n_completed_jobs: int
+    n_completed_jobs: int = 0
 
-    jobs: typing.Tuple[Job, ...]
+    jobs: typing.Tuple[Job, ...] = \
+        tuple([Job() for _ in range(args.n_jobs)])
 
-    workers: typing.Tuple[Worker, ...]
+    workers: typing.Tuple[Worker, ...] = \
+        tuple([Worker() for _ in range(args.n_workers)])
 
-    frontier_stages_mask: np.ndarray
+    frontier_stages_mask: np.ndarray = \
+        np.zeros(args.n_jobs * args.max_stages)
 
-    saturated_stages_mask: np.ndarray
+    saturated_stages_mask: np.ndarray = \
+        np.zeros(args.n_jobs * args.max_stages)
 
-
-    @property
-    def max_stages(self):
-        return Stage.invalid_id
 
     @property
     def all_jobs_complete(self):
@@ -68,7 +70,7 @@ class DagSchedState:
 
 
     def get_stage_indices(self, job_id, stage_ids):
-        return job_id * self.max_stages + np.array(stage_ids, dtype=int)
+        return job_id * args.max_stages + np.array(stage_ids, dtype=int)
 
     
     def get_stage_idx(self, job_id, stage_id):
@@ -76,8 +78,8 @@ class DagSchedState:
 
 
     def get_stage_from_idx(self, stage_idx):
-        stage_id = stage_idx % self.max_stages
-        job_id = (stage_idx - stage_id) // self.max_stages
+        stage_id = stage_idx % args.max_stages
+        job_id = (stage_idx - stage_id) // args.max_stages
         return self.jobs[job_id].stages[stage_id]
 
 
@@ -104,8 +106,8 @@ class DagSchedState:
         return workers
 
 
-    def check_action_validity(self, action):
-        if action.job_id == Job.invalid_id or action.stage_id == Stage.invalid_id:
+    def is_action_valid(self, action):
+        if action.job_id == Job.INVALID_ID or action.stage_id == Stage.INVALID_ID:
             return False
 
         stage = self.jobs[action.job_id].stages[action.stage_id]
@@ -179,7 +181,7 @@ class DagSchedState:
 
         # try to find available worker already at the stage
         for task in stage.tasks:
-            if task.worker_id == Worker.invalid_id:
+            if task.worker_id == Worker.INVALID_ID:
                 continue
             worker = self.workers[task.worker_id]
             if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):

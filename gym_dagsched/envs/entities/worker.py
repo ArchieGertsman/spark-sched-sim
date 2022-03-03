@@ -2,32 +2,39 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from args import args
+from . import task
+
 
 @dataclass
 class Worker:
-    id_: int
+    INVALID_ID = args.n_workers
+
+    INVALID_TYPE = args.n_worker_types
+
+
+    id_: int = INVALID_ID
 
     # type of the worker (for heterogeneous
     # environments)
-    type_: int
+    type_: int = INVALID_TYPE
 
     # id of current job assigned to this worker
-    job_id: int
+    job_id: int = args.n_jobs
 
-    stage_id: int
+    stage_id: int = args.max_stages
 
-    task_id: int
+    task_id: int = args.max_tasks
+
 
 
     @property
     def available(self):
-        from .stage import Stage
-        return self.task_id == Stage.invalid_task_id
+        return self.task_id == task.Task.INVALID_ID
 
 
     def make_available(self):
-        from .stage import Stage
-        self.task_id = Stage.invalid_task_id
+        self.task_id = task.Task.INVALID_ID
 
 
     def compatible_with(self, stage):

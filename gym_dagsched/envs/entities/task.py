@@ -2,13 +2,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from args import args
+from dagsched_utils import invalid_time
+from .worker import Worker
+
 
 @dataclass
 class Task:
-    worker_id: int
+    INVALID_ID = args.max_tasks
 
-    is_processing: bool
 
-    t_accepted: np.ndarray
+    worker_id: int = Worker.INVALID_ID
 
-    t_completed: np.ndarray
+    is_processing: bool = False
+
+    t_accepted: np.ndarray = invalid_time()
+
+    t_completed: np.ndarray = invalid_time()

@@ -1,4 +1,3 @@
-# from dataclasses import 
 from copy import deepcopy as dcp
 
 import gym
@@ -6,42 +5,17 @@ from gym.spaces import Dict, Tuple, MultiBinary, Discrete, Box, MultiDiscrete
 import numpy as np
 from dacite import from_dict
 
-from .entities.action import Action
-from .entities.dagsched_state import DagSchedState
-from .entities.job import Job
-from .entities.stage import Stage
-from .entities.task import Task
-from .entities.worker import Worker
-from .utils import invalid_time, to_wall_time, triangle
-from .timeline import Timeline, JobArrival, TaskCompletion
+from args import args
+from entities.action import Action
+from entities.dagsched_state import DagSchedState
+from dagsched_utils import to_wall_time, triangle
+from timeline import Timeline, JobArrival, TaskCompletion
+import data_generator as gen
+
 
 class DagSchedEnv(gym.Env):
 
-    def __init__(self,
-        max_jobs, 
-        max_stages, 
-        max_tasks, 
-        n_worker_types, 
-        n_workers,
-        mean_job_interarrival_time=10.
-    ):
-        # fix a maximum state size
-        self.max_jobs = Job.invalid_id = max_jobs
-
-        self.max_stages = Stage.invalid_id = max_stages
-
-        self.max_tasks = Stage.invalid_task_id = max_tasks
-
-        # fixed workers
-        self.n_workers = Worker.invalid_id = n_workers
-
-        self.n_worker_types = Worker.invalid_type = n_worker_types
-
-        self.mean_job_interarrival_time = \
-            mean_job_interarrival_time
-
-        self._construct_null_entities()
-
+    def __init__(self):
         self._init_spaces()
 
 
@@ -50,9 +24,9 @@ class DagSchedEnv(gym.Env):
     """
 
     def reset(self):
-        self.state = dcp(self.null_state)
+        self.state = DagSchedState()
         self._init_timeline()
-        self._generate_workers()
+        self._init_workers()
         return dcp(self.state)
 
 
@@ -61,9 +35,11 @@ class DagSchedEnv(gym.Env):
         be one of the following:
         (1) new job arrival
         (2) task completion
+        (3) "nudge," meaning that there are available actions,
+            and so the policy should consider taking one of them
         '''
         action = from_dict(Action, action_dict)
-        if self.state.check_action_validity(action):
+        if self.state.is_action_valid(action):
             stage, task_ids = self.state.take_action(action)
             self._push_tasks(stage, task_ids)
         else:
@@ -126,9 +102,9 @@ class DagSchedEnv(gym.Env):
 
         # lower triangle of the dag's adgacency matrix stored 
         # as a flattened array
-        self.dag_space = MultiBinary(triangle(self.max_stages))
+        self.dag_space = MultiBinary(triangle(args.max_stages))
 
-        self.stages_mask_space = MultiBinary(self.max_jobs * self.max_stages)
+        self.stages_mask_space = MultiBinary(args.n_jobs * args.max_stages)
 
         self._init_observation_space()
 
@@ -140,46 +116,46 @@ class DagSchedEnv(gym.Env):
         # the following spaces
 
         self.worker_space = Dict({
-            'id_': self.discrete_x(self.n_workers),
-            'type_': self.discrete_x(self.n_worker_types),
-            'job_id': self.discrete_x(self.max_jobs),
-            'stage_id': self.discrete_x(self.max_stages),
-            'task_id': self.discrete_x(self.max_tasks)
+            'id_': self.discrete_x(args.n_workers),
+            'type_': self.discrete_x(args.n_worker_types),
+            'job_id': self.discrete_x(args.n_jobs),
+            'stage_id': self.discrete_x(args.max_stages),
+            'task_id': self.discrete_x(args.max_tasks)
         })
 
         self.task_space = Dict({
-            'worker_id': self.discrete_x(self.n_workers),
+            'worker_id': self.discrete_x(args.n_workers),
             'is_processing': self.discrete_i(1),
             't_accepted': self.time_space,
             't_completed': self.time_space
         })
 
         self.stage_space = Dict({
-            'id_': self.discrete_x(self.max_stages),
-            'job_id': self.discrete_x(self.max_jobs),
-            'n_tasks': self.discrete_i(self.max_tasks),
-            'n_completed_tasks': self.discrete_i(self.max_tasks),
+            'id_': self.discrete_x(args.max_stages),
+            'job_id': self.discrete_x(args.n_jobs),
+            'n_tasks': self.discrete_i(args.max_tasks),
+            'n_completed_tasks': self.discrete_i(args.max_tasks),
             'task_duration': self.time_space,
-            'worker_types_mask': MultiBinary(self.n_worker_types),
-            'tasks': Tuple(self.max_tasks * [self.task_space])
+            'worker_types_mask': MultiBinary(args.n_worker_types),
+            'tasks': Tuple(args.max_tasks * [self.task_space])
         })
 
         self.job_space = Dict({
-            'id_': self.discrete_x(self.max_jobs),
+            'id_': self.discrete_x(args.n_jobs),
             'dag': self.dag_space,
             't_arrival': self.time_space,
             't_completed': self.time_space,
-            'stages': Tuple(self.max_stages * [self.stage_space]),
-            'n_stages': self.discrete_i(self.max_stages),
-            'n_completed_stages': self.discrete_i(self.max_stages)
+            'stages': Tuple(args.max_stages * [self.stage_space]),
+            'n_stages': self.discrete_i(args.max_stages),
+            'n_completed_stages': self.discrete_i(args.max_stages)
         })
 
         self.observation_space = Dict({
             'wall_time': self.time_space,
-            'jobs': Tuple(self.max_jobs * [self.job_space]),
-            'n_jobs': self.discrete_i(self.max_jobs),
-            'n_completed_jobs': self.discrete_i(self.max_jobs),
-            'workers': Tuple(self.n_workers * [self.worker_space]),
+            'jobs': Tuple(args.n_jobs * [self.job_space]),
+            'n_jobs': self.discrete_i(args.n_jobs),
+            'n_completed_jobs': self.discrete_i(args.n_jobs),
+            'workers': Tuple(args.n_workers * [self.worker_space]),
             'frontier_stages_mask': self.stages_mask_space,
             'saturated_stages_mask': self.stages_mask_space
         })
@@ -187,135 +163,31 @@ class DagSchedEnv(gym.Env):
 
     def _init_action_space(self):
         self.action_space = Dict({
-            'job_id': self.discrete_x(self.max_jobs),
-            'stage_id': self.discrete_x(self.max_stages),
+            'job_id': self.discrete_x(args.n_jobs),
+            'stage_id': self.discrete_x(args.max_stages),
             'worker_type_counts': MultiDiscrete(
-                self.n_worker_types * [self.n_workers])
+                args.n_worker_types * [args.n_workers])
         })
-
-
-    def _construct_null_entities(self):
-        '''returns a 'null' observation where
-        - exclusive discrete attributes are set to largest (invalid) value
-        - invlusive discrete attributes are set to zero
-        - time attributes are set to infinity
-        - multi-binary attributes are zeroed out
-        in object form. convert to dict using `asdict`
-        '''
-        self.null_worker = Worker(
-            id_=Worker.invalid_id, 
-            type_=Worker.invalid_type, 
-            job_id=Job.invalid_id, 
-            stage_id=Stage.invalid_id, 
-            task_id=Stage.invalid_task_id)
-
-        self.null_task = Task(
-            worker_id=Worker.invalid_id,
-            is_processing=0,
-            t_accepted=invalid_time(),
-            t_completed=invalid_time()
-        )
-
-        self.null_stage = Stage(
-            id_=Stage.invalid_id,
-            job_id=Job.invalid_id,
-            n_tasks=0, 
-            n_completed_tasks=0,
-            task_duration=invalid_time(),
-            worker_types_mask=np.array(self.n_worker_types*[0]), 
-            tasks=tuple([dcp(self.null_task) for _ in range(self.max_tasks)])
-        )        
-
-        self.null_job = Job(
-            id_=Job.invalid_id,
-            dag=np.zeros(triangle(self.max_stages)), 
-            t_arrival=invalid_time(),
-            t_completed=invalid_time(),
-            stages=tuple([dcp(self.null_stage) for _ in range(self.max_stages)]),
-            n_stages=0,
-            n_completed_stages=0
-        )
-
-        null_jobs = [dcp(self.null_job) for _ in range(self.max_jobs)]
-        null_workers = [dcp(self.null_worker) for _ in range(self.n_workers)]
-        null_stages_mask = np.zeros(self.max_jobs * self.max_stages)
-
-        self.null_state = DagSchedState(
-            wall_time=to_wall_time(0),
-            jobs=tuple(null_jobs),
-            n_jobs=0,
-            n_completed_jobs=0,
-            workers=tuple(null_workers),
-            frontier_stages_mask=null_stages_mask.copy(),
-            saturated_stages_mask=null_stages_mask.copy(),
-        )
 
 
     def _init_timeline(self):
         self.timeline = Timeline()
         t = 0.
-        for id_ in range(self.max_jobs):
-            t += np.random.exponential(self.mean_job_interarrival_time)
-            job = self._generate_job(id_, to_wall_time(t))
+        for id_ in range(args.n_jobs):
+            t += np.random.exponential(args.mjit)
+            job = gen.generate_job(id_, to_wall_time(t), self.dag_space)
             self.timeline.push(t, JobArrival(job))
 
 
-    def _generate_workers(self):
+    def _init_workers(self):
         for i, worker in enumerate(self.state.workers):
-            worker.id_ = i
-            # ensure there is at least one worker of each type
-            worker.type_ = i if i < self.n_worker_types \
-                else np.random.randint(low=0, high=self.n_worker_types)
-
-
-    def _generate_job(self, id_, t_arrival):
-        stages, n_stages = self._generate_stages(id_)
-        dag = self.dag_space.sample()
-        job = Job(
-            id_=id_,
-            dag=dag,
-            t_arrival=t_arrival,
-            t_completed=invalid_time(),
-            stages=stages,
-            n_stages=n_stages,
-            n_completed_stages=0
-        )
-        return job
-
-
-    def _generate_stages(self, job_id):
-        n_stages = np.random.randint(low=2, high=self.max_stages+1)
-        stages = []
-        for i in range(n_stages):
-            n_tasks = np.random.randint(low=1, high=self.max_tasks+1)
-            duration = np.random.normal(loc=30., scale=10.)
-            stages += [Stage(
-                id_=i,
-                job_id=job_id,
-                n_tasks=n_tasks,
-                n_completed_tasks=0,
-                task_duration=to_wall_time(duration),
-                worker_types_mask=self._generate_worker_types_mask(), 
-                tasks=tuple([dcp(self.null_task) for _ in range(self.max_tasks)])
-            )]
-
-        stages += (self.max_stages-n_stages) * [self.null_stage]
-        assert len(stages) == self.max_stages
-        stages = tuple(stages)
-        return stages, n_stages
-
-
-    def _generate_worker_types_mask(self):
-        n_types = np.random.randint(low=1, high=self.n_worker_types+1)
-        worker_types = np.array(n_types*[1] + (self.n_worker_types-n_types)*[0])
-        np.random.shuffle(worker_types)
-        return worker_types
+            gen.generate_worker(worker, i)
 
 
     def _push_tasks(self, stage, task_ids):
         for task_id in task_ids:
             t_completion = \
-                self.state.wall_time + stage.generate_task_duration()
+                self.state.wall_time + gen.generate_task_duration(stage)
             event = TaskCompletion(stage, task_id)
             self.timeline.push(t_completion[0], event)
 
