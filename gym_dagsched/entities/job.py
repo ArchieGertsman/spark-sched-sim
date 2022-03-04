@@ -2,11 +2,24 @@ import typing
 from dataclasses import dataclass
 
 import numpy as np
+from gym.spaces import Dict, Tuple
 import networkx as nx
 
-from args import args
-from dagsched_utils import triangle, invalid_time
-from .stage import Stage
+from ..args import args
+from ..utils.misc import triangle, invalid_time
+from ..utils.spaces import discrete_x, discrete_i, time_space, dag_space
+from .stage import Stage, stage_space
+
+
+job_space = Dict({
+    'id_': discrete_x(args.n_jobs),
+    'dag': dag_space,
+    't_arrival': time_space,
+    't_completed': time_space,
+    'stages': Tuple(args.max_stages * [stage_space]),
+    'n_stages': discrete_i(args.max_stages),
+    'n_completed_stages': discrete_i(args.max_stages)
+})
 
 
 @dataclass

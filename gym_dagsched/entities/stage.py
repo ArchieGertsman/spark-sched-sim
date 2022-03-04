@@ -2,10 +2,23 @@ from dataclasses import dataclass
 import typing
 
 import numpy as np
+from gym.spaces import Dict, MultiBinary, Tuple
 
-from args import args
-from dagsched_utils import invalid_time, mask_to_indices
-from .task import Task
+from ..args import args
+from ..utils.misc import invalid_time, mask_to_indices
+from ..utils.spaces import discrete_x, discrete_i, time_space
+from .task import Task, task_space
+
+
+stage_space = Dict({
+    'id_': discrete_x(args.max_stages),
+    'job_id': discrete_x(args.n_jobs),
+    'n_tasks': discrete_i(args.max_tasks),
+    'n_completed_tasks': discrete_i(args.max_tasks),
+    'task_duration': time_space,
+    'worker_types_mask': MultiBinary(args.n_worker_types),
+    'tasks': Tuple(args.max_tasks * [task_space])
+})
 
 
 @dataclass 

@@ -1,9 +1,20 @@
 from dataclasses import dataclass
 
 import numpy as np
+from gym.spaces import Dict
 
-from args import args
+from ..args import args
+from ..utils.spaces import discrete_x
 from . import task
+
+
+worker_space = Dict({
+    'id_': discrete_x(args.n_workers),
+    'type_': discrete_x(args.n_worker_types),
+    'job_id': discrete_x(args.n_jobs),
+    'stage_id': discrete_x(args.max_stages),
+    'task_id': discrete_x(args.max_tasks)
+})
 
 
 @dataclass

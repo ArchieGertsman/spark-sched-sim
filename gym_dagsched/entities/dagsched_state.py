@@ -2,12 +2,25 @@ import typing
 from dataclasses import dataclass, fields
 
 import numpy as np
+from gym.spaces import Dict, Tuple
 
-from args import args
-from dagsched_utils import to_wall_time, mask_to_indices
-from .job import Job
-from .worker import Worker
+from ..args import args
+from ..utils.misc import to_wall_time, mask_to_indices
+from ..utils.spaces import discrete_i, time_space, stages_mask_space
+from .job import Job, job_space
+from .worker import Worker, worker_space
 from .stage import Stage
+
+
+dagsched_state_space = Dict({
+    'wall_time': time_space,
+    'jobs': Tuple(args.n_jobs * [job_space]),
+    'n_jobs': discrete_i(args.n_jobs),
+    'n_completed_jobs': discrete_i(args.n_jobs),
+    'workers': Tuple(args.n_workers * [worker_space]),
+    'frontier_stages_mask': stages_mask_space,
+    'saturated_stages_mask': stages_mask_space
+})
 
 
 @dataclass
@@ -213,6 +226,15 @@ class DagSchedState:
         stage.add_task_completion(task_id, self.wall_time.copy())
         
         worker.make_available()
+
+        if stage.is_complete:
+            print('stage completion')
+            self.process_stage_completion(stage)
+        
+        job = self.jobs[stage.job_id]
+        if job.is_complete:
+            print('job completion')
+            self.process_job_completion(job)
 
 
     def process_stage_completion(self, stage):

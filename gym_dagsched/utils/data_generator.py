@@ -1,10 +1,11 @@
 import numpy as np
 
-from args import args
-from entities.job import Job
-from entities.stage import Stage
-from entities.task import Task
-from dagsched_utils import invalid_time, to_wall_time
+from ..args import args
+from ..entities.job import Job
+from ..entities.stage import Stage
+from ..entities.task import Task
+from ..utils.misc import invalid_time, to_wall_time
+from ..utils.spaces import dag_space
 
 
 def generate_worker(worker, i):
@@ -14,7 +15,7 @@ def generate_worker(worker, i):
         else np.random.randint(low=0, high=args.n_worker_types)
 
 
-def generate_job(id_, t_arrival, dag_space):
+def generate_job(id_, t_arrival):
     stages, n_stages = generate_stages(id_)
     dag = dag_space.sample()
     job = Job(
