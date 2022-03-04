@@ -12,7 +12,7 @@ from .worker import Worker, worker_space
 from .stage import Stage
 
 
-dagsched_state_space = Dict({
+sys_state_space = Dict({
     'wall_time': time_space,
     'jobs': Tuple(args.n_jobs * [job_space]),
     'n_jobs': discrete_i(args.n_jobs),
@@ -24,7 +24,7 @@ dagsched_state_space = Dict({
 
 
 @dataclass
-class DagSchedState:
+class SysState:
     wall_time: np.ndarray = to_wall_time(0.)
 
     n_jobs: int = 0
@@ -228,12 +228,12 @@ class DagSchedState:
         worker.make_available()
 
         if stage.is_complete:
-            print('stage completion')
+            # print('stage completion')
             self.process_stage_completion(stage)
         
         job = self.jobs[stage.job_id]
         if job.is_complete:
-            print('job completion')
+            # print('job completion')
             self.process_job_completion(job)
 
 
