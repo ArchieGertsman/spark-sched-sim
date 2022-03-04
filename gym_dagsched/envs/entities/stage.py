@@ -34,7 +34,7 @@ class Stage:
     # which types of worker are compaitble with
     # this type of stage (for heterogeneous
     # environments)
-    worker_types_mask: np.ndarray = invalid_time()
+    worker_types_mask: np.ndarray = np.zeros(args.n_worker_types)
 
     tasks: typing.Tuple[Task, ...] = \
         tuple([Task() for _ in range(args.max_tasks)])
