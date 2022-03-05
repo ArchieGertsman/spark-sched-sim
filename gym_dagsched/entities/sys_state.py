@@ -123,30 +123,37 @@ class SysState:
         if action.job_id == Job.INVALID_ID or action.stage_id == Stage.INVALID_ID:
             return False
 
-        stage = self.jobs[action.job_id].stages[action.stage_id]
+        job = self.jobs[action.job_id]
+        stage = job.stages[action.stage_id]
 
-        # check that not too many workers are requested
-        if stage.n_remaining_tasks < action.worker_type_counts.sum():
-            return False
+        # n_requested_workers = action.worker_type_counts.sum()
+
+        # # check that not too many workers are requested for the stage
+        # if n_requested_workers > stage.n_remaining_tasks:
+        #     return False
+
+        # # check that not too many workers are requested for the job
+        # if n_requested_workers > job.n_avail_worker_slots:
+        #     return False
 
         # check that the selected stage is actually ready for scheduling
         stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
         if not self.is_stage_in_frontier(stage_idx):
             return False
 
-        # check that there are enough workers of each type
-        # to fulfill the request
-        n_worker_types = len(action.worker_type_counts)
-        avail_worker_counts = self.get_avail_worker_counts(n_worker_types)
-        requested_counts = np.array(action.worker_type_counts)
-        if (requested_counts > avail_worker_counts).any():
-            return False
+        # # check that there are enough workers of each type
+        # # to fulfill the request
+        # n_worker_types = len(action.worker_type_counts)
+        # avail_worker_counts = self.get_avail_worker_counts(n_worker_types)
+        # requested_counts = np.array(action.worker_type_counts)
+        # if (requested_counts > avail_worker_counts).any():
+        #     return False
 
-        # check that the requested types are actually 
-        # compatible with the stage's worker types
-        for worker_type in stage.incompatible_worker_types():
-            if action.worker_type_counts[worker_type] > 0:
-                return False
+        # # check that the requested types are actually 
+        # # compatible with the stage's worker types
+        # for worker_type in stage.incompatible_worker_types():
+        #     if action.worker_type_counts[worker_type] > 0:
+        #         return False
 
         return True
 
@@ -169,11 +176,17 @@ class SysState:
 
         # find workers that are closest to this stage's job
         for worker_type in stage.compatible_worker_types():
-            count = action.worker_type_counts[worker_type]
-            for _ in range(count):
+            if stage.saturated:
+                break
+            n_remaining_requests = action.n_workers - len(task_ids)
+            for _ in range(n_remaining_requests):
                 worker = self.find_closest_worker(stage, worker_type)
+                if worker is None:
+                    break
                 task_id = self.schedule_worker(worker, stage)
                 task_ids += [task_id]
+
+        print(f'scheduled {len(task_ids)} tasks')
 
         # check if stage is now saturated; if so, remove from frontier
         stage_idx = self.get_stage_idx(action.job_id, action.stage_id)
@@ -190,33 +203,61 @@ class SysState:
         1. worker is already at stage
         2. worker is not at stage but is at stage's job
         3. any other available worker
+        if the stage is already saturated, or if no 
+        worker is found, then `None` is returned
         '''
+        if stage.saturated:
+            return None
 
         # try to find available worker already at the stage
         for task in stage.tasks:
             if task.worker_id == Worker.INVALID_ID:
                 continue
             worker = self.workers[task.worker_id]
-            if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):
+            if worker.type_ == worker_type and worker.available:
                 return worker
+
+        # job_is_at_worker_capacity = \
+        #     self.jobs[stage.job_id].is_at_worker_capacity
 
         # try to find available worker at stage's job;
         # if none is found then return any available worker
         avail_worker = None
         for worker in self.workers:
-            if worker.type_ == worker_type and worker.available: # and worker.can_assign(stage):
+            if worker.type_ == worker_type and worker.available:
                 if worker.job_id == stage.job_id:
                     return worker
-                elif avail_worker == None:
+                elif avail_worker == None: #and not job_is_at_worker_capacity:
                     avail_worker = worker
         return avail_worker
 
 
     def schedule_worker(self, worker, stage):
+        # check if the worker is moving to a different job
+        # if worker.job_id != stage.job_id:
+        #     old_job_id = worker.job_id
+        #     new_job_id = stage.job_id
+        #     self.update_job_worker_counts(old_job_id, new_job_id)
+
         worker.assign_new_stage(stage)
 
         task_id = stage.add_worker(worker, self.wall_time.copy())
         return task_id
+
+
+    def update_job_worker_counts(self, old_job_id, new_job_id):
+        old_job = self.jobs[old_job_id] \
+            if old_job_id != Job.INVALID_ID \
+            else None
+        new_job = self.jobs[new_job_id]
+
+        if old_job is not None:
+            print(old_job_id, new_job_id)
+            assert old_job.n_workers > 0
+            old_job.n_workers -= 1
+        
+        assert not new_job.is_at_worker_capacity
+        new_job.n_workers += 1
 
 
     def process_task_completion(self, stage, task_id):
@@ -228,12 +269,12 @@ class SysState:
         worker.make_available()
 
         if stage.is_complete:
-            # print('stage completion')
+            print('stage completion')
             self.process_stage_completion(stage)
         
         job = self.jobs[stage.job_id]
         if job.is_complete:
-            # print('job completion')
+            print('job completion')
             self.process_job_completion(job)
 
 

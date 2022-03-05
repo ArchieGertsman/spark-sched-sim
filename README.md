@@ -16,5 +16,3 @@ What?
     graphs (a.k.a dags) where an edge from stage (a) to stage (b) means
     that (a) must finish before (b) can begin.
 
-![](https://imgur.com/EOU5h7H)
-

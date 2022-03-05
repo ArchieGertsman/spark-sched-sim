@@ -29,7 +29,7 @@ class DagSchedEnv(Env):
         return self.state
 
 
-    def step(self, action_dict):
+    def step(self, action):
         '''steps into the next scheduling event on the timeline, 
         which can be one of the following:
         (1) new job arrival
@@ -38,18 +38,18 @@ class DagSchedEnv(Env):
             even though neither (1) nor (2) have occurred, so 
             the policy should consider taking one of them
         '''
-        action = from_dict(Action, action_dict)
         if self.state.is_action_valid(action):
             stage, task_ids = self.state.take_action(action)
             self._push_task_completion_events(stage, task_ids)
-        # else:
-        #     print('invalid action')
+        else:
+            print('invalid action')
 
         # if there are still actions available after
         # processing the most recent one, then push 
         # a "nudge" event to notify the scheduling agent
         # that another action can immediately be taken
         if self.state.actions_available():
+            print('pushing nudge')
             self._push_nudge_event()
 
         # check if simulation is done
@@ -124,11 +124,11 @@ class DagSchedEnv(Env):
 
         if isinstance(event, JobArrival):
             job = event.obj
-            # print(f'{t}: job arrival')
+            print(f'{t}: job arrival')
             self.state.add_job(job)
         elif isinstance(event, TaskCompletion):
             stage, task_id = event.obj, event.task_id
-            # print(f'{t}: task completion', f'({stage.job_id},{stage.id_},{task_id})')
+            print(f'{t}: task completion', f'({stage.job_id},{stage.id_},{task_id})')
             self.state.process_task_completion(stage, task_id)
-        # else:
-        #     print(f'{t}: nudge')
+        else:
+            print(f'{t}: nudge')

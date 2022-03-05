@@ -18,6 +18,8 @@ def generate_worker(worker, i):
 def generate_job(id_, t_arrival):
     stages, n_stages = generate_stages(id_)
     dag = dag_space.sample()
+    # max_workers = np.random.randint(low=1, high=args.n_workers)
+    max_workers = 2
     job = Job(
         id_=id_,
         dag=dag,
@@ -25,7 +27,9 @@ def generate_job(id_, t_arrival):
         t_completed=invalid_time(),
         stages=stages,
         n_stages=n_stages,
-        n_completed_stages=0
+        n_completed_stages=0,
+        max_workers=max_workers,
+        n_workers=0
     )
     return job
 

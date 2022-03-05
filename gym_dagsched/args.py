@@ -47,8 +47,8 @@ parser.add_argument(
 parser.add_argument(
     '--mjit', 
     type=float, 
-    default=10.,
-    help='mean job interarrival time (default: 10.0)'
+    default=40.,
+    help='mean job interarrival time (default: 40.0)'
 )
 
 

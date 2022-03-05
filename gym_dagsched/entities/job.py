@@ -18,7 +18,9 @@ job_space = Dict({
     't_completed': time_space,
     'stages': Tuple(args.max_stages * [stage_space]),
     'n_stages': discrete_i(args.max_stages),
-    'n_completed_stages': discrete_i(args.max_stages)
+    'n_completed_stages': discrete_i(args.max_stages),
+    'max_workers': discrete_i(args.n_workers),
+    'n_workers': discrete_i(args.n_workers)
 })
 
 
@@ -48,14 +50,23 @@ class Job:
 
     n_completed_stages: int = 0
 
+    max_workers: int = 0
 
-    @property
-    def max_stages(self):
-        return len(self.stages)
+    n_workers: int = 0
+
 
     @property
     def is_complete(self):
         return self.n_completed_stages == self.n_stages
+
+    @property
+    def n_avail_worker_slots(self):
+        assert self.n_workers <= self.max_workers
+        return self.max_workers - self.n_workers
+
+    @property
+    def is_at_worker_capacity(self):
+        return self.n_avail_worker_slots == 0
 
 
     def add_stage_completion(self):
@@ -66,7 +77,7 @@ class Job:
     def dag_to_nx(self):
         # construct adjacency matrix from flattend
         # lower triangle array
-        n = self.max_stages
+        n = args.max_stages
         T = np.zeros((n,n))
         T[np.tril_indices(n,-1)] = self.dag
 

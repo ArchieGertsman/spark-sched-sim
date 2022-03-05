@@ -1,24 +1,23 @@
 from dataclasses import dataclass
 
 import numpy as np
-from gym.spaces import Dict, MultiDiscrete
+from gym.spaces import Dict
 
 from ..args import args
-from gym_dagsched.utils.spaces import discrete_x
+from gym_dagsched.utils.spaces import discrete_x, discrete_i
 
 
 action_space = Dict({
     'job_id': discrete_x(args.n_jobs),
     'stage_id': discrete_x(args.max_stages),
-    'worker_type_counts': MultiDiscrete(
-        args.n_worker_types * [args.n_workers])
+    'n_workers': discrete_i(args.n_workers)
 })
 
 
 @dataclass
 class Action:
-    job_id: int
+    job_id: int = args.n_jobs
 
-    stage_id: int
+    stage_id: int = args.max_stages
 
-    worker_type_counts: np.ndarray
+    n_workers: int = 0
