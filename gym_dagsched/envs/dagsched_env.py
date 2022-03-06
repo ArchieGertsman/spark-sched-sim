@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 from gym import Env
 import numpy as np
 from dacite import from_dict
@@ -26,7 +28,7 @@ class DagSchedEnv(Env):
         self.state = SysState()
         self._init_timeline()
         self._init_workers()
-        return self.state
+        return asdict(self.state)
 
 
     def step(self, action):
@@ -103,8 +105,10 @@ class DagSchedEnv(Env):
         pushes their completions as events to the timeline
         '''
         for task_id in task_ids:
+            assigned_worker_id = stage.tasks[task_id].worker_id
+            worker_type = self.state.workers[assigned_worker_id].type_
             t_completion = \
-                self.state.wall_time + gen.generate_task_duration(stage)
+                self.state.wall_time + gen.generate_task_duration(stage, worker_type)
             t_completion = t_completion[0]
             event = TaskCompletion(stage, task_id)
             self.timeline.push(t_completion, event)

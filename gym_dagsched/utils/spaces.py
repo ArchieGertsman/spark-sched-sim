@@ -7,6 +7,7 @@ from .misc import triangle
 
 # time can be any non-negative real number
 time_space = Box(low=0., high=np.inf, shape=(1,))
+time_spaces = lambda n: Box(low=0., high=np.inf, shape=(n,))
 
 # exclusive discrete space 0 <= k < n, with
 # additional invalid state := n

@@ -5,8 +5,8 @@ import numpy as np
 from gym.spaces import Dict, MultiBinary, Tuple
 
 from ..args import args
-from ..utils.misc import invalid_time, mask_to_indices
-from ..utils.spaces import discrete_x, discrete_i, time_space
+from ..utils.misc import mask_to_indices
+from ..utils.spaces import discrete_x, discrete_i, time_spaces
 from .task import Task, task_space
 
 
@@ -15,8 +15,7 @@ stage_space = Dict({
     'job_id': discrete_x(args.n_jobs),
     'n_tasks': discrete_i(args.max_tasks),
     'n_completed_tasks': discrete_i(args.max_tasks),
-    'task_duration': time_space,
-    'worker_types_mask': MultiBinary(args.n_worker_types),
+    'task_duration_per_worker_type': time_spaces(args.n_worker_types),
     'tasks': Tuple(args.max_tasks * [task_space])
 })
 
@@ -40,14 +39,13 @@ class Stage:
     # have already been completed
     n_completed_tasks: int = 0
 
-    # expected completion time of a single 
-    # task in this stage
-    task_duration: np.ndarray = invalid_time()
-
-    # which types of worker are compaitble with
-    # this type of stage (for heterogeneous
-    # environments)
-    worker_types_mask: np.ndarray = np.zeros(args.n_worker_types)
+    # task_duration_per_worker_type[i] := expected
+    # duration of one of this stage's tasks if it
+    # is executed by a worker of type `i`, or infinity
+    # if the worker type is not compatible with this stage
+    task_duration_per_worker_type: np.ndarray = np.array(
+        [np.inf for _ in range(args.n_worker_types)], 
+        dtype=np.float32)
 
     tasks: typing.Tuple[Task, ...] = \
         tuple([Task() for _ in range(args.max_tasks)])
@@ -78,6 +76,11 @@ class Stage:
     def next_task_id(self):
         assert self.n_saturated_tasks <= self.n_tasks
         return self.n_saturated_tasks
+
+    @property
+    def worker_types_mask(self):
+        mask = self.task_duration_per_worker_type < np.inf
+        return mask.astype(np.int8)
 
 
     def add_task_completion(self, task_id, wall_time):

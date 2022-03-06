@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.express as px
 
 
-def make_gantt(dagsched_state):
+def make_gantt(dagsched_state, x_max):
     df_gantt = _dagsched_state_to_gantt_df(dagsched_state)
 
     n_workers = len(dagsched_state.workers)
@@ -20,7 +20,7 @@ def make_gantt(dagsched_state):
             'job_id': [str(i) for i in range(n_jobs)]
         })
 
-    _setup_x_axis(fig_gantt, df_gantt)
+    _setup_x_axis(fig_gantt, df_gantt, x_max)
 
     fig_gantt.update_traces(width=.7) # set fixed height of gantt boxes
     
@@ -28,16 +28,25 @@ def make_gantt(dagsched_state):
 
     _add_job_completion_vlines(fig_gantt, dagsched_state.jobs)
 
-    return fig_gantt, df_gantt
+    return fig_gantt
 
 
-def _dagsched_state_to_gantt_df(dagsched_state):
+def _dagsched_state_to_gantt_df(sys_state):
     tasks = []
-    for job in dagsched_state.jobs:
-        for stage in job.stages:
-            for task in stage.tasks:
+    for job in sys_state.jobs:
+        
+        for i,stage in enumerate(job.stages):
+            if i >= job.n_stages:
+                break
+
+            for j,task in enumerate(stage.tasks):
+                if j >= stage.n_tasks:
+                    break
+
+                worker_id = task.worker_id
+                worker_type = sys_state.workers[worker_id].type_
                 task_dict = {
-                    'worker_id': str(task.worker_id),
+                    'worker_id': f'{worker_type}_{worker_id}',
                     'job_id': str(job.id_),
                     'stage_id': str(stage.id_),
                     't_accepted': task.t_accepted[0],
@@ -46,7 +55,6 @@ def _dagsched_state_to_gantt_df(dagsched_state):
                 tasks += [task_dict]
 
     df_gantt = pd.DataFrame(tasks)
-    df_gantt = df_gantt[df_gantt.t_accepted != np.inf]
     return df_gantt
 
 
@@ -70,9 +78,11 @@ def _add_job_completion_vlines(fig_gantt, jobs):
             line_color='green')
 
 
-def _setup_x_axis(fig_gantt, df_gantt):
+def _setup_x_axis(fig_gantt, df_gantt, x_max):
     fig_gantt.layout.xaxis.type = 'linear'
+    fig_gantt.update_layout(xaxis_range=(0,x_max))
 
     df_gantt['delta'] = df_gantt.t_completed - df_gantt.t_accepted
     for d in fig_gantt.data:
         d.x = df_gantt[df_gantt.job_id == d.name].delta.tolist()
+

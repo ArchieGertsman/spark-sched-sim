@@ -38,10 +38,10 @@ class SysState:
         tuple([Worker() for _ in range(args.n_workers)])
 
     frontier_stages_mask: np.ndarray = \
-        np.zeros(args.n_jobs * args.max_stages)
+        np.zeros(args.n_jobs * args.max_stages, np.int8)
 
     saturated_stages_mask: np.ndarray = \
-        np.zeros(args.n_jobs * args.max_stages)
+        np.zeros(args.n_jobs * args.max_stages, np.int8)
 
 
     @property

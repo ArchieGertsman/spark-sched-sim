@@ -42,5 +42,8 @@ def fcfs(obs):
 
 def sjf(obs):
     '''selects a frontier stage whose task duration is shortest'''
-    key = lambda stage: stage.task_duration
+    def key(stage):
+        durations = stage.task_duration_per_worker_type
+        durations = durations[durations<np.inf]
+        return durations.mean()
     return _pick_first(obs, key)

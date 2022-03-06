@@ -33,7 +33,7 @@ class Job:
 
     # lower triangle of the dag's adgacency 
     # matrix stored as a flattened array
-    dag: np.ndarray = np.zeros(triangle(args.max_stages))
+    dag: np.ndarray = np.zeros(triangle(args.max_stages), dtype=np.int8)
 
     # arrival time of this job
     t_arrival: np.ndarray = invalid_time()
