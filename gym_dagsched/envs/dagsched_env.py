@@ -105,10 +105,11 @@ class DagSchedEnv(Env):
         pushes their completions as events to the timeline
         '''
         for task_id in task_ids:
-            assigned_worker_id = stage.tasks[task_id].worker_id
+            task = stage.tasks[task_id]
+            assigned_worker_id = task.worker_id
             worker_type = self.state.workers[assigned_worker_id].type_
             t_completion = \
-                self.state.wall_time + gen.generate_task_duration(stage, worker_type)
+                task.t_accepted + gen.generate_task_duration(stage, worker_type)
             t_completion = t_completion[0]
             event = TaskCompletion(stage, task_id)
             self.timeline.push(t_completion, event)

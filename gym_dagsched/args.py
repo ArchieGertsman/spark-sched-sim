@@ -16,7 +16,7 @@ parser.add_argument(
     '--max_stages', 
     type=int, 
     default=8,
-    help='max number of stages a job can contain (default: 10)'
+    help='max number of stages a job can contain (default: 8)'
 )
 
 

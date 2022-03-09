@@ -67,6 +67,7 @@ class Job:
     @property
     def is_at_worker_capacity(self):
         return self.n_avail_worker_slots == 0
+        
 
 
     def add_stage_completion(self):

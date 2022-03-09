@@ -238,11 +238,23 @@ class SysState:
         #     old_job_id = worker.job_id
         #     new_job_id = stage.job_id
         #     self.update_job_worker_counts(old_job_id, new_job_id)
+        
+        old_job_id = worker.job_id
+        new_job_id = stage.job_id
+        moving_cost = self.job_moving_cost(old_job_id, new_job_id)
 
         worker.assign_new_stage(stage)
 
-        task_id = stage.add_worker(worker, self.wall_time.copy())
+        task_id = stage.add_worker(
+            worker, 
+            self.wall_time.copy(), 
+            to_wall_time(moving_cost))
+
         return task_id
+
+
+    def job_moving_cost(self, old_job_id, new_job_id):
+        return 0. if new_job_id == old_job_id else np.random.exponential(10.)
 
 
     def update_job_worker_counts(self, old_job_id, new_job_id):

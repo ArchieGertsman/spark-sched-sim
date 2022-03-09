@@ -99,12 +99,12 @@ class Stage:
         return mask_to_indices(1-self.worker_types_mask)
 
 
-    def add_worker(self, worker, wall_time):
+    def add_worker(self, worker, wall_time, job_moving_cost):
         assert self.n_saturated_tasks < self.n_tasks
         assert worker.compatible_with(self)
         task_id = self.next_task_id
         task = self.tasks[task_id]
         task.worker_id = worker.id_
         task.is_processing = 1
-        task.t_accepted = wall_time
+        task.t_accepted = wall_time + job_moving_cost
         return task_id

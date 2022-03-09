@@ -3,11 +3,14 @@ import pandas as pd
 import plotly.express as px
 
 
-def make_gantt(dagsched_state, x_max):
+def make_gantt(dagsched_state, title, x_max):
     df_gantt = _dagsched_state_to_gantt_df(dagsched_state)
 
-    n_workers = len(dagsched_state.workers)
     n_jobs = len(dagsched_state.jobs)
+
+    sorted_workers = sorted(dagsched_state.workers,
+        key=lambda worker: (worker.type_, worker.id_))
+    sorted_worker_ids = [_worker_display_id(w) for w in sorted_workers]
 
     fig_gantt = px.timeline(df_gantt, 
         x_start='t_accepted',
@@ -15,8 +18,9 @@ def make_gantt(dagsched_state, x_max):
         y='worker_id',
         color='job_id', 
         template='seaborn',
+        title=title,
         category_orders={
-            'worker_id': [str(i) for i in reversed(range(n_workers))],
+            'worker_id': sorted_worker_ids,
             'job_id': [str(i) for i in range(n_jobs)]
         })
 
@@ -31,10 +35,14 @@ def make_gantt(dagsched_state, x_max):
     return fig_gantt
 
 
+def _worker_display_id(worker):
+    return f'{worker.type_}_{worker.id_}'
+
+
 def _dagsched_state_to_gantt_df(sys_state):
     tasks = []
     for job in sys_state.jobs:
-        
+
         for i,stage in enumerate(job.stages):
             if i >= job.n_stages:
                 break
@@ -42,11 +50,9 @@ def _dagsched_state_to_gantt_df(sys_state):
             for j,task in enumerate(stage.tasks):
                 if j >= stage.n_tasks:
                     break
-
-                worker_id = task.worker_id
-                worker_type = sys_state.workers[worker_id].type_
+                worker = sys_state.workers[task.worker_id]
                 task_dict = {
-                    'worker_id': f'{worker_type}_{worker_id}',
+                    'worker_id': _worker_display_id(worker),
                     'job_id': str(job.id_),
                     'stage_id': str(stage.id_),
                     't_accepted': task.t_accepted[0],
