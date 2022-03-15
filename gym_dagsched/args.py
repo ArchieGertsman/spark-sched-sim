@@ -52,4 +52,4 @@ parser.add_argument(
 )
 
 
-args = parser.parse_args('')
+args = parser.parse_args(['--n_workers', '20', '--n_jobs', '10', '--max_stages', '25'])
