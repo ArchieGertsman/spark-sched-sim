@@ -2,6 +2,8 @@ import heapq
 import itertools
 from dataclasses import dataclass
 
+from ..entities.task import Task
+
 
 @dataclass
 class Event:
@@ -13,7 +15,7 @@ class JobArrival(Event):
 
 @dataclass
 class TaskCompletion(Event):
-    task_id: int
+    task: Task
 
 
 

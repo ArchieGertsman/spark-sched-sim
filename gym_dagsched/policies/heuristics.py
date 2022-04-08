@@ -1,38 +1,32 @@
 import numpy as np
 
-from ..args import args
-from ..entities.action import Action
 
-
-def _pick_first(obs, key=None, reverse=False):
+def _pick_first(sim, key=None, reverse=False):
     '''sorts the frontier stages by `key`, if provided,
     then selects the first stage in the sorted frontier 
     for which there is at least one available, compatible
     worker.
     '''
-    frontier_stages = obs.get_frontier_stages()
+    frontier_ops = list(sim.frontier_ops)
     if key is not None:
-        frontier_stages.sort(key=key, reverse=reverse)
+        frontier_ops.sort(key=key, reverse=reverse)
 
-    avail_workers = obs.find_available_workers()
+    avail_workers = sim.find_available_workers()
     
-    first_stage = None
+    first_op = None
 
-    for stage in frontier_stages:
-        if first_stage is not None:
+    for op in frontier_ops:
+        if first_op is not None:
             break
         for worker in avail_workers:
-            if worker.compatible_with(stage):
-                first_stage = stage
+            if worker.compatible_with(op):
+                first_op = op
                 break
-
-    action = Action(
-        job_id=first_stage.job_id,
-        stage_id=first_stage.id_,
-        n_workers=int(first_stage.n_remaining_tasks)
-    ) if first_stage is not None else Action()
     
-    return action
+    n_workers = int(first_op.n_remaining_tasks) \
+        if first_op is not None else 0
+    
+    return first_op, n_workers
 
 
 def fcfs(obs):

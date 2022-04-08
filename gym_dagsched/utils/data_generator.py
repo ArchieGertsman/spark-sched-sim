@@ -1,96 +1,93 @@
 import numpy as np
+import networkx as nx
 
-from ..args import args
 from ..entities.job import Job
-from ..entities.stage import Stage
-from ..entities.task import Task
-from ..utils.misc import invalid_time, mask_to_indices, to_wall_time
-from ..utils.spaces import dag_space
+from ..entities.operation import Operation
+from ..entities.worker import Worker
 
 
-def generate_worker(worker, i):
-    worker.id_ = i
-    # ensure there is at least one worker of each type
-    worker.type_ = i if i < args.n_worker_types \
-        else np.random.randint(low=0, high=args.n_worker_types)
+class DataGenerator:
+
+    def __init__(self, max_ops, max_tasks, n_worker_types):
+        self.MAX_OPS = max_ops
+        self.MAX_TASKS = max_tasks
+        self.N_WORKER_TYPES = n_worker_types
 
 
-def generate_job(id_, t_arrival):
-    stages, n_stages = generate_stages(id_)
-    dag = dag_space.sample()
-    # max_workers = np.random.randint(low=1, high=args.n_workers)
-    max_workers = 2
-    job = Job(
-        id_=id_,
-        dag=dag,
-        t_arrival=t_arrival,
-        t_completed=invalid_time(),
-        stages=stages,
-        n_stages=n_stages,
-        n_completed_stages=0,
-        max_workers=max_workers,
-        n_workers=0
-    )
-    return job
+    def job(self, id, t_arrival):
+        ops = self.ops(id)
+        return Job(
+            id_=id, 
+            ops=ops, 
+            dag=self.dag(len(ops)), 
+            t_arrival=t_arrival)
 
 
-def generate_stages(job_id):
-    n_stages = np.random.randint(low=2, high=args.max_stages+1)
-    stages = []
-    for i in range(n_stages):
-        n_tasks = np.random.randint(low=1, high=args.max_tasks+1)
-        # duration = np.random.normal(loc=30., scale=15.)
-        # TODO: duration for incompatible type should be inf
-        worker_types_mask = generate_worker_types_mask()
-        incompatible_worker_types = mask_to_indices(1-worker_types_mask)
-        durations = generate_task_duration_per_worker_type(incompatible_worker_types)
-        stages += [Stage(
-            id_=i,
-            job_id=job_id,
-            n_tasks=n_tasks,
-            n_completed_tasks=0,
-            task_duration_per_worker_type=durations,
-            tasks=tuple([Task() for _ in range(args.max_tasks)])
-        )]
-
-    stages += [Stage() for _ in range(args.max_stages-n_stages)]
-    assert len(stages) == args.max_stages
-    stages = tuple(stages)
-    return stages, n_stages
+    def dag(self, n):
+        upper_triangle = np.random.binomial(1, 2/n, n*(n-1)//2)
+        adj_matrix = np.zeros((n,n))
+        adj_matrix[np.triu_indices(n,1)] = upper_triangle
+        dag = nx.convert_matrix.from_numpy_matrix(
+            adj_matrix, create_using=nx.DiGraph)
+        assert nx.is_directed_acyclic_graph(dag)
+        return dag
 
 
-def generate_task_duration_per_worker_type(incompatible_worker_types):
-    # generate a baseline task duration
-    baseline_duration = np.random.exponential(30.)
 
-    # generate offsets from this baseline for each worker type
-    # so that some workers will work slower than the baseline
-    # while others will work faster than the baseline
-    worker_types_offsets = np.random.normal(scale=10., size=args.n_worker_types)
-
-    # compute the expected durations from the baseline 
-    # and offsets
-    durations = baseline_duration * np.ones(args.n_worker_types)
-    durations += worker_types_offsets
-
-    # ensure that no expected duration is too small
-    durations = np.clip(durations, 10., None)
-
-    # give incompatible worker types an expected duration
-    # of infinity
-    durations[incompatible_worker_types] = invalid_time()
-    return durations.astype(np.float32)
+    def ops(self, job_id):
+        n_ops = np.random.randint(low=2, high=self.MAX_OPS+1)
+        ops = []
+        for i in range(n_ops):
+            n_tasks = np.random.randint(low=1, high=self.MAX_TASKS+1)
+            mask = self.compatible_worker_types_mask()
+            durations = self.generate_task_duration_per_worker_type(mask)
+            ops += [Operation(
+                id=i,
+                job_id=job_id,
+                n_tasks=n_tasks,
+                mean_task_duration=durations
+            )]
+        return ops
 
 
-def generate_worker_types_mask():
-    n_types = np.random.randint(low=1, high=args.n_worker_types+1)
-    worker_types = n_types*[1] + (args.n_worker_types-n_types)*[0]
-    worker_types = np.array(worker_types, dtype=np.int8)
-    np.random.shuffle(worker_types)
-    return worker_types
+    def compatible_worker_types_mask(self):
+        n_compatible_worker_types = np.random.randint(low=1, high=self.N_WORKER_TYPES+1)
+        worker_types = np.arange(self.N_WORKER_TYPES)
+        compatible_worker_types = \
+            np.random.choice(worker_types, n_compatible_worker_types, replace=False)
+        mask = np.zeros(self.N_WORKER_TYPES, dtype=bool)
+        mask[compatible_worker_types] = True
+        return mask
 
 
-def generate_task_duration(stage, assigned_worker_type):
-        # TODO: do a more complex calculation given 
-        # other properties of this stage
-        return stage.task_duration_per_worker_type[assigned_worker_type]
+    def generate_task_duration_per_worker_type(self, compatible_worker_types_mask):
+        # generate a baseline task duration
+        baseline_duration = np.random.exponential(30.)
+
+        # generate offsets from this baseline for each worker type
+        # so that some workers will work slower than the baseline
+        # while others will work faster than the baseline
+        worker_types_offsets = np.random.normal(scale=10., size=self.N_WORKER_TYPES)
+
+        # compute the expected durations from the baseline 
+        # and offsets
+        durations = baseline_duration * np.ones(self.N_WORKER_TYPES)
+        durations += worker_types_offsets
+
+        # ensure that no expected duration is too small
+        durations = np.clip(durations, 10., None)
+
+        # give incompatible worker types an expected duration
+        # of infinity
+        durations[~compatible_worker_types_mask] = np.inf
+        return durations
+
+
+    def worker(self, i):
+        type_ = i if i < self.N_WORKER_TYPES \
+            else np.random.randint(low=0, high=self.N_WORKER_TYPES)
+        return Worker(id_=i, type_=type_)
+
+    
+    def task_duration(self, op, assigned_worker_type):
+        return op.mean_task_duration[assigned_worker_type]

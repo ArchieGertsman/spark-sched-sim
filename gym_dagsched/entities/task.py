@@ -1,31 +1,26 @@
 from dataclasses import dataclass
 
 import numpy as np
-from gym.spaces import Dict
-
-from ..args import args
-from ..utils.misc import invalid_time
-from ..utils.spaces import discrete_x, discrete_i, time_space
-from .worker import Worker
-
-
-task_space = Dict({
-    'worker_id': discrete_x(args.n_workers),
-    'is_processing': discrete_i(1),
-    't_accepted': time_space,
-    't_completed': time_space
-})
 
 
 @dataclass
 class Task:
-    INVALID_ID = args.max_tasks
+    id_: int
+    op_id: int
+    job_id: int
+    worker_id: int = None
+    t_accepted: float = np.inf
+    t_completed: float = np.inf
 
+    @property
+    def __unique_id(self):
+        return (self.job_id, self.op_id, self.id_)
 
-    worker_id: int = Worker.INVALID_ID
+    def __hash__(self):
+        return hash(self.__unique_id)
 
-    is_processing: bool = False
-
-    t_accepted: np.ndarray = invalid_time()
-
-    t_completed: np.ndarray = invalid_time()
+    def __eq__(self, other):
+        if type(other) is type(self):
+            return self.__unique_id == other.__unique_id
+        else:
+            return False

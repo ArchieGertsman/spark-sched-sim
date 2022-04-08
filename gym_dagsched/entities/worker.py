@@ -1,64 +1,26 @@
 from dataclasses import dataclass
 
-import numpy as np
-from gym.spaces import Dict
-
-from ..args import args
-from ..utils.spaces import discrete_x
-from . import task
-
-
-worker_space = Dict({
-    'id_': discrete_x(args.n_workers),
-    'type_': discrete_x(args.n_worker_types),
-    'job_id': discrete_x(args.n_jobs),
-    'stage_id': discrete_x(args.max_stages),
-    'task_id': discrete_x(args.max_tasks)
-})
-
 
 @dataclass
 class Worker:
-    INVALID_ID = args.n_workers
-
-    INVALID_TYPE = args.n_worker_types
-
-
-    id_: int = INVALID_ID
-
-    # type of the worker (for heterogeneous
-    # environments)
-    type_: int = INVALID_TYPE
-
-    # id of current job assigned to this worker
-    job_id: int = args.n_jobs
-
-    stage_id: int = args.max_stages
-
-    task_id: int = args.max_tasks
-
+    id_: int
+    type_: int
+    task = None
 
 
     @property
     def available(self):
-        return self.task_id == task.Task.INVALID_ID
+        return self.task == None
 
 
     def make_available(self):
-        self.task_id = task.Task.INVALID_ID
+        self.task = None
 
 
-    def compatible_with(self, stage):
-        return np.isin(self.type_, stage.compatible_worker_types())
+    def compatible_with(self, op):
+        return self.type_ in op.compatible_worker_types
 
 
-    def can_assign(self, stage):
-        return self.available and self.compatible_with(stage)
+    def can_assign(self, op):
+        return self.available and self.compatible_with(op)
 
-
-    def assign_new_stage(self, stage):
-        assert self.available
-        assert self.compatible_with(stage)
-        self.job_id = stage.job_id
-        self.stage_id = stage.id_
-        self.task_id = stage.next_task_id

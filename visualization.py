@@ -3,12 +3,10 @@ import pandas as pd
 import plotly.express as px
 
 
-def make_gantt(dagsched_state, title, x_max):
-    df_gantt = _dagsched_state_to_gantt_df(dagsched_state)
+def make_gantt(sim, title, x_max):
+    df_gantt = _dagsched_state_to_gantt_df(sim)
 
-    n_jobs = len(dagsched_state.jobs)
-
-    sorted_workers = sorted(dagsched_state.workers,
+    sorted_workers = sorted(sim.workers,
         key=lambda worker: (worker.type_, worker.id_))
     sorted_worker_ids = [_worker_display_id(w) for w in sorted_workers]
 
@@ -32,7 +30,7 @@ def make_gantt(dagsched_state, title, x_max):
     
     # _add_task_labels(fig_gantt, df_gantt)
 
-    _add_job_completion_vlines(fig_gantt, dagsched_state.jobs)
+    _add_job_completion_vlines(fig_gantt, sim.jobs)
 
     return fig_gantt
 
@@ -41,24 +39,18 @@ def _worker_display_id(worker):
     return f'{worker.type_}_{worker.id_}'
 
 
-def _dagsched_state_to_gantt_df(sys_state):
+def _dagsched_state_to_gantt_df(sim):
     tasks = []
-    for job in sys_state.jobs:
-
-        for i,stage in enumerate(job.stages):
-            if i >= job.n_stages:
-                break
-
-            for j,task in enumerate(stage.tasks):
-                if j >= stage.n_tasks:
-                    break
-                worker = sys_state.workers[task.worker_id]
+    for job in sim.jobs:
+        for op in job.ops:
+            for task in list(op.completed_tasks):
+                worker = sim.workers[task.worker_id]
                 task_dict = {
                     'worker_id': _worker_display_id(worker),
                     'job_id': job.id_,
-                    'stage_id': str(stage.id_),
-                    't_accepted': task.t_accepted[0],
-                    't_completed': task.t_completed[0]
+                    'op_id': str(op.id_),
+                    't_accepted': task.t_accepted,
+                    't_completed': task.t_completed
                 }
                 tasks += [task_dict]
 
@@ -66,22 +58,11 @@ def _dagsched_state_to_gantt_df(sys_state):
     return df_gantt
 
 
-def _add_task_labels(fig_gantt, df_gantt):
-    df_labels = pd.DataFrame(columns=['x','y','text','showarrow'])
-    df_labels.x = (df_gantt.t_accepted + df_gantt.t_completed) / 2
-    df_labels.y = df_gantt.worker_id
-    df_labels.text = df_gantt.stage_id
-    df_labels.showarrow = False
-    labels = df_labels.to_dict(orient='records')
-    for label in labels:
-        label['font'] = dict(size=8, color='white')
-    fig_gantt['layout']['annotations'] = labels
-
 
 def _add_job_completion_vlines(fig_gantt, jobs):
     for job in jobs:
         fig_gantt.add_vline(
-            x=job.t_completed[0], 
+            x=job.t_completed, 
             line_width=2, 
             line_color='red')
 
