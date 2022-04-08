@@ -5,10 +5,10 @@ from .task import Task
 
 class Operation:
 
-    def __init__(self, id, job_id, n_tasks, mean_task_duration):
+    def __init__(self, id, job_id, n_tasks, task_duration):
         self.id_ = id
         self.job_id = job_id
-        self.mean_task_duration = mean_task_duration
+        self.task_duration = task_duration
         self.compatible_worker_types = self.find_compatible_worker_types()
 
         self.n_tasks = n_tasks
@@ -61,8 +61,8 @@ class Operation:
 
     def find_compatible_worker_types(self):
         types = set()
-        for worker_type in range(len(self.mean_task_duration)):
-            if self.mean_task_duration[worker_type] < np.inf:
+        for worker_type in range(len(self.task_duration)):
+            if self.task_duration[worker_type] < np.inf:
                 types.add(worker_type)
         return types
 

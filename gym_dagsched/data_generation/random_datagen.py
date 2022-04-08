@@ -1,29 +1,46 @@
+
 import numpy as np
 import networkx as nx
 
+from .datagen import DataGen
 from ..entities.job import Job
 from ..entities.operation import Operation
-from ..entities.worker import Worker
 
 
-class DataGenerator:
+class RandomDataGen(DataGen):
 
-    def __init__(self, max_ops, max_tasks, n_worker_types):
+    def __init__(self,
+        max_ops, 
+        max_tasks,
+        n_worker_types
+    ):
+        super().__init__(n_worker_types)
         self.MAX_OPS = max_ops
         self.MAX_TASKS = max_tasks
-        self.N_WORKER_TYPES = n_worker_types
 
 
-    def job(self, id, t_arrival):
-        ops = self.ops(id)
+
+    def _initial_job(self, id, t):
+        return self._job(id, t)
+
+
+
+    def _streaming_job(self, id, t):
+        return self._job(id, t)
+
+
+    
+    def _job(self, id, t_arrival):
+        ops = self._ops(id)
         return Job(
             id_=id, 
             ops=ops, 
-            dag=self.dag(len(ops)), 
+            dag=self._dag(len(ops)), 
             t_arrival=t_arrival)
 
 
-    def dag(self, n):
+
+    def _dag(self, n):
         upper_triangle = np.random.binomial(1, 2/n, n*(n-1)//2)
         adj_matrix = np.zeros((n,n))
         adj_matrix[np.triu_indices(n,1)] = upper_triangle
@@ -34,23 +51,24 @@ class DataGenerator:
 
 
 
-    def ops(self, job_id):
+    def _ops(self, job_id):
         n_ops = np.random.randint(low=2, high=self.MAX_OPS+1)
         ops = []
         for i in range(n_ops):
             n_tasks = np.random.randint(low=1, high=self.MAX_TASKS+1)
-            mask = self.compatible_worker_types_mask()
-            durations = self.generate_task_duration_per_worker_type(mask)
+            mask = self._compatible_worker_types_mask()
+            durations = self._generate_task_duration_per_worker_type(mask)
             ops += [Operation(
                 id=i,
                 job_id=job_id,
                 n_tasks=n_tasks,
-                mean_task_duration=durations
+                task_duration=durations
             )]
         return ops
 
 
-    def compatible_worker_types_mask(self):
+
+    def _compatible_worker_types_mask(self):
         n_compatible_worker_types = np.random.randint(low=1, high=self.N_WORKER_TYPES+1)
         worker_types = np.arange(self.N_WORKER_TYPES)
         compatible_worker_types = \
@@ -60,7 +78,8 @@ class DataGenerator:
         return mask
 
 
-    def generate_task_duration_per_worker_type(self, compatible_worker_types_mask):
+
+    def _generate_task_duration_per_worker_type(self, compatible_worker_types_mask):
         # generate a baseline task duration
         baseline_duration = np.random.exponential(30.)
 
@@ -81,13 +100,3 @@ class DataGenerator:
         # of infinity
         durations[~compatible_worker_types_mask] = np.inf
         return durations
-
-
-    def worker(self, i):
-        type_ = i if i < self.N_WORKER_TYPES \
-            else np.random.randint(low=0, high=self.N_WORKER_TYPES)
-        return Worker(id_=i, type_=type_)
-
-    
-    def task_duration(self, op, assigned_worker_type):
-        return op.mean_task_duration[assigned_worker_type]

@@ -1,26 +1,11 @@
+from copy import deepcopy as dcp
+
 import numpy as np
 
-from ..utils.timeline import Timeline, JobArrival, TaskCompletion
-from ..utils.data_generator import DataGenerator
+from ..utils.timeline import JobArrival, TaskCompletion
 
 
 class DagSchedSim:
-
-    def __init__(self, 
-        n_job_arrivals, 
-        n_workers, 
-        mjit, 
-        max_ops, 
-        max_tasks, 
-        n_worker_types
-    ):
-        self.N_JOB_ARRIVALS = n_job_arrivals
-        self.N_WORKERS = n_workers
-        self.MJIT = mjit
-        self.data_gen = DataGenerator(max_ops, max_tasks, n_worker_types)
-        self.reset()
-
-
 
     @property
     def all_jobs_complete(self):
@@ -28,15 +13,14 @@ class DagSchedSim:
 
 
 
-    def reset(self):
+    def reset(self, initial_timeline, workers):
+        self.timeline = dcp(initial_timeline)
+        self.workers = dcp(workers)
         self.wall_time = 0.
         self.jobs = []
         self.n_completed_jobs = 0
-        self.workers = []
         self.frontier_ops = set()
         self.saturated_ops = set()
-        self._init_timeline()
-        self._init_workers()
 
 
 
@@ -78,35 +62,6 @@ class DagSchedSim:
 
 
 
-    def _init_timeline(self):
-        '''Fills timeline with job arrival events, which follow
-        a Poisson process, parameterized by args.mjit (mean job
-        interarrival time)
-        '''
-        self.timeline = Timeline()
-
-        # time of current arrival
-        t = 0.
-
-        for id_ in range(self.N_JOB_ARRIVALS):
-            # sample time until next arrival
-            dt_interarrival = np.random.exponential(self.MJIT)
-            t += dt_interarrival
-
-            # generate a job and add its arrival to the timeline
-            job = self.data_gen.job(id_, t)
-            self.timeline.push(t, JobArrival(job))
-
-
-
-    def _init_workers(self):
-        '''Initializes the workers with randomly generated attributes'''
-        for i in range(self.N_WORKERS):
-            worker = self.data_gen.worker(i)
-            self.workers += [worker]
-
-
-
     def _push_task_completion_events(self, tasks):
         '''Given a list of task ids and the stage they belong to,
         pushes their completions as events to the timeline
@@ -122,7 +77,7 @@ class DagSchedSim:
             assigned_worker_id = task.worker_id
             worker_type = self.workers[assigned_worker_id].type_
             t_completion = \
-                task.t_accepted + self.data_gen.task_duration(op, worker_type)
+                task.t_accepted + op.task_duration[worker_type]
             event = TaskCompletion(op, task)
             self.timeline.push(t_completion, event)
             task = tasks.pop() if len(tasks) > 0 else None
