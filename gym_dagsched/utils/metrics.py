@@ -11,7 +11,7 @@ def avg_job_duration(sim):
 def makespan(sim):
     assert sim.n_completed_jobs > 0
     completion_times = np.array([
-        job.t_completed[0] 
+        job.t_completed
         for job in sim.jobs
     ])
     completion_times = completion_times[completion_times<np.inf]

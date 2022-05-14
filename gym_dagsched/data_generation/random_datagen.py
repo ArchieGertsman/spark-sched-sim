@@ -12,21 +12,13 @@ class RandomDataGen(DataGen):
     def __init__(self,
         max_ops, 
         max_tasks,
+        mean_task_duration,
         n_worker_types
     ):
         super().__init__(n_worker_types)
         self.MAX_OPS = max_ops
         self.MAX_TASKS = max_tasks
-
-
-
-    def _initial_job(self, id, t):
-        return self._job(id, t)
-
-
-
-    def _streaming_job(self, id, t):
-        return self._job(id, t)
+        self.MEAN_TASK_DURATION = mean_task_duration
 
 
     
@@ -81,12 +73,12 @@ class RandomDataGen(DataGen):
 
     def _generate_task_duration_per_worker_type(self, compatible_worker_types_mask):
         # generate a baseline task duration
-        baseline_duration = np.random.exponential(30.)
+        baseline_duration = np.random.exponential(self.MEAN_TASK_DURATION)
 
         # generate offsets from this baseline for each worker type
         # so that some workers will work slower than the baseline
         # while others will work faster than the baseline
-        worker_types_offsets = np.random.normal(scale=10., size=self.N_WORKER_TYPES)
+        worker_types_offsets = np.random.normal(scale=1000., size=self.N_WORKER_TYPES)
 
         # compute the expected durations from the baseline 
         # and offsets
@@ -94,7 +86,7 @@ class RandomDataGen(DataGen):
         durations += worker_types_offsets
 
         # ensure that no expected duration is too small
-        durations = np.clip(durations, 10., None)
+        durations = np.clip(durations, 100., None)
 
         # give incompatible worker types an expected duration
         # of infinity

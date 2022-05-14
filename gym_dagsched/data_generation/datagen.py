@@ -24,19 +24,17 @@ class DataGen:
 
         t = 0.      # time of current arrival
 
-        for i in range(n_job_arrivals):
-            # sample time until next arrival
-            dt_interarrival = np.random.exponential(mjit)
-            t += dt_interarrival
-
+        for id in range(n_job_arrivals):
             # generate a job and add its arrival to the timeline
-            if i < n_init_jobs:
-                id = i
-                job = self._initial_job(id, t)
+            if id < n_init_jobs:
+                job = self._job(id, t)
             else:
-                id = i + n_init_jobs
-                job = self._streaming_job(id, t)
+                # sample time until next arrival
+                dt_interarrival = np.random.exponential(mjit)
+                t += dt_interarrival
+                job = self._job(id, t)
 
+            job.populate_remaining_times()
             timeline.push(t, JobArrival(job))
         
         return timeline
@@ -58,11 +56,5 @@ class DataGen:
 
 
     @abstractmethod
-    def _initial_job(self, id, t):
-        pass
-
-
-
-    @abstractmethod
-    def _streaming_job(self, id, t):
+    def _job(self, id, t):
         pass

@@ -16,9 +16,10 @@ class Operation:
             Task(id_=i, op_id=self.id_, job_id=self.job_id) 
             for i in range(n_tasks)
         ]
-        self.new_tasks = set(tasks)
+        self.remaining_tasks = set(tasks)
         self.processing_tasks = set()
         self.completed_tasks = set()
+        self.remaining_time = np.inf
 
 
     def __hash__(self):
@@ -71,7 +72,7 @@ class Operation:
         assert self.n_saturated_tasks < self.n_tasks
         assert worker.can_assign(self)
 
-        task = self.new_tasks.pop()
+        task = self.remaining_tasks.pop()
         self.processing_tasks.add(task)
 
         worker.task = task
@@ -88,5 +89,7 @@ class Operation:
         self.completed_tasks.add(task)
 
         task.t_completed = wall_time
+
+
     
     

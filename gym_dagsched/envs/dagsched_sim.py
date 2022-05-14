@@ -7,9 +7,18 @@ from ..utils.timeline import JobArrival, TaskCompletion
 
 class DagSchedSim:
 
+    REWARD_SCALE = 1e-4
+    MOVING_COST = 2000.
+
+
     @property
     def all_jobs_complete(self):
         return self.n_completed_jobs == len(self.jobs)
+
+
+    @property 
+    def n_processing_jobs(self):
+        return len(self.jobs) - self.n_completed_jobs
 
 
 
@@ -33,32 +42,37 @@ class DagSchedSim:
             even though neither (1) nor (2) have occurred, so 
             the policy should consider taking one of them
         '''
+
         if op in self.frontier_ops:
             tasks = self.take_action(op, n_workers)
-            self._push_task_completion_events(tasks)
-        else:
-            print('invalid action')
+            if len(tasks) > 0:
+                self._push_task_completion_events(tasks)
+        # else:
+        #     print('invalid action')
 
         # if there are still actions available after
         # processing the most recent one, then push 
         # a "nudge" event to notify the scheduling agent
         # that another action can immediately be taken
         if self.actions_available():
-            print('pushing nudge')
+            # print('pushing nudge')
             self._push_nudge_event()
 
         # check if simulation is done
         if self.timeline.empty:
             assert self.all_jobs_complete
-            print('all jobs completed!')
+            # print('all jobs completed!')
             return True
             
         # retreive the next scheduling event from the timeline
         t, event = self.timeline.pop()
+        print(t)
+
+        reward = self.calculate_reward(t)
 
         self._process_scheduling_event(t, event)
 
-        return False
+        return False, reward
 
 
 
@@ -99,14 +113,14 @@ class DagSchedSim:
 
         if isinstance(event, JobArrival):
             job = event.obj
-            print(f'{t}: job arrival')
+            # print(f'{t}: job arrival')
             self.add_job(job)
         elif isinstance(event, TaskCompletion):
             task = event.task
-            print(f'{t}: task completion', f'({task.job_id},{task.op_id},{task.id_})')
+            # print(f'{t}: task completion', f'({task.job_id},{task.op_id},{task.id_})')
             self.process_task_completion(task)
-        else:
-            print(f'{t}: nudge')
+        # else:
+            # print(f'{t}: nudge')
 
 
 
@@ -120,17 +134,19 @@ class DagSchedSim:
     def process_task_completion(self, task):
         op = self.jobs[task.job_id].ops[task.op_id]
         op.add_task_completion(task, self.wall_time)
+        # op.remaining_time -= \
+        #     op.task_duration[op.task_duration<np.inf].mean()
 
         worker = self.workers[task.worker_id]
         worker.make_available()
 
         if op.is_complete:
-            print('operation completed')
+            # print('operation completed')
             self.process_op_completion(op)
         
         job = self.jobs[op.job_id]
         if job.is_complete:
-            print('job completed')
+            # print('job completed')
             self.process_job_completion(job)
 
 
@@ -169,7 +185,7 @@ class DagSchedSim:
                 task = self.schedule_worker(worker, op)
                 tasks.add(task)
 
-        print(f'scheduled {len(tasks)} tasks')
+        # print(f'scheduled {len(tasks)} tasks')
 
         # check if stage is now saturated; if so, remove from frontier
         if op.saturated:
@@ -229,7 +245,8 @@ class DagSchedSim:
 
     
     def job_moving_cost(self, old_job_id, new_job_id):
-        return 0. if new_job_id == old_job_id else np.random.exponential(10.)
+        return 0. if new_job_id == old_job_id \
+            else np.random.exponential(self.MOVING_COST)
 
 
 
@@ -250,3 +267,9 @@ class DagSchedSim:
 
     def find_available_workers(self):
         return [worker for worker in self.workers if worker.available]
+
+
+
+    def calculate_reward(self, t):
+        reward = -(t - self.wall_time) * self.n_processing_jobs
+        return reward * self.REWARD_SCALE

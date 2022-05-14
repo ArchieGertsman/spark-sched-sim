@@ -50,3 +50,22 @@ def longest_task_first(obs):
         durations = durations[durations<np.inf]
         return durations.mean()
     return _pick_first(obs, key, reverse=True)
+
+
+def max_children(sim):
+    def key(op):
+        job = sim.jobs[op.job_id]
+        return len(list(job.dag.successors(op.id_)))
+    return _pick_first(sim, key, reverse=True)
+
+
+def srt(sim):
+    def key(op):
+        return op.remaining_time
+    return _pick_first(sim, key)
+
+
+def lrt(sim):
+    def key(op):
+        return op.remaining_time
+    return _pick_first(sim, key, reverse=True)
