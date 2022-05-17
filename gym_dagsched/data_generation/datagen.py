@@ -17,7 +17,7 @@ class DataGen:
 
     def initial_timeline(self, n_job_arrivals, n_init_jobs, mjit):
         '''Fills timeline with job arrival events, which follow
-        a Poisson process, parameterized by args.mjit (mean job
+        a Poisson process parameterized by mjit (mean job
         interarrival time)
         '''
         timeline = Timeline()
