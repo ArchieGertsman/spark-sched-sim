@@ -86,23 +86,23 @@ class GraphEncoderNetwork(nn.Module):
         
         
 class PolicyNetwork(nn.Module):
-    def __init__(self, dim_embed):
+    def __init__(self, dim_embed, num_workers):
         super().__init__()
         self.mlp_op_score = make_mlp(3*dim_embed, 1)
         self.mlp_prlvl_score = make_mlp(2*dim_embed+1, 1)
+        self.num_workers = num_workers
         
         
     def forward(
         self, 
         num_ops, 
         num_dags, 
-        num_workers, 
         x, y, z, 
         op_msk, 
         prlvl_msk
     ):
         ops = self._compute_ops(num_ops, x, y, z, op_msk)
-        prlvl = self._compute_prlvl(num_dags, num_workers, y, z, prlvl_msk)
+        prlvl = self._compute_prlvl(num_dags, y, z, prlvl_msk)
         return ops, prlvl
     
     
@@ -119,14 +119,14 @@ class PolicyNetwork(nn.Module):
         return ops
     
     
-    def _compute_prlvl(self, num_dags, num_workers, y, z, prlvl_msk):
-        limits = torch.arange(1, num_workers+1)
+    def _compute_prlvl(self, num_dags, y, z, prlvl_msk):
+        limits = torch.arange(1, self.num_workers+1)
         limits = limits.repeat(num_dags).unsqueeze(1)
-        y_prlvl = torch.repeat_interleave(y, num_workers, dim=0)
-        z_prlvl = z.repeat(num_dags * num_workers, 1)
+        y_prlvl = torch.repeat_interleave(y, self.num_workers, dim=0)
+        z_prlvl = z.repeat(num_dags * self.num_workers, 1)
         
         prlvl = torch.cat([limits, y_prlvl, z_prlvl], dim=1)
-        prlvl = prlvl.reshape(num_dags, num_workers, prlvl.shape[1])
+        prlvl = prlvl.reshape(num_dags, self.num_workers, prlvl.shape[1])
         prlvl = self.mlp_prlvl_score(prlvl).squeeze(-1)
         prlvl -= (1-prlvl_msk)*1000
         prlvl = torch.softmax(prlvl, dim=1)
@@ -135,13 +135,13 @@ class PolicyNetwork(nn.Module):
     
     
 class ActorNetwork(nn.Module):
-    def __init__(self, in_ch, dim_embed):
+    def __init__(self, in_ch, dim_embed, num_workers):
         super().__init__()
         self.encoder = GraphEncoderNetwork(in_ch, dim_embed)
-        self.policy_network = PolicyNetwork(dim_embed)
+        self.policy_network = PolicyNetwork(dim_embed, num_workers)
         
         
-    def forward(self, dag_batch, num_workers, op_msk, prlvl_msk):
+    def forward(self, dag_batch, op_msk, prlvl_msk):
         x, y, z = self.encoder(dag_batch)
         
         num_ops = self._num_ops_per_dag(dag_batch)
@@ -149,7 +149,6 @@ class ActorNetwork(nn.Module):
         ops, prlvl = self.policy_network(
             num_ops, 
             num_dags, 
-            num_workers, 
             x, y, z, 
             op_msk, 
             prlvl_msk)

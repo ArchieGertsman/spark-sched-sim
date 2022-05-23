@@ -1,11 +1,14 @@
 from copy import deepcopy as dcp
 
 import numpy as np
+import torch
+from torch_geometric.utils.convert import from_networkx
+from torch_geometric.data import Batch
 
 from ..utils.timeline import JobArrival, TaskCompletion
 
 
-class DagSchedSim:
+class DagSchedEnv:
 
     # multiplied by reward to control its magnitude
     REWARD_SCALE = 1e-4
@@ -96,7 +99,7 @@ class DagSchedSim:
         # check if simulation is done
         if self.timeline.empty:
             assert self.all_jobs_complete
-            return True
+            return None, None, True
             
         # retreive the next scheduling event from the timeline
         t, event = self.timeline.pop()
@@ -105,7 +108,27 @@ class DagSchedSim:
 
         self._process_scheduling_event(t, event)
 
-        return False, reward
+        return self._observe(), reward, False
+
+
+
+    def _observe(self):
+        dags = []
+        op_msk = []
+        for job in self.jobs:
+            job.update_feature_vectors(self.workers)
+            dags += [from_networkx(job.dag)]
+            for op in job.ops:
+                op_msk += [1] if op in self.frontier_ops else [0]
+
+        if len(dags) == 0:
+            return None
+
+        dag_batch = Batch.from_data_list(dags)
+        op_msk = torch.tensor(op_msk)
+        prlvl_msk = torch.ones((len(dags), len(self.workers)))
+        
+        return dag_batch, op_msk, prlvl_msk
 
 
 
