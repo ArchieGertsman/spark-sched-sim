@@ -9,11 +9,40 @@ from ..utils.timeline import JobArrival, TaskCompletion
 
 
 class DagSchedEnv:
+    '''An OpenAI-Gym-style simulation environment for scheduling 
+    streaming jobs consisting of interdependent operations. 
+    
+    What?
+    "job": consists of "operations" that need to be completed by "workers"
+    "streaming": arriving stochastically and continuously over time
+    "scheduling": assigning workers to jobs
+    "operation": can be futher split into "tasks" which are identical 
+      and can be worked on in parallel. The number of tasks in a 
+      operation is equal to the number of workers that can work on 
+      the operation in parallel.
+    "interdependent": some operations may depend on the results of others, 
+      and therefore cannot begin execution until those dependencies are 
+      satisfied. These dependencies are encoded in directed acyclic graphs 
+      (dags) where an edge from operation (a) to operation (b) means that 
+      (a) must complete before (b) can begin.
 
-    # multiplied by reward to control its magnitude
+    Example: a cloud computing cluster is responsible for receiving workflows
+        (i.e. jobs) and executing them using its resources. A  machine learning 
+        workflow may consist of numerous operations, such as data prep, training/
+        validation, hyperparameter tuning, testing, etc. and these operations 
+        depend on each other, e.g. data prep comes before training. Data prep 
+        can further be broken into tasks, where each task entails prepping a 
+        subset of the data, and these tasks can easily be parallelized. 
+        
+    The process of assigning workers to jobs is crutial, as sophisticated 
+    scheduling algorithms can significantly increase the system's efficiency.
+    Yet, it turns out to be a very challenging problem.
+    '''
+
+    # multiplied with reward to control its magnitude
     REWARD_SCALE = 1e-4
 
-    # expected time of moving a worker between jobs
+    # expected time to move a worker between jobs
     # (mean of exponential distribution)
     MOVING_COST = 2000.
 
@@ -37,7 +66,7 @@ class DagSchedEnv:
 
     def reset(self, initial_timeline, workers):
         '''resets the simulation. should be called before
-        each run. all state data is found here.
+        each run (including first). all state data is found here.
         '''
 
         # a priority queue containing scheduling 
@@ -73,7 +102,7 @@ class DagSchedEnv:
 
 
     def step(self, op, n_workers):
-        '''steps into the next scheduling event on the timeline, 
+        '''steps onto the next scheduling event on the timeline, 
         which can be one of the following:
         (1) new job arrival
         (2) task completion
@@ -113,11 +142,27 @@ class DagSchedEnv:
 
 
     def _observe(self):
+        '''Returns an observation of the state that can be
+        directly passed into the model. This observation
+        consists of `dag_batch, op_msk, prlvl_msk`, where
+        - `dag_batch` is a mini-batch of PyG graphs, where
+            each graph is a dag in the system. See the
+            'Advanced Mini-Batching' section in PyG's docs
+        - `op_msk` is a mask indicating which operations
+            can be scheduled, i.e. op_msk[i] = 1 if the
+            i'th operation is in the frontier, 0 otherwise
+        - `prlvl_msk` is a mask indicating which parallelism
+            levels are valid for each job dag, i.e. 
+            prlvl_msk[i,l] = 1 if parallelism level `l` is
+            valid for job `i`
+        '''
         dags = []
         op_msk = []
         for job in self.jobs:
+            # convert this job into a PyG graph
             job.update_feature_vectors(self.workers)
             dags += [from_networkx(job.dag)]
+            # append this job's operations to the mask
             for op in job.ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
 
@@ -133,7 +178,7 @@ class DagSchedEnv:
 
 
     def _push_task_completion_events(self, tasks):
-        '''Given a list of task ids and the stage they belong to,
+        '''Given a set of task ids and the operation they belong to,
         pushes each of their completions as events to the timeline
         '''
         assert len(tasks) > 0
@@ -144,13 +189,19 @@ class DagSchedEnv:
         op = self.jobs[job_id].ops[op_id]
 
         while task is not None:
-            assigned_worker_id = task.worker_id
-            worker_type = self.workers[assigned_worker_id].type_
-            t_completion = \
-                task.t_accepted + op.task_duration[worker_type]
-            event = TaskCompletion(op, task)
-            self.timeline.push(t_completion, event)
+            self._push_task_completion_event(op, task)
             task = tasks.pop() if len(tasks) > 0 else None
+
+
+    
+    def _push_task_completion_event(self, op, task):
+        '''pushes a single task completion event to the timeline'''
+        assigned_worker_id = task.worker_id
+        worker_type = self.workers[assigned_worker_id].type_
+        t_completion = \
+            task.t_accepted + op.task_duration[worker_type]
+        event = TaskCompletion(op, task)
+        self.timeline.push(t_completion, event)
 
 
 
@@ -167,16 +218,20 @@ class DagSchedEnv:
         '''handles a scheduling event, which can be a job arrival,
         a task completion, or a nudge
         '''
-        self.wall_time = t # update the current wall time
+        # update the current wall time
+        self.wall_time = t
 
         if isinstance(event, JobArrival):
+            # job arrival event
             job = event.obj
             self._add_job(job)
         elif isinstance(event, TaskCompletion):
+            # task completion event
             task = event.task
             self._process_task_completion(task)
         else:
-            pass # nudge event
+            # nudge event
+            pass 
 
 
 
@@ -229,12 +284,12 @@ class DagSchedEnv:
 
 
     def _take_action(self, op, n_workers):
-        '''updates the state of the simulation based on the
+        '''updates the state of the environment based on the
         provided action = (op, n_workers)
 
-        op: Operation object which shall be worked on next
-        n_workers: number of workers to try assigning to `op`
-            in reality, `op` gets `max(n_workers, n_assignable_workers)`
+        op: Operation object which shall receive work next
+        n_workers: number of workers to _try_ assigning to `op`.
+            in reality, `op` gets `min(n_workers, n_assignable_workers)`
             where `n_assignable_workers` is the number of workers
             which are both available and compatible with `op`
 
@@ -304,7 +359,9 @@ class DagSchedEnv:
         account a moving cost, should the worker move 
         between jobs
         '''
-        old_job_id = worker.task.job_id if worker.task is not None else None
+        old_job_id = worker.task.job_id \
+            if worker.task is not None \
+            else None
         new_job_id = op.job_id
         moving_cost = self._job_moving_cost(old_job_id, new_job_id)
 
