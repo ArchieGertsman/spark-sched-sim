@@ -1,28 +1,28 @@
+from re import L
 import sys
 from typing import List
 sys.path.append('./gym_dagsched/data_generation/tpch/')
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from scipy.signal import lfilter
+import matplotlib.pyplot as plt
 
 from gym_dagsched.envs.dagsched_env import DagSchedEnv
 from gym_dagsched.policies.decima_agent import ActorNetwork
 from gym_dagsched.data_generation.random_datagen import RandomDataGen
+from gym_dagsched.utils.metrics import avg_job_duration
 
 
 
+@dataclass
 class Trajectory:
     '''stores the trajectory of one MDP episode'''
 
-    def __init__(self):
-        self.action_lgprobs = []
-        self.rewards = []
+    action_lgprobs: List
 
-
-    def append(self, action_lgprob, reward):
-        self.action_lgprobs += [action_lgprob]
-        self.rewards += [reward]
+    returns: List
 
 
 
@@ -129,12 +129,13 @@ class ReinforceTrainer:
         '''
         self.env.reset(initial_timeline, workers)
 
-        traj = Trajectory()
+        action_lgprobs = []
+        rewards = []
 
         done = False
         obs = None
 
-        while len(traj.action_lgprobs) < ep_length and not done:
+        while len(action_lgprobs) < ep_length and not done:
             if obs is None:
                 next_op, prlvl = None, 0
             else:
@@ -143,64 +144,49 @@ class ReinforceTrainer:
                 next_op, prlvl, action_lgprob = \
                     self.sample_action(ops_probs, prlvl_probs)
 
-                traj.append(action_lgprob, reward)
+                action_lgprobs += [action_lgprob]
+                rewards += [reward]
 
             obs, reward, done = self.env.step(next_op, prlvl)
         
-        return traj
+        returns = self._compute_returns(rewards)
+        return Trajectory(action_lgprobs, returns)
 
 
 
-    def _run_episodes(self, initial_timeline, workers, ep_length):
-        '''runs multiple episodes on the same sequence and returns
-        a list containing each of their (action,observation,reward) 
-        trajectories
+    def _compute_returns(self, rewards):
+        ''' returs array `y` where `y[i] = rewards[i] + discount * y[i+1]`
+        credit: https://stackoverflow.com/a/47971187/5361456
         '''
-
-        def compute_cum_discounted_rewards(rewards, discount):
-            ''' returs array `y` where `y[i] = rewards[i] + discount * y[i+1]`
-            credit: https://stackoverflow.com/a/47971187/5361456
-            '''
-            r = rewards[::-1]
-            a = [1, -discount]
-            b = [1]
-            y = lfilter(b, a, x=r)
-            return y[::-1]
-
-
-        trajectories = []
-
-        for _ in range(self.n_ep_per_seq):
-            traj = self._run_episode(ep_length, initial_timeline, workers)
-            rewards = np.array(traj.rewards)
-            cum_disc_rewards = \
-                compute_cum_discounted_rewards(rewards, self.discount)
-            traj.rewards = cum_disc_rewards
-            trajectories += [traj]
-
-        return trajectories
+        rewards = np.array(rewards)
+        r = rewards[::-1]
+        a = [1, -self.discount]
+        b = [1]
+        y = lfilter(b, a, x=r)
+        return y[::-1]
 
 
 
-    def _train_on_trajectories(self, trajectories):
+    def _learn_from_trajectories(self, trajectories):
         '''given a list of trajectories from multiple MDP episodes
         that were repeated on a fixed job arrival sequence, update the model 
         parameters using the REINFORCE algorithm as in the Decima paper.
         '''
-        cum_disc_rewards_mat = torch.tensor([traj.rewards for traj in trajectories])
+        returns_mat = torch.tensor([traj.returns for traj in trajectories])
 
         action_lgprobs_mat = torch.stack([
             torch.cat(traj.action_lgprobs) 
             for traj in trajectories
         ])
 
-        baselines = cum_disc_rewards_mat.mean(axis=0)
-        advantages_mat = cum_disc_rewards_mat - baselines
+        baselines = returns_mat.mean(axis=0)
+        advantages_mat = returns_mat - baselines
 
         optim.zero_grad()
 
         loss_mat = -action_lgprobs_mat * advantages_mat
-        loss = loss_mat.sum(axis=1).mean()
+        # loss = loss_mat.sum(axis=1).mean()
+        loss = loss_mat.sum()
         loss.backward()
 
         optim.step()
@@ -219,15 +205,31 @@ class ReinforceTrainer:
             workers = datagen.workers(n_workers=self.n_workers)
 
             # run multiple episodes on this fixed sequence
-            trajectories = self._run_episodes(initial_timeline, workers, ep_len)
+            # trajectories = [
+            #     self._run_episode(ep_len, initial_timeline, workers)
+            #     for _ in range(self.n_ep_per_seq)
+            # ]
 
-            self._train_on_trajectories(trajectories)
+            trajectories = []
+            # avg_job_durations = np.zeros(self.n_ep_per_seq)
+            for i in range(self.n_ep_per_seq):
+                traj = self._run_episode(ep_len, initial_timeline, workers)
+                trajectories += [traj]
+                # avg_job_durations[i] = avg_job_duration(self.env)
+
+            # print(avg_job_durations.mean())
+            # for job in self.env.jobs:
+            #     print(job.t_arrival, job.t_completed)
+
+            self._learn_from_trajectories(trajectories)
 
             self.mean_ep_len += self.delta_ep_len
 
 
 
 if __name__ == '__main__':
+
+    # plt.plot(np.arange(5), np.arange(5))
     
     mean_ep_length = 20
 
@@ -250,11 +252,15 @@ if __name__ == '__main__':
         datagen, 
         policy, 
         optim, 
-        n_sequences=10,
-        n_ep_per_seq=4,
+        n_sequences=20,
+        n_ep_per_seq=16,
         discount=.99,
         n_workers=n_workers,
-        initial_mean_ep_len=20,
-        delta_ep_len=3)
+        initial_mean_ep_len=50,
+        delta_ep_len=25)
 
     trainer.train()
+
+
+
+

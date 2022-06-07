@@ -40,7 +40,7 @@ class DagSchedEnv:
     '''
 
     # multiplied with reward to control its magnitude
-    REWARD_SCALE = 1e-4
+    REWARD_SCALE = 1 # 1e-4
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
