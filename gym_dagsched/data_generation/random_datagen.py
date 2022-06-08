@@ -1,6 +1,7 @@
 
 import numpy as np
 import networkx as nx
+from torch_geometric.utils.convert import from_networkx
 
 from .datagen import DataGen
 from ..entities.job import Job
@@ -24,10 +25,12 @@ class RandomDataGen(DataGen):
     
     def _job(self, id, t_arrival):
         ops = self._ops(id)
+        dag, data = self._dag(len(ops))
         return Job(
             id_=id, 
             ops=ops, 
-            dag=self._dag(len(ops)), 
+            dag=dag,
+            data=data,
             t_arrival=t_arrival)
 
 
@@ -36,10 +39,13 @@ class RandomDataGen(DataGen):
         upper_triangle = np.random.binomial(1, 2/n, n*(n-1)//2)
         adj_matrix = np.zeros((n,n))
         adj_matrix[np.triu_indices(n,1)] = upper_triangle
-        dag = nx.convert_matrix.from_numpy_matrix(
+        dag = nx.convert_matrix.from_numpy_array(
             adj_matrix, create_using=nx.DiGraph)
         assert nx.is_directed_acyclic_graph(dag)
-        return dag
+        for _,_,d in dag.edges(data=True):
+            d.clear()
+        data = from_networkx(dag)
+        return dag, data
 
 
 

@@ -3,6 +3,7 @@ import sys
 from typing import List
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from dataclasses import dataclass
+import time
 
 import numpy as np
 import torch
@@ -135,12 +136,20 @@ class ReinforceTrainer:
         done = False
         obs = None
 
+        
+        start = time.time()
+        total_time = 0.
         while len(action_lgprobs) < ep_length and not done:
             if obs is None:
                 next_op, prlvl = None, 0
             else:
                 dag_batch, op_msk, prlvl_msk = obs
+                t0 = time.time()
+                # expensive
                 ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
+                t1 = time.time()
+                total_time += t1-t0
+
                 next_op, prlvl, action_lgprob = \
                     self.sample_action(ops_probs, prlvl_probs)
 
@@ -150,6 +159,8 @@ class ReinforceTrainer:
             obs, reward, done = self.env.step(next_op, prlvl)
         
         returns = self._compute_returns(rewards)
+        end = time.time()
+        # print('time:', total_time, end-start)
         return Trajectory(action_lgprobs, returns)
 
 
@@ -190,52 +201,65 @@ class ReinforceTrainer:
         loss.backward()
 
         optim.step()
+        return loss.item()
 
 
     
     def train(self):
         '''train the model on multiple different job arrival sequences'''
-        for _ in range(self.n_sequences):
-            ep_len = np.random.geometric(1/self.mean_ep_len)
-            ep_len = max(ep_len, self.min_ep_len)
+
+        y = []
+
+        for i in range(self.n_sequences):
+            print(f'beginning training on sequence {i+1}')
+
+            # ep_len = np.random.geometric(1/self.mean_ep_len)
+            # ep_len = max(ep_len, self.min_ep_len)
+            ep_len = self.mean_ep_len
 
             # sample a job arrival sequence and worker types
             initial_timeline = datagen.initial_timeline(
-                n_job_arrivals=20, n_init_jobs=0, mjit=1000.)
+                n_job_arrivals=50, n_init_jobs=0, mjit=1000.)
             workers = datagen.workers(n_workers=self.n_workers)
 
             # run multiple episodes on this fixed sequence
-            # trajectories = [
-            #     self._run_episode(ep_len, initial_timeline, workers)
-            #     for _ in range(self.n_ep_per_seq)
-            # ]
-
             trajectories = []
             # avg_job_durations = np.zeros(self.n_ep_per_seq)
-            for i in range(self.n_ep_per_seq):
+            n_completed_jobs = np.zeros(self.n_ep_per_seq)
+            for j in range(self.n_ep_per_seq):
                 traj = self._run_episode(ep_len, initial_timeline, workers)
+                print(f'episode {j+1} complete')
                 trajectories += [traj]
-                # avg_job_durations[i] = avg_job_duration(self.env)
-
+                n_completed_jobs[j] = self.env.n_completed_jobs
+                print(n_completed_jobs[j])
+                # avg_job_durations[j] = avg_job_duration(self.env)
+                # print(avg_job_durations[j])
+            
             # print(avg_job_durations.mean())
             # for job in self.env.jobs:
             #     print(job.t_arrival, job.t_completed)
 
-            self._learn_from_trajectories(trajectories)
+            # loss = self._learn_from_trajectories(trajectories)
+            # y += [loss]
+            # y += [avg_job_durations.mean()]
+            y += [n_completed_jobs.mean()]
 
             self.mean_ep_len += self.delta_ep_len
+
+        y = np.array(y)
+        print(y)
+        plt.plot(np.arange(len(y)), y)
+        plt.show()
 
 
 
 if __name__ == '__main__':
-
-    # plt.plot(np.arange(5), np.arange(5))
     
     mean_ep_length = 20
 
     datagen = RandomDataGen(
-        max_ops=20,
-        max_tasks=4, # 200 in Decima
+        max_ops=8, # 20
+        max_tasks=4, # 200
         mean_task_duration=2000.,
         n_worker_types=1)
 
@@ -252,12 +276,12 @@ if __name__ == '__main__':
         datagen, 
         policy, 
         optim, 
-        n_sequences=20,
-        n_ep_per_seq=16,
-        discount=.99,
+        n_sequences=5,
+        n_ep_per_seq=4,
+        discount=1.,
         n_workers=n_workers,
-        initial_mean_ep_len=50,
-        delta_ep_len=25)
+        initial_mean_ep_len=300,
+        delta_ep_len=0)
 
     trainer.train()
 

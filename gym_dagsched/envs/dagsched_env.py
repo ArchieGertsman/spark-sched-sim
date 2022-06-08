@@ -1,4 +1,5 @@
 from copy import deepcopy as dcp
+import time
 
 import numpy as np
 import torch
@@ -40,7 +41,7 @@ class DagSchedEnv:
     '''
 
     # multiplied with reward to control its magnitude
-    REWARD_SCALE = 1 # 1e-4
+    REWARD_SCALE = 1e-4
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
@@ -99,6 +100,8 @@ class DagSchedEnv:
         # they need assigned to them
         self.saturated_ops = set()
 
+        self.total_time = 0.
+
 
 
     def step(self, op, n_workers):
@@ -110,6 +113,8 @@ class DagSchedEnv:
             even though neither (1) nor (2) have occurred, so 
             the policy should consider taking one of them
         '''
+        t0 = time.time() 
+
 
         if op in self.frontier_ops:
             tasks = self._take_action(op, n_workers)
@@ -134,9 +139,12 @@ class DagSchedEnv:
         t, event = self.timeline.pop()
 
         reward = self._calculate_reward(t)
-
+        
         self._process_scheduling_event(t, event)
 
+        t1 = time.time()
+        self.total_time += t1-t0
+        
         return self._observe(), reward, False
 
 
@@ -156,22 +164,31 @@ class DagSchedEnv:
             prlvl_msk[i,l] = 1 if parallelism level `l` is
             valid for job `i`
         '''
-        dags = []
+
+        
+
+        data_list = []
         op_msk = []
         for job in self.jobs:
-            # convert this job into a PyG graph
             job.update_feature_vectors(self.workers)
-            dags += [from_networkx(job.dag)]
+            data_list += [job.data]
+
             # append this job's operations to the mask
+           
             for op in job.ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
+            
 
-        if len(dags) == 0:
+
+        if len(data_list) == 0:
             return None
 
-        dag_batch = Batch.from_data_list(dags)
+
+        dag_batch = Batch.from_data_list(data_list)
+
         op_msk = torch.tensor(op_msk)
-        prlvl_msk = torch.ones((len(dags), len(self.workers)))
+        prlvl_msk = torch.ones((len(data_list), len(self.workers)))
+
         
         return dag_batch, op_msk, prlvl_msk
 
@@ -278,6 +295,7 @@ class DagSchedEnv:
 
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
+        print('job completion')
         self.n_completed_jobs += 1
         job.t_completed = self.wall_time
 

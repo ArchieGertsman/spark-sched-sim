@@ -1,8 +1,11 @@
 from dataclasses import dataclass
 from typing import List
+import time
 
 import networkx as nx
 import numpy as np
+import torch
+from torch_geometric.data import Data
 
 
 @dataclass
@@ -18,8 +21,11 @@ class Job:
     ops: List
 
     # networkx dag storing the operations' interdependencies
-    # and their feature vectors
     dag: nx.DiGraph
+
+    # torch geometric Data object which contains all the
+    # dag's nodes, edges, and features vectors
+    data: Data
 
     # time that this job arrived into the system
     t_arrival: float
@@ -122,12 +128,11 @@ class Job:
         based on the current state of the system.
         '''
         n_avail, n_avail_local = self.n_workers(workers)
-        feature_vectors = {
-            i: self.form_feature_vector(
-                op, n_avail, n_avail_local) 
-            for i,op in enumerate(self.ops)
-        }
-        nx.set_node_attributes(self.dag, feature_vectors, 'x')
+
+        self.data.x = torch.tensor([
+            self.form_feature_vector(op, n_avail, n_avail_local) 
+            for op in self.ops
+        ], dtype=torch.float32)
 
 
 
@@ -154,10 +159,10 @@ class Job:
         n_processing_tasks = len(op.processing_tasks)
         mean_task_duration = op.task_duration.mean()
 
-        return np.array([
+        return [
             n_remaining_tasks,
             n_processing_tasks,
             mean_task_duration,
             n_avail_workers,
             n_avail_local_workers
-        ], dtype=np.float32)
+        ]
