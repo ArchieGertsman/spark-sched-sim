@@ -25,12 +25,11 @@ class RandomDataGen(DataGen):
     
     def _job(self, id, t_arrival):
         ops = self._ops(id)
-        dag, data = self._dag(len(ops))
+        dag = self._dag(len(ops))
         return Job(
             id_=id, 
             ops=ops, 
             dag=dag,
-            data=data,
             t_arrival=t_arrival)
 
 
@@ -44,8 +43,7 @@ class RandomDataGen(DataGen):
         assert nx.is_directed_acyclic_graph(dag)
         for _,_,d in dag.edges(data=True):
             d.clear()
-        data = from_networkx(dag)
-        return dag, data
+        return dag
 
 
 

@@ -1,9 +1,13 @@
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 import torch_geometric.nn as gnn
+
+# cuda0 = torch.device('cuda:0')
 
 
 def make_mlp(in_ch, out_ch, h1=32, h2=16):
@@ -63,11 +67,18 @@ class GraphEncoderNetwork(nn.Module):
         self.conv1 = GCNConv(in_ch, dim_embed)
         self.mlp_dag = make_mlp(dim_embed, dim_embed)
         self.mlp_global = make_mlp(dim_embed, dim_embed)
+        self.total_time = 0.
 
     def forward(self, dag_batch):
+        # 9.297%
         x = self._compute_node_level_embeddings(dag_batch)
+
+        # 4.694%
         y = self._compute_dag_level_embeddings(x, dag_batch.batch)
+
+        # 2.549%
         z = self._compute_global_embedding(y)
+
         return x, y, z
     
     
@@ -91,6 +102,7 @@ class PolicyNetwork(nn.Module):
         self.mlp_op_score = make_mlp(3*dim_embed, 1)
         self.mlp_prlvl_score = make_mlp(2*dim_embed+1, 1)
         self.num_workers = num_workers
+        self.total_time = [0,0]
         
         
     def forward(
@@ -101,8 +113,12 @@ class PolicyNetwork(nn.Module):
         op_msk, 
         prlvl_msk
     ):
+        # 6.130%
         ops = self._compute_ops(num_ops, x, y, z, op_msk)
+
+        # 6.953%
         prlvl = self._compute_prlvl(num_dags, y, z, prlvl_msk)
+
         return ops, prlvl
     
     
@@ -114,13 +130,13 @@ class PolicyNetwork(nn.Module):
         
         ops = torch.cat([x,y_ops,z_ops], dim=1)
         ops = self.mlp_op_score(ops).squeeze(-1)
-        ops -= (1-op_msk)*1000.
+        ops -= (1-op_msk)*1000
         ops = torch.softmax(ops, dim=0)
         return ops
     
     
     def _compute_prlvl(self, num_dags, y, z, prlvl_msk):
-        limits = torch.arange(1, self.num_workers+1)
+        limits = torch.arange(1, self.num_workers+1) #, device=cuda0)
         limits = limits.repeat(num_dags).unsqueeze(1)
         y_prlvl = torch.repeat_interleave(y, self.num_workers, dim=0)
         z_prlvl = z.repeat(num_dags * self.num_workers, 1)
@@ -144,7 +160,9 @@ class ActorNetwork(nn.Module):
     def forward(self, dag_batch, op_msk, prlvl_msk):
         x, y, z = self.encoder(dag_batch)
         
+        # not very expensive
         num_ops = self._num_ops_per_dag(dag_batch)
+
         num_dags = dag_batch.num_graphs
         ops, prlvl = self.policy_network(
             num_ops, 
@@ -157,8 +175,10 @@ class ActorNetwork(nn.Module):
     
     
     def _num_ops_per_dag(self, dag_batch):
-        num_ops = dag_batch._inc_dict['edge_index']
+        inc_dict = dag_batch._inc_dict['edge_index'][:dag_batch.num_graphs]
+        num_ops = inc_dict
         num_ops = torch.roll(num_ops, -1)
         num_ops[-1] = dag_batch.num_nodes
-        num_ops -= dag_batch._inc_dict['edge_index']
-        return num_ops
+        num_ops -= inc_dict
+        # print(len(num_ops), num_ops)
+        return num_ops #.cuda()

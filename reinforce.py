@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from gym_dagsched.envs.dagsched_env import DagSchedEnv
 from gym_dagsched.policies.decima_agent import ActorNetwork
 from gym_dagsched.data_generation.random_datagen import RandomDataGen
+from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
 from gym_dagsched.utils.metrics import avg_job_duration
 
 
@@ -145,8 +146,8 @@ class ReinforceTrainer:
             else:
                 dag_batch, op_msk, prlvl_msk = obs
                 t0 = time.time()
-                # expensive
-                ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
+                # 17.478%
+                ops_probs, prlvl_probs = self.policy(dag_batch, op_msk, prlvl_msk)
                 t1 = time.time()
                 total_time += t1-t0
 
@@ -160,7 +161,9 @@ class ReinforceTrainer:
         
         returns = self._compute_returns(rewards)
         end = time.time()
-        # print('time:', total_time, end-start)
+        p = [f'{x / (end-start) * 100: .3f}%' for x in [total_time]]
+        print('time:', p)
+        print('total time:', end-start)
         return Trajectory(action_lgprobs, returns)
 
 
@@ -224,16 +227,15 @@ class ReinforceTrainer:
 
             # run multiple episodes on this fixed sequence
             trajectories = []
-            # avg_job_durations = np.zeros(self.n_ep_per_seq)
+            avg_job_durations = np.zeros(self.n_ep_per_seq)
             n_completed_jobs = np.zeros(self.n_ep_per_seq)
             for j in range(self.n_ep_per_seq):
                 traj = self._run_episode(ep_len, initial_timeline, workers)
-                print(f'episode {j+1} complete')
                 trajectories += [traj]
                 n_completed_jobs[j] = self.env.n_completed_jobs
-                print(n_completed_jobs[j])
-                # avg_job_durations[j] = avg_job_duration(self.env)
-                # print(avg_job_durations[j])
+                # print(n_completed_jobs[j])
+                avg_job_durations[j] = avg_job_duration(self.env)
+                print(f'episode {j+1} complete:', n_completed_jobs[j], avg_job_durations[j])
             
             # print(avg_job_durations.mean())
             # for job in self.env.jobs:
@@ -242,14 +244,15 @@ class ReinforceTrainer:
             # loss = self._learn_from_trajectories(trajectories)
             # y += [loss]
             # y += [avg_job_durations.mean()]
-            y += [n_completed_jobs.mean()]
+            y += [avg_job_durations.mean() / n_completed_jobs.mean()]
 
             self.mean_ep_len += self.delta_ep_len
 
         y = np.array(y)
         print(y)
         plt.plot(np.arange(len(y)), y)
-        plt.show()
+        # plt.show()
+        plt.savefig('bruh.png')
 
 
 
@@ -257,17 +260,19 @@ if __name__ == '__main__':
     
     mean_ep_length = 20
 
-    datagen = RandomDataGen(
-        max_ops=8, # 20
-        max_tasks=4, # 200
-        mean_task_duration=2000.,
-        n_worker_types=1)
+    # datagen = RandomDataGen(
+    #     max_ops=8, # 20
+    #     max_tasks=4, # 200
+    #     mean_task_duration=2000.,
+    #     n_worker_types=1)
+    datagen = TPCHDataGen()
 
     env = DagSchedEnv()
 
     n_workers = 5
 
     policy = ActorNetwork(5, 8, n_workers)
+    # policy.cuda()
 
     optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
@@ -276,11 +281,11 @@ if __name__ == '__main__':
         datagen, 
         policy, 
         optim, 
-        n_sequences=5,
-        n_ep_per_seq=4,
+        n_sequences=10,
+        n_ep_per_seq=8,
         discount=1.,
         n_workers=n_workers,
-        initial_mean_ep_len=300,
+        initial_mean_ep_len=5000,
         delta_ep_len=0)
 
     trainer.train()

@@ -1,6 +1,18 @@
+from enum import Enum, auto
+
 import numpy as np
 
 from .task import Task
+
+
+class OpFt(Enum):
+    N_REMAINING_TASKS = 0
+    N_PROCESSING_TASKS = 1
+    MEAN_TASK_DURATION = 2
+    N_AVAIL_WORKERS = 3
+    N_AVAIL_LOCAL_WORKERS = 4
+    N_FEATURES = 5
+
 
 
 class Operation:
@@ -68,12 +80,15 @@ class Operation:
         return types
 
 
-    def add_worker(self, worker, wall_time, job_moving_cost):
+    def add_worker(self, worker, wall_time, job_moving_cost, x):
         assert self.n_saturated_tasks < self.n_tasks
         assert worker.can_assign(self)
 
         task = self.remaining_tasks.pop()
         self.processing_tasks.add(task)
+
+        x[OpFt.N_REMAINING_TASKS.value] -= 1
+        x[OpFt.N_PROCESSING_TASKS.value] += 1
 
         worker.task = task
         task.worker_id = worker.id_
@@ -81,12 +96,14 @@ class Operation:
         return task
 
 
-    def add_task_completion(self, task, wall_time):
+    def add_task_completion(self, task, wall_time, x):
         assert not self.is_complete
         assert task in self.processing_tasks
 
         self.processing_tasks.remove(task)
         self.completed_tasks.add(task)
+
+        x[OpFt.N_PROCESSING_TASKS.value] -= 1
 
         task.t_completed = wall_time
 

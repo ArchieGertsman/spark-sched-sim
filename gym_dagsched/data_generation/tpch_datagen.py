@@ -1,6 +1,7 @@
 
 import numpy as np
 import networkx as nx
+from torch_geometric.utils.convert import from_networkx
 
 from .datagen import DataGen
 from ..entities.job import Job
@@ -50,6 +51,8 @@ class TPCHDataGen(DataGen):
         # generate DAG
         dag = nx.convert_matrix.from_numpy_matrix(
             adj_matrix, create_using=nx.DiGraph)
+        for _,_,d in dag.edges(data=True):
+            d.clear()
         job = Job(id_=id, ops=ops, dag=dag, t_arrival=t_arrival)
         
         return job

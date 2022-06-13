@@ -7,6 +7,9 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
+from .operation import OpFt
+
+
 
 @dataclass
 class Job:
@@ -23,10 +26,6 @@ class Job:
     # networkx dag storing the operations' interdependencies
     dag: nx.DiGraph
 
-    # torch geometric Data object which contains all the
-    # dag's nodes, edges, and features vectors
-    data: Data
-
     # time that this job arrived into the system
     t_arrival: float
 
@@ -36,6 +35,10 @@ class Job:
     # time that this job completed, i.e. when the last
     # operation completed executing
     t_completed = np.inf
+
+
+
+    
 
 
 
@@ -120,49 +123,3 @@ class Job:
         while len(src_ops) > 0:
             op = src_ops.pop()
             _populate_recursive(op)
-
-
-
-    def update_feature_vectors(self, workers):
-        '''updates the feature vectors of each node in the dag
-        based on the current state of the system.
-        '''
-        n_avail, n_avail_local = self.n_workers(workers)
-
-        self.data.x = torch.tensor([
-            self.form_feature_vector(op, n_avail, n_avail_local) 
-            for op in self.ops
-        ], dtype=torch.float32)
-
-
-
-    def n_workers(self, workers):
-        '''returns a tuple `(n_avail, n_avail_local)` where
-        `n_avail` is the total number of available workers in
-        the system, and `n_avail_local` is the number of 
-        those workers that are local to this job.
-        '''
-        n_avail = 0
-        n_avail_local = 0
-        for worker in workers:
-            if worker.available:
-                n_avail += 1
-                if worker.task is not None and worker.task.job_id == self.id_:
-                    n_avail_local += 1
-        return n_avail, n_avail_local
-
-
-
-    def form_feature_vector(self, op, n_avail_workers, n_avail_local_workers):
-        '''returns a feature vector for a single node in the dag'''
-        n_remaining_tasks = len(op.remaining_tasks)
-        n_processing_tasks = len(op.processing_tasks)
-        mean_task_duration = op.task_duration.mean()
-
-        return [
-            n_remaining_tasks,
-            n_processing_tasks,
-            mean_task_duration,
-            n_avail_workers,
-            n_avail_local_workers
-        ]

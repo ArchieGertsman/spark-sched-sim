@@ -100,6 +100,8 @@ class DagSchedEnv:
         # they need assigned to them
         self.saturated_ops = set()
 
+        self._init_dag_batch()
+
         self.total_time = 0.
 
 
@@ -149,6 +151,25 @@ class DagSchedEnv:
 
 
 
+    def _init_dag_batch(self):
+        data_list = [None] * len(self.timeline.pq)
+
+        for _,_,e in self.timeline.pq:
+            job = e.obj
+            data = from_networkx(job.dag)
+            data.x = torch.zeros((len(job.ops), 5))
+            data_list[job.id_] = data
+
+        self.dag_batch = Batch.from_data_list(data_list)
+
+        self.x_ptrs = {}
+        for _,_,e in self.timeline.pq:
+            job = e.obj
+            x = self._get_feature_vecs(job.id_)
+            self.x_ptrs[job.id_] = x
+
+
+
     def _observe(self):
         '''Returns an observation of the state that can be
         directly passed into the model. This observation
@@ -164,33 +185,82 @@ class DagSchedEnv:
             prlvl_msk[i,l] = 1 if parallelism level `l` is
             valid for job `i`
         '''
+        t0 = time.time()
+        
 
         
 
-        data_list = []
         op_msk = []
+
+        # 20.522%
         for job in self.jobs:
-            job.update_feature_vectors(self.workers)
-            data_list += [job.data]
 
             # append this job's operations to the mask
-           
+        
             for op in job.ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
-            
 
-
-        if len(data_list) == 0:
-            return None
-
-
-        dag_batch = Batch.from_data_list(data_list)
-
-        op_msk = torch.tensor(op_msk)
-        prlvl_msk = torch.ones((len(data_list), len(self.workers)))
 
         
-        return dag_batch, op_msk, prlvl_msk
+        # TODO: name indicies
+
+
+        # 30.164%
+
+        subbatch = self._subbatch(len(self.jobs))
+        subbatch._num_graphs = len(self.jobs)
+
+        n_avail, n_avail_local = self.n_workers()
+        n_avail_local = n_avail_local[subbatch.batch]
+        subbatch.x[:, 3] = n_avail
+        subbatch.x[:, 4] = n_avail_local
+
+        op_msk = torch.tensor(op_msk) #.cuda()
+        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers))) #.cuda()
+
+
+        t1 = time.time()
+        self.total_time += t1-t0
+
+
+        return subbatch, op_msk, prlvl_msk
+
+
+
+
+    def n_workers(self):
+        '''returns a tuple `(n_avail, n_avail_local)` where
+        `n_avail` is the total number of available workers in
+        the system, and `n_avail_local` is the number of 
+        those workers that are local to this job.
+        '''
+        n_avail = 0
+        n_avail_local = torch.zeros(len(self.jobs))
+        for worker in self.workers:
+            if worker.available:
+                n_avail += 1
+                if worker.task is not None:
+                    n_avail_local[worker.task.job_id] += 1
+        return n_avail, n_avail_local
+    
+
+
+    def _get_feature_vecs(self, i):
+        mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
+        mask[i] = True
+        mask = mask[self.dag_batch.batch]
+        return self.dag_batch.x[mask]
+
+
+
+    def _subbatch(self, n):
+        N = self.dag_batch.num_graphs
+        mask = torch.cat([
+            torch.ones(n, dtype=torch.bool), 
+            torch.zeros(N-n, dtype=torch.bool)
+        ])
+        mask = mask[self.dag_batch.batch]
+        return self.dag_batch.subgraph(mask)
 
 
 
@@ -264,8 +334,9 @@ class DagSchedEnv:
 
     def _process_task_completion(self, task):
         '''performs some bookkeeping when a task completes'''
-        op = self.jobs[task.job_id].ops[task.op_id]
-        op.add_task_completion(task, self.wall_time)
+        job = self.jobs[task.job_id]
+        op = job.ops[task.op_id]
+        op.add_task_completion(task, self.wall_time, self.x_ptrs[job.id_][op.id_]) #job.data.x[task.op_id])
 
         worker = self.workers[task.worker_id]
         worker.make_available()
@@ -295,7 +366,7 @@ class DagSchedEnv:
 
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
-        print('job completion')
+        # print('job completion')
         self.n_completed_jobs += 1
         job.t_completed = self.wall_time
 
@@ -383,10 +454,14 @@ class DagSchedEnv:
         new_job_id = op.job_id
         moving_cost = self._job_moving_cost(old_job_id, new_job_id)
 
+        job = self.jobs[op.job_id]
+
         task = op.add_worker(
             worker, 
             self.wall_time, 
-            moving_cost)
+            moving_cost,
+            self.x_ptrs[job.id_][op.id_])
+            # job.data.x[op.id_])
 
         return task
 
