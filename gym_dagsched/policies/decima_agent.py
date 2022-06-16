@@ -7,7 +7,7 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 import torch_geometric.nn as gnn
 
-# cuda0 = torch.device('cuda:0')
+from gym_dagsched.utils.device import device
 
 
 def make_mlp(in_ch, out_ch, h1=32, h2=16):
@@ -136,7 +136,7 @@ class PolicyNetwork(nn.Module):
     
     
     def _compute_prlvl(self, num_dags, y, z, prlvl_msk):
-        limits = torch.arange(1, self.num_workers+1) #, device=cuda0)
+        limits = torch.arange(1, self.num_workers+1, device=device)
         limits = limits.repeat(num_dags).unsqueeze(1)
         y_prlvl = torch.repeat_interleave(y, self.num_workers, dim=0)
         z_prlvl = z.repeat(num_dags * self.num_workers, 1)
@@ -181,4 +181,4 @@ class ActorNetwork(nn.Module):
         num_ops[-1] = dag_batch.num_nodes
         num_ops -= inc_dict
         # print(len(num_ops), num_ops)
-        return num_ops #.cuda()
+        return num_ops.to(device)

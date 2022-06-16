@@ -7,6 +7,7 @@ from torch_geometric.utils.convert import from_networkx
 from torch_geometric.data import Batch
 
 from ..utils.timeline import JobArrival, TaskCompletion
+from ..utils.device import device
 
 
 class DagSchedEnv:
@@ -157,16 +158,24 @@ class DagSchedEnv:
         for _,_,e in self.timeline.pq:
             job = e.obj
             data = from_networkx(job.dag)
-            data.x = torch.zeros((len(job.ops), 5))
+            data.x = torch.tensor(
+                job.form_feature_vectors(),
+                dtype=torch.float32,
+                device=device
+            )
             data_list[job.id_] = data
 
-        self.dag_batch = Batch.from_data_list(data_list)
+        self.dag_batch = Batch.from_data_list(data_list).to(device)
 
         self.x_ptrs = {}
         for _,_,e in self.timeline.pq:
             job = e.obj
             x = self._get_feature_vecs(job.id_)
             self.x_ptrs[job.id_] = x
+
+
+
+   
 
 
 
@@ -187,41 +196,27 @@ class DagSchedEnv:
         '''
         t0 = time.time()
         
-
-        
-
         op_msk = []
-
-        # 20.522%
         for job in self.jobs:
-
             # append this job's operations to the mask
-        
             for op in job.ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
-
-
-        
-        # TODO: name indicies
-
-
-        # 30.164%
 
         subbatch = self._subbatch(len(self.jobs))
         subbatch._num_graphs = len(self.jobs)
 
+        # update feature vectors with new worker info
         n_avail, n_avail_local = self.n_workers()
         n_avail_local = n_avail_local[subbatch.batch]
+        # TODO: name indicies
         subbatch.x[:, 3] = n_avail
         subbatch.x[:, 4] = n_avail_local
 
-        op_msk = torch.tensor(op_msk) #.cuda()
-        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers))) #.cuda()
-
+        op_msk = torch.tensor(op_msk, device=device) #.cuda()
+        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers)), device=device) #.cuda()
 
         t1 = time.time()
         self.total_time += t1-t0
-
 
         return subbatch, op_msk, prlvl_msk
 

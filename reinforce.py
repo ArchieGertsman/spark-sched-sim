@@ -1,12 +1,16 @@
 from re import L
 import sys
 from typing import List
+
+from prometheus_client import Summary
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from dataclasses import dataclass
 import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from scipy.signal import lfilter
 import matplotlib.pyplot as plt
 
@@ -15,6 +19,7 @@ from gym_dagsched.policies.decima_agent import ActorNetwork
 from gym_dagsched.data_generation.random_datagen import RandomDataGen
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
 from gym_dagsched.utils.metrics import avg_job_duration
+from gym_dagsched.utils.device import device
 
 
 
@@ -42,7 +47,8 @@ class ReinforceTrainer:
         discount,
         n_workers,
         initial_mean_ep_len,
-        delta_ep_len
+        delta_ep_len,
+        min_ep_len
     ):
         # instance of dagsched_env
         self.env = env
@@ -79,7 +85,9 @@ class ReinforceTrainer:
         self.delta_ep_len = delta_ep_len
 
         # minimum number of steps in an episode
-        self.min_ep_len = 5
+        self.min_ep_len = min_ep_len
+
+        self.writer = SummaryWriter('tensorboard')
 
 
 
@@ -122,12 +130,12 @@ class ReinforceTrainer:
 
 
 
-    def _run_episode(self, ep_length, initial_timeline, workers):
-        '''runs one MDP episode for `ep_length` iterations given 
+    def _run_episode(self, ep_len, initial_timeline, workers):
+        '''runs one MDP episode for `ep_len` iterations given 
         a job arrival sequence stored in `initial_timeline` and a 
         set of workers, and returns the history of actions, 
         observations, and rewards throughout the episode, each
-        of length `ep_length`.
+        of length `ep_len`.
         '''
         self.env.reset(initial_timeline, workers)
 
@@ -140,13 +148,13 @@ class ReinforceTrainer:
         
         start = time.time()
         total_time = 0.
-        while len(action_lgprobs) < ep_length and not done:
+        while len(action_lgprobs) < ep_len and not done:
             if obs is None:
                 next_op, prlvl = None, 0
             else:
                 dag_batch, op_msk, prlvl_msk = obs
+
                 t0 = time.time()
-                # 17.478%
                 ops_probs, prlvl_probs = self.policy(dag_batch, op_msk, prlvl_msk)
                 t1 = time.time()
                 total_time += t1-t0
@@ -158,12 +166,20 @@ class ReinforceTrainer:
                 rewards += [reward]
 
             obs, reward, done = self.env.step(next_op, prlvl)
-        
+
+        action_lgprobs = torch.cat(action_lgprobs)
         returns = self._compute_returns(rewards)
+
+        diff = ep_len - len(action_lgprobs)
+        if diff > 0:
+            action_lgprobs = F.pad(action_lgprobs, pad=(0,diff), value=0)
+            returns = F.pad(returns, pad=(0,diff), value=0)
+
         end = time.time()
         p = [f'{x / (end-start) * 100: .3f}%' for x in [total_time]]
         print('time:', p)
         print('total time:', end-start)
+
         return Trajectory(action_lgprobs, returns)
 
 
@@ -177,7 +193,7 @@ class ReinforceTrainer:
         a = [1, -self.discount]
         b = [1]
         y = lfilter(b, a, x=r)
-        return y[::-1]
+        return torch.from_numpy(y[::-1].copy()).to(device=device)
 
 
 
@@ -186,10 +202,11 @@ class ReinforceTrainer:
         that were repeated on a fixed job arrival sequence, update the model 
         parameters using the REINFORCE algorithm as in the Decima paper.
         '''
-        returns_mat = torch.tensor([traj.returns for traj in trajectories])
+        returns_mat = torch.stack(
+            [traj.returns for traj in trajectories])
 
         action_lgprobs_mat = torch.stack([
-            torch.cat(traj.action_lgprobs) 
+            traj.action_lgprobs
             for traj in trajectories
         ])
 
@@ -199,7 +216,6 @@ class ReinforceTrainer:
         optim.zero_grad()
 
         loss_mat = -action_lgprobs_mat * advantages_mat
-        # loss = loss_mat.sum(axis=1).mean()
         loss = loss_mat.sum()
         loss.backward()
 
@@ -211,18 +227,16 @@ class ReinforceTrainer:
     def train(self):
         '''train the model on multiple different job arrival sequences'''
 
-        y = []
-
         for i in range(self.n_sequences):
             print(f'beginning training on sequence {i+1}')
 
-            # ep_len = np.random.geometric(1/self.mean_ep_len)
-            # ep_len = max(ep_len, self.min_ep_len)
-            ep_len = self.mean_ep_len
+            ep_len = np.random.geometric(1/self.mean_ep_len)
+            ep_len = max(ep_len, self.min_ep_len)
+            # ep_len = self.mean_ep_len
 
             # sample a job arrival sequence and worker types
             initial_timeline = datagen.initial_timeline(
-                n_job_arrivals=50, n_init_jobs=0, mjit=1000.)
+                n_job_arrivals=100, n_init_jobs=0, mjit=1000.)
             workers = datagen.workers(n_workers=self.n_workers)
 
             # run multiple episodes on this fixed sequence
@@ -232,47 +246,42 @@ class ReinforceTrainer:
             for j in range(self.n_ep_per_seq):
                 traj = self._run_episode(ep_len, initial_timeline, workers)
                 trajectories += [traj]
-                n_completed_jobs[j] = self.env.n_completed_jobs
-                # print(n_completed_jobs[j])
-                avg_job_durations[j] = avg_job_duration(self.env)
-                print(f'episode {j+1} complete:', n_completed_jobs[j], avg_job_durations[j])
-            
-            # print(avg_job_durations.mean())
-            # for job in self.env.jobs:
-            #     print(job.t_arrival, job.t_completed)
 
-            # loss = self._learn_from_trajectories(trajectories)
-            # y += [loss]
-            # y += [avg_job_durations.mean()]
-            y += [avg_job_durations.mean() / n_completed_jobs.mean()]
+                n_completed_jobs[j] = self.env.n_completed_jobs
+                avg_job_durations[j] = avg_job_duration(self.env)
+
+                print(f'episode {j+1} complete:', n_completed_jobs[j], avg_job_durations[j])
+
+            loss = self._learn_from_trajectories(trajectories)
+
+            self.writer.add_scalar('episode length', ep_len, i)
+            self.writer.add_scalar('loss', -loss / ep_len, i)
+            self.writer.add_scalar('avg job duration', avg_job_durations.mean() / n_completed_jobs.mean(), i)
+            self.writer.add_scalar('n completed jobs', n_completed_jobs.mean() / ep_len, i)
 
             self.mean_ep_len += self.delta_ep_len
 
-        y = np.array(y)
-        print(y)
-        plt.plot(np.arange(len(y)), y)
-        # plt.show()
-        plt.savefig('bruh.png')
+        self.writer.close()
 
 
 
 if __name__ == '__main__':
     
-    mean_ep_length = 20
+    mean_ep_len = 20
 
-    # datagen = RandomDataGen(
-    #     max_ops=8, # 20
-    #     max_tasks=4, # 200
-    #     mean_task_duration=2000.,
-    #     n_worker_types=1)
-    datagen = TPCHDataGen()
+    datagen = RandomDataGen(
+        max_ops=8, # 20
+        max_tasks=4, # 200
+        mean_task_duration=2000.,
+        n_worker_types=1)
+    # datagen = TPCHDataGen()
 
     env = DagSchedEnv()
 
-    n_workers = 5
+    n_workers = 10
 
     policy = ActorNetwork(5, 8, n_workers)
-    # policy.cuda()
+    policy.to(device)
 
     optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
@@ -281,14 +290,19 @@ if __name__ == '__main__':
         datagen, 
         policy, 
         optim, 
-        n_sequences=10,
-        n_ep_per_seq=8,
+        n_sequences=20,
+        n_ep_per_seq=4,
         discount=1.,
         n_workers=n_workers,
-        initial_mean_ep_len=5000,
-        delta_ep_len=0)
+        initial_mean_ep_len=500,
+        delta_ep_len=50,
+        min_ep_len=250)
 
+    # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+    #     with record_function("model_inference"):
     trainer.train()
+
+    # print(prof.key_averages().table(row_limit=10))
 
 
 

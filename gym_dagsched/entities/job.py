@@ -123,3 +123,23 @@ class Job:
         while len(src_ops) > 0:
             op = src_ops.pop()
             _populate_recursive(op)
+
+
+
+    def form_feature_vectors(self):
+        return [self.form_feature_vector(op) for op in self.ops]
+
+
+
+    def form_feature_vector(self, op):
+        '''returns a feature vector for a single node in the dag'''
+        n_remaining_tasks = len(op.remaining_tasks)
+        n_processing_tasks = len(op.processing_tasks)
+        mean_task_duration = op.task_duration.mean()
+
+        return [
+            n_remaining_tasks,
+            n_processing_tasks,
+            mean_task_duration,
+            0, 0
+        ] 
