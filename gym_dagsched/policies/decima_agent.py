@@ -107,14 +107,14 @@ class PolicyNetwork(nn.Module):
         
     def forward(
         self, 
-        num_ops, 
+        num_ops_per_dag, 
         num_dags, 
         x, y, z, 
         op_msk, 
         prlvl_msk
     ):
         # 6.130%
-        ops = self._compute_ops(num_ops, x, y, z, op_msk)
+        ops = self._compute_ops(num_ops_per_dag, x, y, z, op_msk)
 
         # 6.953%
         prlvl = self._compute_prlvl(num_dags, y, z, prlvl_msk)
@@ -122,10 +122,10 @@ class PolicyNetwork(nn.Module):
         return ops, prlvl
     
     
-    def _compute_ops(self, num_ops, x, y, z, op_msk):
-        y_ops = torch.repeat_interleave(y, num_ops, dim=0)
+    def _compute_ops(self, num_ops_per_dag, x, y, z, op_msk):
+        y_ops = torch.repeat_interleave(y, num_ops_per_dag, dim=0)
         
-        num_total_ops = num_ops.sum(dim=0)
+        num_total_ops = num_ops_per_dag.sum(dim=0)
         z_ops = z.repeat(num_total_ops, 1)
         
         ops = torch.cat([x,y_ops,z_ops], dim=1)
@@ -159,26 +159,13 @@ class ActorNetwork(nn.Module):
         
     def forward(self, dag_batch, op_msk, prlvl_msk):
         x, y, z = self.encoder(dag_batch)
-        
-        # not very expensive
-        num_ops = self._num_ops_per_dag(dag_batch)
 
         num_dags = dag_batch.num_graphs
         ops, prlvl = self.policy_network(
-            num_ops, 
+            dag_batch.num_ops_per_dag, 
             num_dags, 
             x, y, z, 
             op_msk, 
             prlvl_msk)
         
         return ops, prlvl
-    
-    
-    def _num_ops_per_dag(self, dag_batch):
-        inc_dict = dag_batch._inc_dict['edge_index'][:dag_batch.num_graphs]
-        num_ops = inc_dict
-        num_ops = torch.roll(num_ops, -1)
-        num_ops[-1] = dag_batch.num_nodes
-        num_ops -= inc_dict
-        # print(len(num_ops), num_ops)
-        return num_ops.to(device)

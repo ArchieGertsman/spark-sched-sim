@@ -96,14 +96,15 @@ class ReinforceTrainer:
         the `op_idx`th operation in the system'''
         i = 0
         op = None
-        for job in self.env.jobs:
+        for j, job_id in enumerate(self.env.active_job_ids):
+            job = self.env.jobs[job_id]
             if op_idx < i + len(job.ops):
                 op = job.ops[op_idx - i]
                 break
             else:
                 i += len(job.ops)
         assert op is not None
-        return op
+        return op, j
 
 
 
@@ -118,9 +119,9 @@ class ReinforceTrainer:
         c = torch.distributions.Categorical(probs=ops_probs)
         next_op_idx = c.sample()
         next_op_idx_lgp = c.log_prob(next_op_idx)
-        next_op = self._find_op(next_op_idx)
+        next_op, j = self._find_op(next_op_idx)
 
-        c = torch.distributions.Categorical(probs=prlvl_probs[next_op.job_id])        
+        c = torch.distributions.Categorical(probs=prlvl_probs[j])        
         prlvl = c.sample()
         prlvl_lgp = c.log_prob(prlvl)
 
@@ -149,7 +150,7 @@ class ReinforceTrainer:
         start = time.time()
         total_time = 0.
         while len(action_lgprobs) < ep_len and not done:
-            if obs is None:
+            if obs is None or self.env.n_active_jobs == 0:
                 next_op, prlvl = None, 0
             else:
                 dag_batch, op_msk, prlvl_msk = obs
@@ -172,8 +173,8 @@ class ReinforceTrainer:
 
         diff = ep_len - len(action_lgprobs)
         if diff > 0:
-            action_lgprobs = F.pad(action_lgprobs, pad=(0,diff), value=0)
-            returns = F.pad(returns, pad=(0,diff), value=0)
+            action_lgprobs = F.pad(action_lgprobs, pad=(0,diff))
+            returns = F.pad(returns, pad=(0,diff))
 
         end = time.time()
         p = [f'{x / (end-start) * 100: .3f}%' for x in [total_time]]

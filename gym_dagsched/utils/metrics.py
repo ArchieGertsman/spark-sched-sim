@@ -2,8 +2,8 @@ import numpy as np
 
 def avg_job_duration(env):
     durations = np.array([
-        (job.t_completed - job.t_arrival)
-        for job in env.jobs if job.t_completed < np.inf
+        (env.jobs[j].t_completed - env.jobs[j].t_arrival)
+        for j in env.completed_job_ids
     ])
     return durations.mean()
 
