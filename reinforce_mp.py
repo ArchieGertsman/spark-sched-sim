@@ -1,66 +1,39 @@
-from re import L
 import sys
-from typing import List
 sys.path.append('./gym_dagsched/data_generation/tpch/')
-from dataclasses import dataclass
 import time
 from copy import deepcopy as dcp
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.multiprocessing import Process, Queue, SimpleQueue
 from scipy.signal import lfilter
-import matplotlib.pyplot as plt
-from torch.multiprocessing import Process, Queue
 
 from gym_dagsched.envs.dagsched_env import DagSchedEnv
 from gym_dagsched.policies.decima_agent import ActorNetwork
 from gym_dagsched.data_generation.random_datagen import RandomDataGen
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
 from gym_dagsched.utils.metrics import avg_job_duration
+from gym_dagsched.utils.device import device
 
 
 
-@dataclass
-class Trajectory:
-    '''stores the trajectory of one MDP episode'''
-
-    action_lgprobs: List
-
-    returns: List
-
-
-
-
-def find_op(jobs, op_idx):
-    '''returns an Operation object corresponding to
-    the `op_idx`th operation in the system'''
-    i = 0
-    op = None
-    for job in jobs:
-        if op_idx < i + len(job.ops):
-            op = job.ops[op_idx - i]
-            break
-        else:
-            i += len(job.ops)
-    assert op is not None
-    return op
-
-
-
-def sample_action(jobs, ops_probs, prlvl_probs):
+def sample_action(env, ops_probs, prlvl_probs):
     '''given probabilities for selecting the next operation
     and the parallelism level for that operation's job (returned
-    by the neural network), constructs categorical distributions 
-    from those probabilities and then returns a randomly sampled 
-    operation `next_op` (with index `next_op_idx`) and parallelism 
-    level `prlvl` from those distributions.
+    by the neural network), returns a randomly sampled 
+    action according to those probabilities conisting of
+    - an operation `next_op`, and 
+    - parallelism level `prlvl`, 
+    plus the log probability of the sampled action `action_lgprob` 
+    (which maintains a computational graph for learning)
     '''
     c = torch.distributions.Categorical(probs=ops_probs)
     next_op_idx = c.sample()
     next_op_idx_lgp = c.log_prob(next_op_idx)
-    next_op = find_op(jobs, next_op_idx)
+    next_op, j = env.find_op(next_op_idx)
 
-    c = torch.distributions.Categorical(probs=prlvl_probs[next_op.job_id])        
+    c = torch.distributions.Categorical(probs=prlvl_probs[j])        
     prlvl = c.sample()
     prlvl_lgp = c.log_prob(prlvl)
 
@@ -79,250 +52,225 @@ def compute_returns(rewards, discount):
     a = [1, -discount]
     b = [1]
     y = lfilter(b, a, x=r)
-    return y[::-1]
+    return torch.from_numpy(y[::-1].copy()).float().to(device=device)
 
 
 
-def episode_runner(in_q, out_q):
-    '''runs one MDP episode for `ep_length` iterations given 
+def pad_trajectory(ep_len, action_lgprobs, returns):
+    '''if the episode ended in less than `ep_len` steps, then pads
+    the trajectory with zeros at the end to have length `ep_len`'''
+    diff = ep_len - len(action_lgprobs)
+    if diff > 0:
+        action_lgprobs = F.pad(action_lgprobs, pad=(0, diff))
+        returns = F.pad(returns, pad=(0, diff))
+    return action_lgprobs, returns
+
+
+
+def run_episode(
+    env,
+    initial_timeline,
+    workers,
+    ep_len,
+    policy,
+    discount
+):
+    '''runs one MDP episode for `ep_len` iterations given 
     a job arrival sequence stored in `initial_timeline` and a 
-    set of workers, and returns the history of actions, 
-    observations, and rewards throughout the episode, each
-    of length `ep_length`.
+    set of workers, and returns the trajectory of action log
+    probabilities (which contain gradients) and returns, each 
+    of length `ep_len`
     '''
+    env.reset(initial_timeline, workers)
+
+    action_lgprobs = []
+    rewards = []
+
+    done = False
+    obs = None
+
+    while len(action_lgprobs) < ep_len and not done:
+        if obs is None or env.n_active_jobs == 0:
+            next_op, prlvl = None, 0
+        else:
+            dag_batch, op_msk, prlvl_msk = obs
+            
+            ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
+
+            next_op, prlvl, action_lgprob = \
+                sample_action(env, ops_probs, prlvl_probs)
+
+            action_lgprobs += [action_lgprob]
+            rewards += [reward]
+
+        obs, reward, done = env.step(next_op, prlvl)
+        
+    action_lgprobs = torch.cat(action_lgprobs)
+    returns = compute_returns(rewards, discount)
+
+    return pad_trajectory(ep_len, action_lgprobs, returns)
+
+
+
+def episode_runner(worker_id, discount, optim, in_q, out_q):
+    '''subprocess function which runs episodes and trains the model 
+    by communicating with the parent process'''
+
+    # IMPORTANT! ensures that the different child processes
+    # don't all generate the same random numbers. Otherwise,
+    # each process would produce an identical episode.
+    torch.manual_seed(worker_id)
+
+    # this subprocess's copy of the environment
+    env = DagSchedEnv()
 
     while data := in_q.get():
-        base_env, base_optim, policy, initial_timeline, workers, ep_length, discount = data
-        if base_env is not None:
-            env = base_env
-        if base_optim is not None:
-            optim = base_optim
+        # receive episode data from parent process
+        initial_timeline, workers, ep_length, policy = data
 
-        print('received data')
+        action_lgprobs, returns = \
+            run_episode(
+                env,
+                initial_timeline,
+                workers,
+                ep_length,
+                policy,
+                discount
+            )        
 
-        env.reset(initial_timeline, workers)
+        # send returns back to parent process
+        out_q.put(returns)
 
-        action_lgprobs = []
-        rewards = []
-
-        done = False
-        obs = None
-
-        while len(action_lgprobs) < ep_length and not done:
-
-            if obs is None:
-                next_op, prlvl = None, 0
-            else:
-                dag_batch, op_msk, prlvl_msk = obs
-                ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
-
-                next_op, prlvl, action_lgprob = \
-                    sample_action(env.jobs, ops_probs, prlvl_probs)
-
-                action_lgprobs += [action_lgprob]
-                rewards += [reward]
-
-            obs, reward, done = env.step(next_op, prlvl)
-        
-        returns = compute_returns(rewards, discount)
-        traj = Trajectory(action_lgprobs, returns)
-        print('sending traj')
-        out_q.put(traj)
-
+        # receive baselines from parent process
         baselines = in_q.get()
-        advantages = returns - baselines
-        print('received baselines')
 
+        advantages = returns - baselines
+
+        # update model parameters
         optim.zero_grad()
         loss = -action_lgprobs @ advantages
         loss.backward()
         optim.step()
 
+        # signal end of parameter updates to parent
         out_q.put(None)
 
 
 
+def launch_subprocesses(n_ep_per_seq, discount, optim):
+    procs = []
+    in_qs = []
+    out_qs = []
+    for i in range(n_ep_per_seq):
+        in_q = SimpleQueue()
+        in_qs += [in_q]
+        out_q = SimpleQueue()
+        out_qs += [out_q]
+        proc = Process(
+            target=episode_runner, 
+            args=(i, discount, dcp(optim), in_q, out_q))
+        proc.start()
+    return procs, in_qs, out_qs
 
 
 
+def terminate_subprocesses(in_qs, procs):
+    for in_q in in_qs:
+        in_q.put(None)
 
-
-class ReinforceTrainer:
-    '''Trains the Decima model'''
-
-
-    def __init__(self, 
-        env, 
-        datagen, 
-        policy, 
-        optim, 
-        n_sequences,
-        n_ep_per_seq,
-        discount,
-        n_workers,
-        initial_mean_ep_len,
-        delta_ep_len
-    ):
-        # instance of dagsched_env
-        self.env = env
-
-        # data generator which provides that data
-        # used for training
-        self.datagen = datagen
-        
-        # neural network to be trained
-        self.policy = policy
-        
-        # torch optimizer
-        self.optim = optim
-        
-        # number of job arrival sequences to train on
-        self.n_sequences = n_sequences
-        
-        # number of times to train on a fixed sequence
-        self.n_ep_per_seq = n_ep_per_seq
-        
-        # discount factor for computing total rewards
-        self.discount = discount
-        
-        # number of workers to include in the simulation
-        self.n_workers = n_workers
-        
-        # (geometric distribution) mean number of environment 
-        # steps in an episode; this quantity gradually increases
-        # as a form of curriculum learning
-        self.mean_ep_len = initial_mean_ep_len
-        
-        # amount by which the mean episode length increases
-        # every time training is complete on some sequence
-        self.delta_ep_len = delta_ep_len
-
-        # minimum number of steps in an episode
-        self.min_ep_len = 5
-
-
-    
-    def train(self):
-        '''train the model on multiple different job arrival sequences'''
-
-
-        procs = []
-        in_qs = []
-        out_qs = []
-        for _ in range(self.n_ep_per_seq):
-            in_q = Queue(1)
-            in_qs += [in_q]
-            out_q = Queue(1)
-            out_qs += [out_q]
-            proc = Process(target=episode_runner, args=(in_q,out_q))
-            proc.start()
+    for proc in procs:
+        proc.join()
 
 
 
-        # y = []
+def train(
+    datagen, 
+    policy, 
+    optim, 
+    n_sequences,
+    n_ep_per_seq,
+    discount,
+    n_workers,
+    initial_mean_ep_len,
+    delta_ep_len,
+    min_ep_len
+):
+    '''trains the model on multiple different job arrival sequences, where
+    `n_ep_per_seq` episodes are repeated on each sequence in parallel
+    using multiprocessing'''
 
-        for i in range(self.n_sequences):
-            print(f'beginning training on sequence {i+1}')
+    procs, in_qs, out_qs = \
+        launch_subprocesses(n_ep_per_seq, discount, optim)
 
-            # ep_len = np.random.geometric(1/self.mean_ep_len)
-            # ep_len = max(ep_len, self.min_ep_len)
-            ep_len = self.mean_ep_len
+    mean_ep_len = initial_mean_ep_len
 
-            # sample a job arrival sequence and worker types
-            initial_timeline = datagen.initial_timeline(
-                n_job_arrivals=50, n_init_jobs=0, mjit=2000.)
-            workers = datagen.workers(n_workers=self.n_workers)
+    for i in range(n_sequences):
+        print(f'beginning training on sequence {i+1}')
 
+        ep_len = np.random.geometric(1/mean_ep_len)
+        ep_len = max(ep_len, min_ep_len)
 
-            for in_q in in_qs:
-                base_env = None if i>0 else dcp(self.env)
-                base_optim = None if i>0 else dcp(self.optim)
-                data = base_env, base_optim, self.policy, initial_timeline, workers, ep_len, self.discount
-                in_q.put(data)
+        # sample a job arrival sequence and worker types
+        initial_timeline = datagen.initial_timeline(
+            n_job_arrivals=100, n_init_jobs=0, mjit=2000.)
+        workers = datagen.workers(n_workers=n_workers)
 
-            trajectories = []
-            for out_q in out_qs:
-                traj = out_q.get()
-                trajectories += [traj]
-                print('received traj')
-
-            returns_mat = torch.tensor([traj.returns for traj in trajectories])
-            baselines = returns_mat.mean(axis=0)
-
-            for in_q in in_qs:
-                in_q.put(baselines)
-
-
-            for j,out_q in enumerate(out_qs):
-                out_q.get()
-                print(f'ep {j+1} complete')
-
-            # run multiple episodes on this fixed sequence
-
-            # trajectories = []
-            # avg_job_durations = np.zeros(self.n_ep_per_seq)
-            # n_completed_jobs = np.zeros(self.n_ep_per_seq)
-            # for j in range(self.n_ep_per_seq):
-            #     traj = self._run_episode(ep_len, initial_timeline, workers)
-            #     trajectories += [traj]
-            #     n_completed_jobs[j] = self.env.n_completed_jobs
-            #     avg_job_durations[j] = avg_job_duration(self.env)
-            #     print(f'episode {j+1} complete:', n_completed_jobs[j], avg_job_durations[j])
-
-            # y += [avg_job_durations.mean() / n_completed_jobs.mean()]
-
-            self.mean_ep_len += self.delta_ep_len
-
-
+        # send episode data to each of the subprocesses
         for in_q in in_qs:
-            in_q.put(None)
+            data = initial_timeline, workers, ep_len, policy
+            in_q.put(data)
 
-        for proc in procs:
-            proc.join()
+        # retreieve returns from each of the subprocesses
+        returns_list = []
+        for out_q in out_qs:
+            returns = out_q.get()
+            returns_list += [returns]
 
-        # y = np.array(y)
-        # print(y)
-        # plt.plot(np.arange(len(y)), y)
-        # # plt.show()
-        # plt.savefig('bruh.png')
+        # compute baselines
+        returns_mat = torch.stack(returns_list)
+        baselines = returns_mat.mean(axis=0)
+
+        # send baselines back to each of the subprocesses
+        for in_q in in_qs:
+            in_q.put(baselines)
+
+        # wait for each of the subprocesses to finish parameter updates
+        for j,out_q in enumerate(out_qs):
+            out_q.get()
+            print(f'ep {j+1} complete')
+
+        mean_ep_len += delta_ep_len
+
+    terminate_subprocesses(in_qs, procs)
 
 
 
 if __name__ == '__main__':
-    
-    mean_ep_length = 20
+    torch.set_num_threads(1)
 
     datagen = RandomDataGen(
         max_ops=8, # 20
         max_tasks=4, # 200
         mean_task_duration=2000.,
         n_worker_types=1)
-    # datagen = TPCHDataGen()
-
-    env = DagSchedEnv()
 
     n_workers = 5
 
     policy = ActorNetwork(5, 8, n_workers)
+    policy.to(device)
     policy.share_memory()
-    # policy.cuda()
 
     optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
-    trainer = ReinforceTrainer(
-        env, 
+    train(
         datagen, 
         policy, 
         optim, 
-        n_sequences=10,
-        n_ep_per_seq=4,
-        discount=1.,
+        n_sequences=4,
+        n_ep_per_seq=8,
+        discount=.99,
         n_workers=n_workers,
-        initial_mean_ep_len=5000,
-        delta_ep_len=0)
-
-    trainer.train()
-
-
-
-
+        initial_mean_ep_len=500,
+        delta_ep_len=50,
+        min_ep_len=250
+    )

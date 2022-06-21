@@ -160,6 +160,7 @@ class ActorNetwork(nn.Module):
     def forward(self, dag_batch, op_msk, prlvl_msk):
         x, y, z = self.encoder(dag_batch)
 
+        # t0 = time.time()
         num_dags = dag_batch.num_graphs
         ops, prlvl = self.policy_network(
             dag_batch.num_ops_per_dag, 
@@ -167,5 +168,8 @@ class ActorNetwork(nn.Module):
             x, y, z, 
             op_msk, 
             prlvl_msk)
+
+        # t1 = time.time()
+        # print(t1-t0)
         
         return ops, prlvl

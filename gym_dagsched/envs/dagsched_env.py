@@ -164,6 +164,23 @@ class DagSchedEnv:
 
 
 
+    def find_op(self, op_idx):
+        '''returns an Operation object corresponding to
+        the `op_idx`th operation in the system'''
+        i = 0
+        op = None
+        for j, job_id in enumerate(self.active_job_ids):
+            job = self.jobs[job_id]
+            if op_idx < i + len(job.ops):
+                op = job.ops[op_idx - i]
+                break
+            else:
+                i += len(job.ops)
+        assert op is not None
+        return op, j
+
+
+
     def _init_dag_batch(self):
         data_list = []
         for _,_,e in self.timeline.pq:
@@ -492,8 +509,9 @@ class DagSchedEnv:
         either zero if the jobs are the same, or a sample
         from a fixed exponential distribution
         '''
+        e = torch.distributions.exponential.Exponential(self.MOVING_COST)
         return 0. if new_job_id == old_job_id \
-            else np.random.exponential(self.MOVING_COST)
+            else e.sample().item()
 
 
 

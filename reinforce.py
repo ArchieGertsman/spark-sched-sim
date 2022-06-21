@@ -91,23 +91,6 @@ class ReinforceTrainer:
 
 
 
-    def _find_op(self, op_idx):
-        '''returns an Operation object corresponding to
-        the `op_idx`th operation in the system'''
-        i = 0
-        op = None
-        for j, job_id in enumerate(self.env.active_job_ids):
-            job = self.env.jobs[job_id]
-            if op_idx < i + len(job.ops):
-                op = job.ops[op_idx - i]
-                break
-            else:
-                i += len(job.ops)
-        assert op is not None
-        return op, j
-
-
-
     def sample_action(self, ops_probs, prlvl_probs):
         '''given probabilities for selecting the next operation
         and the parallelism level for that operation's job (returned
@@ -119,7 +102,7 @@ class ReinforceTrainer:
         c = torch.distributions.Categorical(probs=ops_probs)
         next_op_idx = c.sample()
         next_op_idx_lgp = c.log_prob(next_op_idx)
-        next_op, j = self._find_op(next_op_idx)
+        next_op, j = self.env.find_op(next_op_idx)
 
         c = torch.distributions.Categorical(probs=prlvl_probs[j])        
         prlvl = c.sample()
@@ -150,15 +133,14 @@ class ReinforceTrainer:
         start = time.time()
         total_time = 0.
         while len(action_lgprobs) < ep_len and not done:
+            t0 = time.time()
+
             if obs is None or self.env.n_active_jobs == 0:
                 next_op, prlvl = None, 0
             else:
                 dag_batch, op_msk, prlvl_msk = obs
 
-                t0 = time.time()
                 ops_probs, prlvl_probs = self.policy(dag_batch, op_msk, prlvl_msk)
-                t1 = time.time()
-                total_time += t1-t0
 
                 next_op, prlvl, action_lgprob = \
                     self.sample_action(ops_probs, prlvl_probs)
@@ -167,6 +149,10 @@ class ReinforceTrainer:
                 rewards += [reward]
 
             obs, reward, done = self.env.step(next_op, prlvl)
+            
+            t1 = time.time()
+            total_time += t1-t0
+            print(t1-t0)
 
         action_lgprobs = torch.cat(action_lgprobs)
         returns = self._compute_returns(rewards)
@@ -267,8 +253,6 @@ class ReinforceTrainer:
 
 
 if __name__ == '__main__':
-    
-    mean_ep_len = 20
 
     datagen = RandomDataGen(
         max_ops=8, # 20
@@ -299,11 +283,7 @@ if __name__ == '__main__':
         delta_ep_len=50,
         min_ep_len=250)
 
-    # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-    #     with record_function("model_inference"):
     trainer.train()
-
-    # print(prof.key_averages().table(row_limit=10))
 
 
 
