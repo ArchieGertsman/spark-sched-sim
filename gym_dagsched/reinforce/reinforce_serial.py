@@ -3,7 +3,6 @@ sys.path.append('./gym_dagsched/data_generation/tpch/')
 
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
 from .reinforce_utils import *
 from ..envs.dagsched_env import DagSchedEnv
@@ -11,24 +10,37 @@ from ..utils.metrics import avg_job_duration
 
 
 
-def learn_from_trajectories(action_lgprobs_list, returns_list, optim):
+def learn_from_trajectories(
+    optim,
+    entropy_weight,
+    action_lgprobs_list, 
+    returns_list, 
+    entropies_list
+):
     '''given a list of trajectories from multiple MDP episodes
     that were repeated on a fixed job arrival sequence, update the model 
     parameters using the REINFORCE algorithm as in the Decima paper.
     '''
     action_lgprobs_mat = torch.stack(action_lgprobs_list)
     returns_mat = torch.stack(returns_list)
+    entropies_mat = torch.stack(entropies_list)
 
     baselines = returns_mat.mean(axis=0)
     advantages_mat = returns_mat - baselines
 
+    action_lgprobs = action_lgprobs_mat.flatten()
+    advantages = advantages_mat.flatten()
+
+    policy_loss  = -action_lgprobs @ advantages
+    entropy_loss = entropy_weight * entropies_mat.sum()
+
+    ep_len = baselines.shape[0]
+
     optim.zero_grad()
-
-    loss_mat = -action_lgprobs_mat * advantages_mat
-    loss = loss_mat.sum()
+    loss = (policy_loss + entropy_loss) / ep_len
     loss.backward()
-
     optim.step()
+
     return loss.item()
 
 
@@ -40,21 +52,24 @@ def train(
     n_sequences,
     n_ep_per_seq,
     discount,
+    entropy_weight_init,
+    entropy_weight_decay,
+    entropy_weight_min,
     n_workers,
     initial_mean_ep_len,
-    delta_ep_len,
-    min_ep_len
+    ep_len_growth,
+    min_ep_len,
+    writer
 ):
     '''train the model on multiple different job arrival sequences'''
 
     env = DagSchedEnv()
 
-    writer = SummaryWriter('tensorboard')
-
     mean_ep_len = initial_mean_ep_len
+    entropy_weight = entropy_weight_init
 
-    for i in range(n_sequences):
-        print(f'beginning training on sequence {i+1}')
+    for epoch in range(n_sequences):
+        print(f'beginning training on sequence {epoch+1}')
 
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
@@ -67,12 +82,13 @@ def train(
         # run multiple episodes on this fixed sequence
         action_lgprobs_list = []
         returns_list = []
+        entropies_list = []
 
         avg_job_durations = np.zeros(n_ep_per_seq)
-        n_completed_jobs = np.zeros(n_ep_per_seq)
+        n_completed_jobs_list = np.zeros(n_ep_per_seq)
 
         for j in range(n_ep_per_seq):
-            action_lgprobs, returns = \
+            action_lgprobs, returns, entropies = \
                 run_episode(
                     env,
                     initial_timeline,
@@ -84,20 +100,34 @@ def train(
 
             action_lgprobs_list += [action_lgprobs]
             returns_list += [returns]
+            entropies_list += [entropies]
 
-            n_completed_jobs[j] = env.n_completed_jobs
             avg_job_durations[j] = avg_job_duration(env)
+            n_completed_jobs_list[j] = env.n_completed_jobs
 
-            print(f'episode {j+1} complete:', n_completed_jobs[j], avg_job_durations[j])
+            print(f'episode {j+1} complete:', n_completed_jobs_list[j], avg_job_durations[j])
 
-        loss = learn_from_trajectories(action_lgprobs_list, returns_list, optim)
+        loss = learn_from_trajectories(
+            optim, 
+            entropy_weight,
+            action_lgprobs_list, 
+            returns_list, 
+            entropies_list)
 
-        writer.add_scalar('episode length', ep_len, i)
-        writer.add_scalar('loss', -loss / ep_len, i)
-        writer.add_scalar('avg job duration', avg_job_durations.mean() / n_completed_jobs.mean(), i)
-        writer.add_scalar('n completed jobs', n_completed_jobs.mean() / ep_len, i)
+        write_tensorboard(
+            writer, 
+            epoch, 
+            ep_len, 
+            loss, 
+            avg_job_durations.mean(), 
+            n_completed_jobs_list.mean()
+        )
 
-        mean_ep_len += delta_ep_len
+        mean_ep_len += ep_len_growth
+
+        entropy_weight = max(
+            entropy_weight - entropy_weight_decay, 
+            entropy_weight_min)
 
     writer.close()
 

@@ -1,3 +1,4 @@
+from collections import defaultdict
 from copy import deepcopy as dcp
 import time
 
@@ -128,8 +129,7 @@ class DagSchedEnv:
             even though neither (1) nor (2) have occurred, so 
             the policy should consider taking one of them
         '''
-        t0 = time.time() 
-
+        # t0 = time.time() 
 
         if op in self.frontier_ops:
             tasks = self._take_action(op, n_workers)
@@ -153,12 +153,17 @@ class DagSchedEnv:
         # retreive the next scheduling event from the timeline
         t, event = self.timeline.pop()
 
-        reward = self._calculate_reward(t)
-        
-        self._process_scheduling_event(t, event)
+        prev_time = self.wall_time
 
-        t1 = time.time()
-        self.total_time += t1-t0
+        # update the current wall time
+        self.wall_time = t
+
+        reward = self._calculate_reward(prev_time)
+        
+        self._process_scheduling_event(event)
+
+        # t1 = time.time()
+        # self.total_time += t1-t0
         
         return self._observe(), reward, False
 
@@ -205,8 +210,7 @@ class DagSchedEnv:
         self.x_ptrs = {}
         for _,_,e in self.timeline.pq:
             job = e.obj
-            x = self._get_feature_vecs(job.id_)
-            self.x_ptrs[job.id_] = x
+            self.x_ptrs[job.id_] = self._get_feature_vecs(job.id_)
 
 
 
@@ -254,7 +258,6 @@ class DagSchedEnv:
         those workers that are local to this job.
         '''
         n_avail = 0
-        # n_avail_local = torch.zeros(len(self.active_job_ids))
         n_avail_local = torch.zeros(self.dag_batch.num_graphs)
         for worker in self.workers:
             if worker.available:
@@ -269,7 +272,8 @@ class DagSchedEnv:
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
         mask[i] = True
         mask = mask[self.dag_batch.batch]
-        return self.dag_batch.x[mask]
+        idx = mask.nonzero().flatten()
+        return self.dag_batch.x[idx[0] : idx[-1]+1]
 
 
 
@@ -277,13 +281,41 @@ class DagSchedEnv:
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
         mask[self.active_job_ids] = True
 
-        subbatch = self.dag_batch.subgraph(mask[self.dag_batch.batch])
-        subbatch._num_graphs = self.n_active_jobs
-        subbatch.num_ops_per_dag = self.num_ops_per_dag[self.active_job_ids]
-        
+
+        node_mask = mask[self.dag_batch.batch]
+
+        subbatch = self.dag_batch.subgraph(node_mask)
+
+        subbatch._num_graphs = mask.sum().item()
+
         assoc = torch.empty(self.dag_batch.num_graphs, dtype=torch.long)
-        assoc[mask] = torch.arange(mask.sum())
-        subbatch.batch = assoc[self.dag_batch.batch][mask[self.dag_batch.batch]]
+        assoc[mask] = torch.arange(subbatch.num_graphs)
+        subbatch.batch = assoc[self.dag_batch.batch][node_mask]
+
+        ptr = self.dag_batch._slice_dict['x']
+        num_nodes_per_graph = ptr[1:] - ptr[:-1]
+        ptr = torch.cumsum(num_nodes_per_graph[mask], 0)
+        ptr = torch.cat([torch.tensor([0]), ptr])
+        subbatch.ptr = ptr
+
+        subbatch.num_ops_per_dag = num_nodes_per_graph[mask]
+
+        edge_ptr = self.dag_batch._slice_dict['edge_index']
+        num_edges_per_graph = edge_ptr[1:] - edge_ptr[:-1]
+        edge_ptr = torch.cumsum(num_edges_per_graph[mask], 0)
+        edge_ptr = torch.cat([torch.tensor([0]), edge_ptr])
+
+        subbatch._inc_dict = defaultdict(
+            dict, {
+                'x': torch.zeros(subbatch.num_graphs, dtype=torch.long),
+                'edge_index': ptr[:-1]
+            })
+
+        subbatch._slice_dict = defaultdict(dict, {
+            'x': ptr,
+            'edge_index': edge_ptr
+        })
+
 
         # update feature vectors with new worker info
         n_avail, n_avail_local = self.n_workers(mask)
@@ -333,13 +365,10 @@ class DagSchedEnv:
 
 
 
-    def _process_scheduling_event(self, t, event):
+    def _process_scheduling_event(self, event):
         '''handles a scheduling event, which can be a job arrival,
         a task completion, or a nudge
         '''
-        # update the current wall time
-        self.wall_time = t
-
         if isinstance(event, JobArrival):
             # job arrival event
             job = event.obj
@@ -498,7 +527,6 @@ class DagSchedEnv:
             self.wall_time, 
             moving_cost,
             self.x_ptrs[job.id_][op.id_])
-            # job.data.x[op.id_])
 
         return task
 
@@ -539,11 +567,16 @@ class DagSchedEnv:
 
 
 
-    def _calculate_reward(self, t):
+    def _calculate_reward(self, prev_time):
         '''number of jobs in the system multiplied by the time
         that has passed since the previous scheduling event compleiton.
         minimizing this quantity is equivalent to minimizing the
         average job completion time, by Little's Law (see Decima paper)
         '''
-        reward = -(t - self.wall_time) * self.n_active_jobs
+        reward = 0.
+        for job_id in self.active_job_ids:
+            job = self.jobs[job_id]
+            start = max(job.t_arrival, prev_time)
+            end = min(job.t_completed, self.wall_time)
+            reward -= (end - start)
         return reward * self.REWARD_SCALE

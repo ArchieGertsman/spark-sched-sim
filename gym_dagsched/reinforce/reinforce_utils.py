@@ -1,16 +1,26 @@
+from memory_profiler import profile
 import sys
 sys.path.append('../data_generation/tpch/')
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributions import Categorical
 from scipy.signal import lfilter
 
 from ..utils.device import device
 
 
 
-def sample_action(env, ops_probs, prlvl_probs):
+def calc_joint_entropy(op_probs, prlvl_probs):
+    '''returns the joint entropy over the two distributions returned
+    by the neural network'''
+    joint_probs = torch.outer(op_probs, prlvl_probs).flatten()
+    return Categorical(joint_probs).entropy()
+
+
+
+def sample_action(env, op_probs, prlvl_probs):
     '''given probabilities for selecting the next operation
     and the parallelism level for that operation's job (returned
     by the neural network), returns a randomly sampled 
@@ -20,18 +30,24 @@ def sample_action(env, ops_probs, prlvl_probs):
     plus the log probability of the sampled action `action_lgprob` 
     (which maintains a computational graph for learning)
     '''
-    c = torch.distributions.Categorical(probs=ops_probs)
+    c = Categorical(probs=op_probs)
     next_op_idx = c.sample()
     next_op_idx_lgp = c.log_prob(next_op_idx)
     next_op, j = env.find_op(next_op_idx)
 
-    c = torch.distributions.Categorical(probs=prlvl_probs[j])        
+    c = Categorical(probs=prlvl_probs[j])        
     prlvl = c.sample()
     prlvl_lgp = c.log_prob(prlvl)
 
     action_lgprob = next_op_idx_lgp + prlvl_lgp
 
-    return next_op, prlvl.item(), action_lgprob.unsqueeze(-1)
+    entropy = calc_joint_entropy(op_probs, prlvl_probs[j])
+
+    return \
+        next_op, \
+        prlvl.item(), \
+        action_lgprob.unsqueeze(-1), \
+        entropy.unsqueeze(-1)
 
 
 
@@ -48,14 +64,16 @@ def compute_returns(rewards, discount):
 
 
 
-def pad_trajectory(ep_len, action_lgprobs, returns):
+def pad_trajectory(ep_len, tensors):
     '''if the episode ended in less than `ep_len` steps, then pads
     the trajectory with zeros at the end to have length `ep_len`'''
-    diff = ep_len - len(action_lgprobs)
+
+    diff = ep_len - tensors.shape[1]
+
     if diff > 0:
-        action_lgprobs = F.pad(action_lgprobs, pad=(0, diff))
-        returns = F.pad(returns, pad=(0, diff))
-    return action_lgprobs, returns
+        tensors = F.pad(tensors, pad=(0, diff))
+            
+    return tensors
 
 
 
@@ -77,6 +95,7 @@ def run_episode(
 
     action_lgprobs = []
     rewards = []
+    entropies = []
 
     done = False
     obs = None
@@ -89,15 +108,33 @@ def run_episode(
             
             ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
 
-            next_op, prlvl, action_lgprob = \
+            next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs)
 
             action_lgprobs += [action_lgprob]
             rewards += [reward]
+            entropies += [entropy]
 
         obs, reward, done = env.step(next_op, prlvl)
         
     action_lgprobs = torch.cat(action_lgprobs)
     returns = compute_returns(rewards, discount)
+    entropies = torch.cat(entropies)
 
-    return pad_trajectory(ep_len, action_lgprobs, returns)
+    return pad_trajectory(
+        ep_len, torch.stack([action_lgprobs, returns, entropies]))
+
+
+
+def write_tensorboard(
+    writer, 
+    epoch, 
+    ep_len, 
+    loss, 
+    avg_job_durations_mean, 
+    n_completed_jobs_mean
+):
+    writer.add_scalar('episode length', ep_len, epoch)
+    writer.add_scalar('loss', loss, epoch)
+    writer.add_scalar('avg job duration', avg_job_durations_mean / ep_len, epoch)
+    writer.add_scalar('n completed jobs', n_completed_jobs_mean / ep_len, epoch)

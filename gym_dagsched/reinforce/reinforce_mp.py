@@ -10,7 +10,6 @@ sys.path.append('./gym_dagsched/data_generation/tpch/')
 import numpy as np
 import torch
 from torch.multiprocessing import Process, SimpleQueue
-from scipy.signal import lfilter
 
 from .reinforce_utils import *
 from ..envs.dagsched_env import DagSchedEnv
@@ -33,34 +32,40 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
 
     while data := in_q.get():
         # receive episode data from parent process
-        initial_timeline, workers, ep_length, policy = data
+        initial_timeline, workers, ep_len, policy, entropy_weight = data
 
-        action_lgprobs, returns = \
+        action_lgprobs, returns, entropies = \
             run_episode(
                 env,
                 initial_timeline,
                 workers,
-                ep_length,
+                ep_len,
                 policy,
                 discount
             )        
 
         # send returns back to parent process
-        out_q.put(returns)
+        out_q.put(returns.detach())
 
         # receive baselines from parent process
         baselines = in_q.get()
 
         advantages = returns - baselines
 
+        policy_loss = -action_lgprobs @ advantages
+        entropy_loss = entropy_weight * entropies.sum()
+
         # update model parameters
         optim.zero_grad()
-        loss = -action_lgprobs @ advantages
+        loss = (policy_loss + entropy_loss) / ep_len
         loss.backward()
         optim.step()
 
         # signal end of parameter updates to parent
-        out_q.put(None)
+        out_q.put((
+            loss.item(),
+            avg_job_duration(env),
+            env.n_completed_jobs))
 
 
 
@@ -97,22 +102,29 @@ def train(
     n_sequences,
     n_ep_per_seq,
     discount,
+    entropy_weight_init,
+    entropy_weight_decay,
+    entropy_weight_min,
     n_workers,
     initial_mean_ep_len,
-    delta_ep_len,
-    min_ep_len
+    ep_len_growth,
+    min_ep_len,
+    writer
 ):
     '''trains the model on multiple different job arrival sequences, where
     `n_ep_per_seq` episodes are repeated on each sequence in parallel
     using multiprocessing'''
 
+    assert device == torch.device('cpu')
+
     procs, in_qs, out_qs = \
         launch_subprocesses(n_ep_per_seq, discount, optim)
 
     mean_ep_len = initial_mean_ep_len
+    entropy_weight = entropy_weight_init
 
-    for i in range(n_sequences):
-        print(f'beginning training on sequence {i+1}')
+    for epoch in range(n_sequences):
+        print(f'beginning training on sequence {epoch+1}')
 
         # sample the length of the current episode
         ep_len = np.random.geometric(1/mean_ep_len)
@@ -120,13 +132,13 @@ def train(
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=100, n_init_jobs=0, mjit=2000.)
+            n_job_arrivals=500, n_init_jobs=0, mjit=2000.)
         workers = datagen.workers(n_workers=n_workers)
 
         # send episode data to each of the subprocesses, 
         # which starts the episodes
         for in_q in in_qs:
-            data = initial_timeline, workers, ep_len, policy
+            data = initial_timeline, workers, ep_len, policy, entropy_weight
             in_q.put(data)
 
         # retreieve returns from each of the subprocesses
@@ -141,12 +153,31 @@ def train(
             in_q.put(baselines)
 
         # wait for each of the subprocesses to finish parameter updates
+        losses = np.empty(n_ep_per_seq)
+        avg_job_durations = np.empty(n_ep_per_seq)
+        n_completed_jobs_list = np.empty(n_ep_per_seq)
         for j,out_q in enumerate(out_qs):
-            out_q.get()
+            loss, avg_job_duration, n_completed_jobs = out_q.get()
+            losses[j] = loss
+            avg_job_durations[j] = avg_job_duration
+            n_completed_jobs_list[j] = n_completed_jobs
             # print(f'ep {j+1} complete')
 
+        write_tensorboard(
+            writer, 
+            epoch, 
+            ep_len, 
+            losses.sum(), 
+            avg_job_durations.mean(), 
+            n_completed_jobs_list.mean()
+        )
+
         # increase the mean episode length
-        mean_ep_len += delta_ep_len
+        mean_ep_len += ep_len_growth
+
+        entropy_weight = max(
+            entropy_weight - entropy_weight_decay, 
+            entropy_weight_min)
 
     terminate_subprocesses(in_qs, procs)
 

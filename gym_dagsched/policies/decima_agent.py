@@ -22,10 +22,10 @@ def make_mlp(in_ch, out_ch, h1=32, h2=16):
 
 
 class GCNConv(MessagePassing):
-    def __init__(self, in_ch, out_ch, hid=16):
+    def __init__(self, in_ch, out_ch):
         super().__init__(aggr='add', flow='target_to_source')
-        self.mlp1 = make_mlp(in_ch, hid)
-        self.mlp2 = make_mlp(hid, out_ch)
+        self.mlp1 = make_mlp(in_ch, 8)
+        self.mlp2 = make_mlp(8, out_ch)
         
 
     def forward(self, x, edge_index):
@@ -69,29 +69,25 @@ class GraphEncoderNetwork(nn.Module):
         self.mlp_global = make_mlp(dim_embed, dim_embed)
         self.total_time = 0.
 
+
     def forward(self, dag_batch):
-        # 9.297%
         x = self._compute_node_level_embeddings(dag_batch)
-
-        # 4.694%
         y = self._compute_dag_level_embeddings(x, dag_batch.batch)
-
-        # 2.549%
         z = self._compute_global_embedding(y)
-
         return x, y, z
-    
+
     
     def _compute_node_level_embeddings(self, dag_batch):
-        x, edge_index = dag_batch.x, dag_batch.edge_index
-        return self.conv1(x, edge_index)
+        return self.conv1(dag_batch.x, dag_batch.edge_index)
     
+
     def _compute_dag_level_embeddings(self, x, batch_tensor):
-        y = gnn.global_mean_pool(x, batch_tensor)
+        y = gnn.global_add_pool(x, batch_tensor)
         return self.mlp_dag(y)
     
+
     def _compute_global_embedding(self, y):
-        z = torch.mean(y, dim=0)
+        z = torch.sum(y, dim=0)
         return self.mlp_global(z)
         
         
@@ -132,6 +128,7 @@ class PolicyNetwork(nn.Module):
         ops = self.mlp_op_score(ops).squeeze(-1)
         ops -= (1-op_msk)*1000
         ops = torch.softmax(ops, dim=0)
+
         return ops
     
     

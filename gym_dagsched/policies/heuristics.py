@@ -1,17 +1,17 @@
 import numpy as np
 
 
-def _pick_first(sim, key=None, reverse=False):
+def _pick_first(env, key=None, reverse=False):
     '''sorts the frontier stages by `key`, if provided,
     then selects the first stage in the sorted frontier 
     for which there is at least one available, compatible
     worker.
     '''
-    frontier_ops = list(sim.frontier_ops)
+    frontier_ops = list(env.frontier_ops)
     if key is not None:
         frontier_ops.sort(key=key, reverse=reverse)
 
-    avail_workers = sim.find_available_workers()
+    avail_workers = env.find_available_workers()
     
     first_op = None
 
@@ -52,20 +52,20 @@ def longest_task_first(obs):
     return _pick_first(obs, key, reverse=True)
 
 
-def max_children(sim):
+def max_children(env):
     def key(op):
-        job = sim.jobs[op.job_id]
+        job = env.jobs[op.job_id]
         return len(list(job.dag.successors(op.id_)))
-    return _pick_first(sim, key, reverse=True)
+    return _pick_first(env, key, reverse=True)
 
 
-def srt(sim):
+def srt(env):
     def key(op):
         return op.remaining_time
-    return _pick_first(sim, key)
+    return _pick_first(env, key)
 
 
-def lrt(sim):
+def lrt(env):
     def key(op):
         return op.remaining_time
-    return _pick_first(sim, key, reverse=True)
+    return _pick_first(env, key, reverse=True)
