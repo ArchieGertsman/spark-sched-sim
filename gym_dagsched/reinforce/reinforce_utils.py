@@ -28,7 +28,8 @@ def sample_action(env, op_probs, prlvl_probs):
     - an operation `next_op`, and 
     - parallelism level `prlvl`, 
     plus the log probability of the sampled action `action_lgprob` 
-    (which maintains a computational graph for learning)
+    (which maintains a computational graph for learning) and the
+    joint entropy of the distributions that came from the network
     '''
     c = Categorical(probs=op_probs)
     next_op_idx = c.sample()
@@ -67,7 +68,6 @@ def compute_returns(rewards, discount):
 def pad_trajectory(ep_len, tensors):
     '''if the episode ended in less than `ep_len` steps, then pads
     the trajectory with zeros at the end to have length `ep_len`'''
-
     diff = ep_len - tensors.shape[1]
 
     if diff > 0:

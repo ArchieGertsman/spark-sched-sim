@@ -2,8 +2,9 @@ __pycache__/
 *.egg-info/
 
 planning.py
-scratchpad*
+# scratchpad*
 gym_dagsched/data_generation/tpch
 reinforce.ipynb
 bruh.png
 tensorboard
+*.pt

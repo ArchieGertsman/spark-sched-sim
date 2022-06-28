@@ -11,7 +11,7 @@ def _pick_first(env, key=None, reverse=False):
     if key is not None:
         frontier_ops.sort(key=key, reverse=reverse)
 
-    avail_workers = env.find_available_workers()
+    avail_workers = env._find_available_workers()
     
     first_op = None
 
