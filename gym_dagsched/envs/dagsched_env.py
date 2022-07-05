@@ -1,6 +1,6 @@
 from collections import defaultdict
 from copy import deepcopy as dcp
-import time
+from time import time
 
 import numpy as np
 import torch
@@ -129,14 +129,19 @@ class DagSchedEnv:
             even though neither (1) nor (2) have occurred, so 
             the policy should consider taking one of them
         '''
-        # t0 = time.time() 
 
         if op in self.frontier_ops:
+
+            # t0 = time() 
             tasks = self._take_action(op, n_workers)
+            # t1 = time()
+            # self.total_time += t1-t0
+
             if len(tasks) > 0:
                 self._push_task_completion_events(tasks)
         else:
             pass # an invalid action was taken
+
 
         # if there are still actions available after
         # processing the most recent one, then push 
@@ -162,9 +167,6 @@ class DagSchedEnv:
         
         self._process_scheduling_event(event)
 
-        # t1 = time.time()
-        # self.total_time += t1-t0
-        
         return self._observe(), reward, False
 
 
@@ -278,15 +280,25 @@ class DagSchedEnv:
 
 
     def _subbatch(self):
+        
+
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
         mask[self.active_job_ids] = True
+
+        
 
 
         node_mask = mask[self.dag_batch.batch]
 
         subbatch = self.dag_batch.subgraph(node_mask)
 
+
+        
+
         subbatch._num_graphs = mask.sum().item()
+
+
+        
 
         assoc = torch.empty(self.dag_batch.num_graphs, dtype=torch.long)
         assoc[mask] = torch.arange(subbatch.num_graphs)
@@ -305,6 +317,9 @@ class DagSchedEnv:
         edge_ptr = torch.cumsum(num_edges_per_graph[mask], 0)
         edge_ptr = torch.cat([torch.tensor([0]), edge_ptr])
 
+
+       
+
         subbatch._inc_dict = defaultdict(
             dict, {
                 'x': torch.zeros(subbatch.num_graphs, dtype=torch.long),
@@ -317,12 +332,17 @@ class DagSchedEnv:
         })
 
 
+        t0 = time()
+
         # update feature vectors with new worker info
         n_avail, n_avail_local = self.n_workers(mask)
         n_avail_local = n_avail_local[subbatch.batch]
         # TODO: name indicies
         subbatch.x[:, 3] = n_avail
         subbatch.x[:, 4] = n_avail_local
+
+        t1 = time()
+        self.total_time += t1-t0
         
         return subbatch
 
@@ -505,6 +525,7 @@ class DagSchedEnv:
                     return worker
                 elif avail_worker == None:
                     avail_worker = worker
+        
         return avail_worker
 
 
@@ -519,7 +540,6 @@ class DagSchedEnv:
             else None
         new_job_id = op.job_id
         moving_cost = self._job_moving_cost(old_job_id, new_job_id)
-
         job = self.jobs[op.job_id]
 
         task = op.add_worker(
@@ -537,9 +557,8 @@ class DagSchedEnv:
         either zero if the jobs are the same, or a sample
         from a fixed exponential distribution
         '''
-        e = torch.distributions.exponential.Exponential(self.MOVING_COST)
         return 0. if new_job_id == old_job_id \
-            else e.sample().item()
+            else np.random.exponential(self.MOVING_COST)
 
 
 

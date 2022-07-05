@@ -1,12 +1,14 @@
 from memory_profiler import profile
 import sys
 sys.path.append('../data_generation/tpch/')
+from time import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from scipy.signal import lfilter
+from pympler import tracker
 
 from ..utils.device import device
 
@@ -16,7 +18,9 @@ def calc_joint_entropy(op_probs, prlvl_probs):
     '''returns the joint entropy over the two distributions returned
     by the neural network'''
     joint_probs = torch.outer(op_probs, prlvl_probs).flatten()
-    return Categorical(joint_probs).entropy()
+    c = Categorical(joint_probs)
+    entropy = c.entropy()
+    return entropy
 
 
 
@@ -34,21 +38,22 @@ def sample_action(env, op_probs, prlvl_probs):
     c = Categorical(probs=op_probs)
     next_op_idx = c.sample()
     next_op_idx_lgp = c.log_prob(next_op_idx)
-    next_op, j = env.find_op(next_op_idx)
+    next_op, job_idx = env.find_op(next_op_idx)
 
-    c = Categorical(probs=prlvl_probs[j])        
+    prlvl_probs = prlvl_probs[job_idx]
+    c = Categorical(probs=prlvl_probs)        
     prlvl = c.sample()
     prlvl_lgp = c.log_prob(prlvl)
 
     action_lgprob = next_op_idx_lgp + prlvl_lgp
 
-    entropy = calc_joint_entropy(op_probs, prlvl_probs[j])
+    entropy = calc_joint_entropy(op_probs, prlvl_probs)
 
     return \
         next_op, \
         prlvl.item(), \
-        action_lgprob.unsqueeze(-1), \
-        entropy.unsqueeze(-1)
+        action_lgprob, \
+        entropy
 
 
 
@@ -62,18 +67,6 @@ def compute_returns(rewards, discount):
     b = [1]
     y = lfilter(b, a, x=r)
     return torch.from_numpy(y[::-1].copy()).float().to(device=device)
-
-
-
-def pad_trajectory(ep_len, tensors):
-    '''if the episode ended in less than `ep_len` steps, then pads
-    the trajectory with zeros at the end to have length `ep_len`'''
-    diff = ep_len - tensors.shape[1]
-
-    if diff > 0:
-        tensors = F.pad(tensors, pad=(0, diff))
-            
-    return tensors
 
 
 
@@ -93,36 +86,96 @@ def run_episode(
     '''
     env.reset(initial_timeline, workers)
 
-    action_lgprobs = []
-    rewards = []
-    entropies = []
+    trajectory = torch.zeros((ep_len, 3))
+
+    # references to different parts of the trajectory tensor
+    # for readability purposes
+    action_lgprobs = trajectory[:,0]
+    rewards = trajectory[:,1]
+    entropies = trajectory[:,2]
 
     done = False
     obs = None
 
-    while len(action_lgprobs) < ep_len and not done:
+    # t_model = 0.
+    # t_env = 0.
+
+    # t_start = time()
+
+    tr = tracker.SummaryTracker()
+
+    i = 0
+    
+    while i < ep_len and not done:
+
+        # if len(action_lgprobs) % 200 == 0:
+        #     tr.print_diff()
+        #     print(flush=True)  
+        
+
         if obs is None or env.n_active_jobs == 0:
             next_op, prlvl = None, 0
         else:
             dag_batch, op_msk, prlvl_msk = obs
-            
+
+            # time the policy
+            # t0 = time()
+
+            # print('print 1')
+            # tr.print_diff()
+
             ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
+
+            # print('print 2')
+            # tr.print_diff()
+
+            # t1 = time()
+            # t_model += t1-t0
+
+
+            # print('print 1')
+            # tr.print_diff()
 
             next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs)
 
-            action_lgprobs += [action_lgprob]
-            rewards += [reward]
-            entropies += [entropy]
+            # print('print 3')
+            # tr.print_diff()
 
-        obs, reward, done = env.step(next_op, prlvl)
+            action_lgprobs[i] = action_lgprob
+            rewards[i] = reward
+            entropies[i] = entropy
+
+            # print('print 4')
+            # tr.print_diff()
+
         
-    action_lgprobs = torch.cat(action_lgprobs)
-    returns = compute_returns(rewards, discount)
-    entropies = torch.cat(entropies)
+        # time the env
+        # t0 = time()
 
-    return pad_trajectory(
-        ep_len, torch.stack([action_lgprobs, returns, entropies]))
+
+    
+        obs, reward, done = env.step(next_op, prlvl)
+
+        # print('print 5')
+        # tr.print_diff()
+
+        # print(flush=True)
+
+        i += 1
+
+        # t1 = time()
+        # t_env += t1-t0
+
+    # t_end = time()
+    # t_total = t_end - t_start
+
+
+    # print(f'policy: {t_model/t_total*100.: 3f}%; obs: {env.total_time/t_total*100.: 3f}%')
+
+    returns = compute_returns(rewards.detach(), discount)
+
+    return action_lgprobs, returns, entropies
 
 
 

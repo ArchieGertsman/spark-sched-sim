@@ -6,12 +6,14 @@ prior to running main.py with [processing_mode] set to 'm'
 
 import sys
 sys.path.append('./gym_dagsched/data_generation/tpch/')
+from time import time
 
 import numpy as np
 import torch
 from torch.multiprocessing import Process, SimpleQueue
+from pympler import tracker
 
-from .reinforce_utils import *
+from .reinforce_base import *
 from ..envs.dagsched_env import DagSchedEnv
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
@@ -26,6 +28,7 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
     # don't all generate the same random numbers. Otherwise,
     # each process would produce an identical episode.
     torch.manual_seed(worker_id)
+    np.random.seed(worker_id)
 
     # this subprocess's copy of the environment
     env = DagSchedEnv()
@@ -45,7 +48,7 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
             )        
 
         # send returns back to parent process
-        out_q.put(returns.detach())
+        out_q.put(returns)
 
         # receive baselines from parent process
         baselines = in_q.get()
@@ -117,6 +120,8 @@ def train(
 
     assert device == torch.device('cpu')
 
+    # tr = tracker.SummaryTracker()
+
     procs, in_qs, out_qs = \
         launch_subprocesses(n_ep_per_seq, discount, optim)
 
@@ -124,11 +129,12 @@ def train(
     entropy_weight = entropy_weight_init
 
     for epoch in range(n_sequences):
-        print(f'beginning training on sequence {epoch+1}')
-
         # sample the length of the current episode
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
+        # ep_len = 7000
+
+        print(f'beginning training on sequence {epoch+1} with ep_len = {ep_len}', flush=True)
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
@@ -144,6 +150,11 @@ def train(
         # retreieve returns from each of the subprocesses
         returns_list = [out_q.get() for out_q in out_qs]
 
+
+        # tr.print_diff()
+        # print(flush=True)
+
+
         # compute baselines
         returns_mat = torch.stack(returns_list)
         baselines = returns_mat.mean(axis=0)
@@ -151,6 +162,8 @@ def train(
         # send baselines back to each of the subprocesses
         for in_q in in_qs:
             in_q.put(baselines)
+
+        # optim.zero_grad()
 
         # wait for each of the subprocesses to finish parameter updates
         losses = np.empty(n_ep_per_seq)
@@ -161,7 +174,8 @@ def train(
             losses[j] = loss
             avg_job_durations[j] = avg_job_duration
             n_completed_jobs_list[j] = n_completed_jobs
-            # print(f'ep {j+1} complete')
+
+        # optim.step()
 
         write_tensorboard(
             writer, 
@@ -178,6 +192,9 @@ def train(
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
+
+        # tr.print_diff()
+        # print(flush=True)
 
     terminate_subprocesses(in_qs, procs)
 

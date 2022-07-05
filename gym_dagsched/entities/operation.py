@@ -1,4 +1,5 @@
 from enum import Enum, auto
+from time import time
 
 import numpy as np
 

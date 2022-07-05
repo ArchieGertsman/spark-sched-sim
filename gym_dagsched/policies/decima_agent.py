@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 import torch_geometric.nn as gnn
+from pympler import tracker
 
 from gym_dagsched.utils.device import device
 
@@ -65,15 +66,30 @@ class GraphEncoderNetwork(nn.Module):
     def __init__(self, in_ch, dim_embed):
         super().__init__()
         self.conv1 = GCNConv(in_ch, dim_embed)
-        self.mlp_dag = make_mlp(dim_embed, dim_embed)
+        self.mlp_dag = make_mlp(in_ch + dim_embed, dim_embed)
         self.mlp_global = make_mlp(dim_embed, dim_embed)
         self.total_time = 0.
 
 
-    def forward(self, dag_batch):
+    def forward(self, dag_batch, tr):
+        # print('print 1')
+        # tr.print_diff()
+
         x = self._compute_node_level_embeddings(dag_batch)
-        y = self._compute_dag_level_embeddings(x, dag_batch.batch)
+
+        # print('print 2')
+        # tr.print_diff()
+
+        y = self._compute_dag_level_embeddings(x, dag_batch)
+
+        # print('print 3')
+        # tr.print_diff()
+
         z = self._compute_global_embedding(y)
+
+        # print('print 4')
+        # tr.print_diff()
+
         return x, y, z
 
     
@@ -81,8 +97,9 @@ class GraphEncoderNetwork(nn.Module):
         return self.conv1(dag_batch.x, dag_batch.edge_index)
     
 
-    def _compute_dag_level_embeddings(self, x, batch_tensor):
-        y = gnn.global_add_pool(x, batch_tensor)
+    def _compute_dag_level_embeddings(self, x, dag_batch):
+        x_combined = torch.cat([dag_batch.x, x], dim=1)
+        y = gnn.global_add_pool(x_combined, dag_batch.batch)
         return self.mlp_dag(y)
     
 
@@ -107,13 +124,23 @@ class PolicyNetwork(nn.Module):
         num_dags, 
         x, y, z, 
         op_msk, 
-        prlvl_msk
+        prlvl_msk,
+        tr
     ):
+        # print('print 5')
+        # tr.print_diff()
+
         # 6.130%
         ops = self._compute_ops(num_ops_per_dag, x, y, z, op_msk)
 
+        # print('print 6')
+        # tr.print_diff()
+
         # 6.953%
         prlvl = self._compute_prlvl(num_dags, y, z, prlvl_msk)
+
+        # print('print 7')
+        # tr.print_diff()
 
         return ops, prlvl
     
@@ -143,6 +170,7 @@ class PolicyNetwork(nn.Module):
         prlvl = self.mlp_prlvl_score(prlvl).squeeze(-1)
         prlvl -= (1-prlvl_msk)*1000
         prlvl = torch.softmax(prlvl, dim=1)
+
         return prlvl
 
     
@@ -152,10 +180,17 @@ class ActorNetwork(nn.Module):
         super().__init__()
         self.encoder = GraphEncoderNetwork(in_ch, dim_embed)
         self.policy_network = PolicyNetwork(dim_embed, num_workers)
+        self.tr = tracker.SummaryTracker()
         
         
     def forward(self, dag_batch, op_msk, prlvl_msk):
-        x, y, z = self.encoder(dag_batch)
+        # print('print 1')
+        # self.tr.print_diff()
+
+        x, y, z = self.encoder(dag_batch, self.tr)
+
+        # print('print 2')
+        # self.tr.print_diff()
 
         # t0 = time.time()
         num_dags = dag_batch.num_graphs
@@ -164,9 +199,14 @@ class ActorNetwork(nn.Module):
             num_dags, 
             x, y, z, 
             op_msk, 
-            prlvl_msk)
+            prlvl_msk,
+            self.tr)
+
+        # print('print 3')
+        # self.tr.print_diff()
 
         # t1 = time.time()
         # print(t1-t0)
         
         return ops, prlvl
+ 

@@ -1,10 +1,11 @@
 import sys
 sys.path.append('./gym_dagsched/data_generation/tpch/')
+from time import time
 
 import numpy as np
 import torch
 
-from .reinforce_utils import *
+from .reinforce_base import *
 from ..envs.dagsched_env import DagSchedEnv
 from ..utils.metrics import avg_job_duration
 
@@ -71,6 +72,8 @@ def train(
     for epoch in range(n_sequences):
         print(f'beginning training on sequence {epoch+1}')
 
+        # t_start = time()
+
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
 
@@ -87,7 +90,11 @@ def train(
         avg_job_durations = np.zeros(n_ep_per_seq)
         n_completed_jobs_list = np.zeros(n_ep_per_seq)
 
+        # times = []
+
         for j in range(n_ep_per_seq):
+            # t0 = time()
+
             action_lgprobs, returns, entropies = \
                 run_episode(
                     env,
@@ -107,12 +114,21 @@ def train(
 
             print(f'episode {j+1} complete:', n_completed_jobs_list[j], avg_job_durations[j])
 
+            # t1 = time()
+            # times += [t1-t0]
+
+        # t_ep = np.mean(times)
+
+
+        # t0 = time()
         loss = learn_from_trajectories(
             optim, 
             entropy_weight,
             action_lgprobs_list, 
             returns_list, 
             entropies_list)
+        # t1 = time()
+        # t_learn = t1-t0
 
         write_tensorboard(
             writer, 
@@ -128,6 +144,11 @@ def train(
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
+
+        # t_end = time()
+        # t_total = t_end - t_start
+
+        # print(f'ep: {t_ep/t_total*100.: 3f}%; learn: {t_learn/t_total*100.: 3f}%')
 
     writer.close()
 
