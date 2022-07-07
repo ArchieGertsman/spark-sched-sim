@@ -195,19 +195,20 @@ class DagSchedEnv:
             data = from_networkx(job.dag)
             data.x = torch.tensor(
                 job.form_feature_vectors(),
-                dtype=torch.float32,
-                device=device
+                dtype=torch.float32 #,
+                # device=device
             )
             data_list += [data]
 
-        self.dag_batch = Batch.from_data_list(data_list).to(device)
+        self.dag_batch = Batch.from_data_list(data_list) #.to(device)
+        # self.dag_batch.pin_memory()
 
-        inc_dict = self.dag_batch._inc_dict['edge_index'] 
-        num_ops_per_dag = inc_dict
-        num_ops_per_dag = torch.roll(num_ops_per_dag, -1)
-        num_ops_per_dag[-1] = self.dag_batch.num_nodes
-        num_ops_per_dag -= inc_dict
-        self.num_ops_per_dag = num_ops_per_dag.to(device)
+        # inc_dict = self.dag_batch._inc_dict['edge_index'] 
+        # num_ops_per_dag = inc_dict
+        # num_ops_per_dag = torch.roll(num_ops_per_dag, -1)
+        # num_ops_per_dag[-1] = self.dag_batch.num_nodes
+        # num_ops_per_dag -= inc_dict
+        # self.num_ops_per_dag = num_ops_per_dag #.to(device)
 
         self.x_ptrs = {}
         for _,_,e in self.timeline.pq:
@@ -291,7 +292,7 @@ class DagSchedEnv:
         node_mask = mask[self.dag_batch.batch]
 
         subbatch = self.dag_batch.subgraph(node_mask)
-
+        # subbatch.pin_memory()
 
         
 
@@ -311,6 +312,7 @@ class DagSchedEnv:
         subbatch.ptr = ptr
 
         subbatch.num_ops_per_dag = num_nodes_per_graph[mask]
+        # subbatch.num_ops_per_dag.pin_memory()
 
         edge_ptr = self.dag_batch._slice_dict['edge_index']
         num_edges_per_graph = edge_ptr[1:] - edge_ptr[:-1]
@@ -343,8 +345,11 @@ class DagSchedEnv:
 
         t1 = time()
         self.total_time += t1-t0
-        
-        return subbatch
+
+
+        # subbatch.batch = subbatch.batch.to(device=device)
+        # subbatch.num_ops_per_dag = subbatch.num_ops_per_dag.to(device=device)
+        return subbatch #.to(device=device)
 
 
 

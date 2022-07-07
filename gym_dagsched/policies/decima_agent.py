@@ -1,4 +1,5 @@
-import time
+from time import time
+import gc
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,7 @@ class GCNConv(MessagePassing):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp1 = make_mlp(in_ch, 8)
         self.mlp2 = make_mlp(8, out_ch)
+        self.t = 0.
         
 
     def forward(self, x, edge_index):
@@ -37,7 +39,10 @@ class GCNConv(MessagePassing):
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
 
         # Step 2: Linearly transform node feature matrix.
+        t0 = time()
         x = self.mlp1(x)
+        t1 = time()
+        self.t += t1-t0
 
         # Step 3: Compute normalization.
         row, col = edge_index
@@ -58,7 +63,11 @@ class GCNConv(MessagePassing):
 
     
     def update(self, aggr_out):
-        return self.mlp2(aggr_out)
+        # t0 = time()
+        x = self.mlp2(aggr_out)
+        # t1 = time()
+        # self.t += t1-t0
+        return x
     
     
 
@@ -68,14 +77,19 @@ class GraphEncoderNetwork(nn.Module):
         self.conv1 = GCNConv(in_ch, dim_embed)
         self.mlp_dag = make_mlp(in_ch + dim_embed, dim_embed)
         self.mlp_global = make_mlp(dim_embed, dim_embed)
-        self.total_time = 0.
+        self.t = 0.
 
 
     def forward(self, dag_batch, tr):
         # print('print 1')
         # tr.print_diff()
 
+        # t0 = time()
         x = self._compute_node_level_embeddings(dag_batch)
+        # t1 = time()
+        # self.t += t1-t0
+
+        # self.t += self.conv1.t
 
         # print('print 2')
         # tr.print_diff()
@@ -98,14 +112,26 @@ class GraphEncoderNetwork(nn.Module):
     
 
     def _compute_dag_level_embeddings(self, x, dag_batch):
-        x_combined = torch.cat([dag_batch.x, x], dim=1)
+        x_combined = torch.cat([dag_batch.x, x], dim=1).to(device=device)
         y = gnn.global_add_pool(x_combined, dag_batch.batch)
-        return self.mlp_dag(y)
+
+        t0 = time()
+        y = self.mlp_dag(y)
+        t1 = time()
+        self.t += t1-t0
+
+        return y
     
 
     def _compute_global_embedding(self, y):
         z = torch.sum(y, dim=0)
-        return self.mlp_global(z)
+
+        t0 = time()
+        z = self.mlp_global(z)
+        t1 = time()
+        self.t += t1-t0
+
+        return z
         
         
         
@@ -115,7 +141,8 @@ class PolicyNetwork(nn.Module):
         self.mlp_op_score = make_mlp(3*dim_embed, 1)
         self.mlp_prlvl_score = make_mlp(2*dim_embed+1, 1)
         self.num_workers = num_workers
-        self.total_time = [0,0]
+        # self.total_time = [0,0]
+        self.t = 0.
         
         
     def forward(
@@ -152,7 +179,12 @@ class PolicyNetwork(nn.Module):
         z_ops = z.repeat(num_total_ops, 1)
         
         ops = torch.cat([x,y_ops,z_ops], dim=1)
+
+        t0 = time()
         ops = self.mlp_op_score(ops).squeeze(-1)
+        t1 = time()
+        self.t += t1-t0
+
         ops -= (1-op_msk)*1000
         ops = torch.softmax(ops, dim=0)
 
@@ -167,7 +199,12 @@ class PolicyNetwork(nn.Module):
         
         prlvl = torch.cat([limits, y_prlvl, z_prlvl], dim=1)
         prlvl = prlvl.reshape(num_dags, self.num_workers, prlvl.shape[1])
+        
+        t0 = time()
         prlvl = self.mlp_prlvl_score(prlvl).squeeze(-1)
+        t1 = time()
+        self.t += t1-t0
+
         prlvl -= (1-prlvl_msk)*1000
         prlvl = torch.softmax(prlvl, dim=1)
 
@@ -183,7 +220,7 @@ class ActorNetwork(nn.Module):
         self.tr = tracker.SummaryTracker()
         
         
-    def forward(self, dag_batch, op_msk, prlvl_msk):
+    def forward(self, dag_batch, num_ops_per_dag, op_msk, prlvl_msk):
         # print('print 1')
         # self.tr.print_diff()
 
@@ -191,12 +228,16 @@ class ActorNetwork(nn.Module):
 
         # print('print 2')
         # self.tr.print_diff()
+        
 
         # t0 = time.time()
-        num_dags = dag_batch.num_graphs
+
+        # refs = gc.get_referrers(dag_batch)
+        # print('len(refs) =', len(refs))
+
         ops, prlvl = self.policy_network(
-            dag_batch.num_ops_per_dag, 
-            num_dags, 
+            num_ops_per_dag, 
+            dag_batch.num_graphs, 
             x, y, z, 
             op_msk, 
             prlvl_msk,

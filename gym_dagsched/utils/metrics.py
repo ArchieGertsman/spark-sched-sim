@@ -5,7 +5,7 @@ def avg_job_duration(env):
         (env.jobs[j].t_completed - env.jobs[j].t_arrival)
         for j in env.completed_job_ids
     ])
-    return durations.mean()
+    return durations.mean() if durations.size > 0 else None
 
 
 def makespan(env):

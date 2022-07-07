@@ -9,6 +9,7 @@ import sys
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torch.multiprocessing import set_start_method
 
 from gym_dagsched.data_generation.random_datagen import RandomDataGen
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
@@ -23,11 +24,12 @@ if __name__ == '__main__':
     processing_mode = sys.argv[1]
     assert processing_mode in ['m', 's']
 
-    print(torch.cuda.is_available())
+    # print(torch.cuda.is_available())
 
     if processing_mode == 'm':
-        assert not torch.cuda.is_available()
-        torch.set_num_threads(1)
+        # assert not torch.cuda.is_available()
+        set_start_method('spawn')
+        # torch.set_num_threads(1)
 
     datagen = RandomDataGen(
         max_ops=8, # 20
@@ -37,9 +39,10 @@ if __name__ == '__main__':
 
     # datagen = TPCHDataGen()
 
-    n_workers = 100
+    n_workers = 10
 
     policy = ActorNetwork(5, 8, n_workers)
+    policy.share_memory()
     policy.to(device)
 
     optim = torch.optim.Adam(policy.parameters(), lr=.005)
@@ -55,9 +58,9 @@ if __name__ == '__main__':
         policy, 
         optim, 
         n_sequences=100,
-        n_ep_per_seq=8,
+        n_ep_per_seq=6,
         discount=.99,
-        entropy_weight_init=.1,
+        entropy_weight_init=.5,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
         n_workers=n_workers,
@@ -70,4 +73,4 @@ if __name__ == '__main__':
         writer=writer
     )
 
-    torch.save(policy.state_dict(), 'policy.pt')
+    # torch.save(policy.state_dict(), 'policy.pt')

@@ -5,12 +5,17 @@ prior to running main.py with [processing_mode] set to 'm'
 """
 
 import sys
+import os
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from time import time
+import warnings
+warnings.filterwarnings("ignore", message="torch.distributed.reduce_op is deprecated")
+from copy import deepcopy
 
 import numpy as np
 import torch
-from torch.multiprocessing import Process, SimpleQueue
+from torch.multiprocessing import Process, SimpleQueue, set_start_method
+import torch.distributed as dist
 from pympler import tracker
 
 from .reinforce_base import *
@@ -20,22 +25,39 @@ from ..utils.device import device
 
 
 
-def episode_runner(worker_id, discount, optim, in_q, out_q):
+def sum_gradients(model):
+    size = float(dist.get_world_size())
+    for param in model.parameters():
+        dist.all_reduce(param.grad)
+
+
+
+def episode_runner(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,
     # each process would produce an identical episode.
-    torch.manual_seed(worker_id)
-    np.random.seed(worker_id)
+    torch.manual_seed(rank)
+    np.random.seed(rank)
+
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+    dist.init_process_group('gloo', rank=rank, world_size=n_ep_per_seq)
 
     # this subprocess's copy of the environment
     env = DagSchedEnv()
 
+    policy = deepcopy(policy)
+    policy.to(device)
+
+    optim = torch.optim.Adam(policy.parameters(), lr=.005)
+    
+
     while data := in_q.get():
         # receive episode data from parent process
-        initial_timeline, workers, ep_len, policy, entropy_weight = data
+        initial_timeline, workers, ep_len, entropy_weight = data
 
         action_lgprobs, returns, entropies = \
             run_episode(
@@ -45,13 +67,17 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
                 ep_len,
                 policy,
                 discount
-            )        
+            )      
 
-        # send returns back to parent process
-        out_q.put(returns)
+        # # send returns back to parent process
+        # out_q.put(returns)
 
-        # receive baselines from parent process
-        baselines = in_q.get()
+        # # receive baselines from parent process
+        # baselines = in_q.get()
+
+        baselines = returns.clone()
+        dist.all_reduce(baselines)
+        baselines /= n_ep_per_seq
 
         advantages = returns - baselines
 
@@ -61,7 +87,9 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
         # update model parameters
         optim.zero_grad()
         loss = (policy_loss + entropy_loss) / ep_len
+        # loss = policy_loss / ep_len
         loss.backward()
+        sum_gradients(policy)
         optim.step()
 
         # signal end of parameter updates to parent
@@ -72,18 +100,18 @@ def episode_runner(worker_id, discount, optim, in_q, out_q):
 
 
 
-def launch_subprocesses(n_ep_per_seq, discount, optim):
+def launch_subprocesses(n_ep_per_seq, discount, policy):
     procs = []
     in_qs = []
     out_qs = []
-    for i in range(n_ep_per_seq):
+    for rank in range(n_ep_per_seq):
         in_q = SimpleQueue()
         in_qs += [in_q]
         out_q = SimpleQueue()
         out_qs += [out_q]
         proc = Process(
             target=episode_runner, 
-            args=(i, discount, optim, in_q, out_q))
+            args=(rank, n_ep_per_seq, policy, discount, in_q, out_q))
         proc.start()
     return procs, in_qs, out_qs
 
@@ -118,12 +146,8 @@ def train(
     `n_ep_per_seq` episodes are repeated on each sequence in parallel
     using multiprocessing'''
 
-    assert device == torch.device('cpu')
-
-    # tr = tracker.SummaryTracker()
-
     procs, in_qs, out_qs = \
-        launch_subprocesses(n_ep_per_seq, discount, optim)
+        launch_subprocesses(n_ep_per_seq, discount, policy)
 
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init
@@ -138,30 +162,24 @@ def train(
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=500, n_init_jobs=0, mjit=2000.)
+            n_job_arrivals=100, n_init_jobs=0, mjit=2000.)
         workers = datagen.workers(n_workers=n_workers)
 
         # send episode data to each of the subprocesses, 
         # which starts the episodes
         for in_q in in_qs:
-            data = initial_timeline, workers, ep_len, policy, entropy_weight
+            data = initial_timeline, workers, ep_len, entropy_weight
             in_q.put(data)
 
-        # retreieve returns from each of the subprocesses
-        returns_list = [out_q.get() for out_q in out_qs]
+        # # retreieve returns from each of the subprocesses
+        # returns_list = [out_q.get() for out_q in out_qs]
 
+        # # compute baselines
+        # baselines = torch.stack(returns_list).mean(axis=0)
 
-        # tr.print_diff()
-        # print(flush=True)
-
-
-        # compute baselines
-        returns_mat = torch.stack(returns_list)
-        baselines = returns_mat.mean(axis=0)
-
-        # send baselines back to each of the subprocesses
-        for in_q in in_qs:
-            in_q.put(baselines)
+        # # send baselines back to each of the subprocesses
+        # for in_q in in_qs:
+        #     in_q.put(baselines)
 
         # optim.zero_grad()
 
@@ -192,9 +210,6 @@ def train(
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
-
-        # tr.print_diff()
-        # print(flush=True)
 
     terminate_subprocesses(in_qs, procs)
 

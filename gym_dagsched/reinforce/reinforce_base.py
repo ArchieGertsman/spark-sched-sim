@@ -2,6 +2,7 @@ from memory_profiler import profile
 import sys
 sys.path.append('../data_generation/tpch/')
 from time import time
+import gc
 
 import numpy as np
 import torch
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from scipy.signal import lfilter
 from pympler import tracker
+from torch.profiler import profile, record_function, ProfilerActivity
+from gym_dagsched.policies.decima_agent import ActorNetwork
 
 from ..utils.device import device
 
@@ -66,7 +69,21 @@ def compute_returns(rewards, discount):
     a = [1, -discount]
     b = [1]
     y = lfilter(b, a, x=r)
-    return torch.from_numpy(y[::-1].copy()).float().to(device=device)
+    return torch.from_numpy(y[::-1].copy()).float()
+
+
+
+def bruh(policy, obs):
+    dag_batch, op_msk, prlvl_msk = obs
+
+    num_ops_per_dag = dag_batch.num_ops_per_dag
+    ops_probs, prlvl_probs = policy(
+        dag_batch.to(device=device), 
+        num_ops_per_dag.to(device=device),
+        op_msk,
+        prlvl_msk)
+
+    return ops_probs.cpu(), prlvl_probs.cpu()
 
 
 
@@ -97,7 +114,7 @@ def run_episode(
     done = False
     obs = None
 
-    # t_model = 0.
+    t_model = 0.
     # t_env = 0.
 
     # t_start = time()
@@ -105,7 +122,7 @@ def run_episode(
     tr = tracker.SummaryTracker()
 
     i = 0
-    
+
     while i < ep_len and not done:
 
         # if len(action_lgprobs) % 200 == 0:
@@ -113,24 +130,59 @@ def run_episode(
         #     print(flush=True)  
         
 
+
         if obs is None or env.n_active_jobs == 0:
             next_op, prlvl = None, 0
         else:
-            dag_batch, op_msk, prlvl_msk = obs
+            # print(torch.cuda.memory_allocated() / 1000)
 
-            # time the policy
-            # t0 = time()
+            t0 = time()
+            ops_probs, prlvl_probs = bruh(policy, obs)
+            t1 = time()
+            t_model += t1-t0
 
-            # print('print 1')
-            # tr.print_diff()
+            # dag_batch, op_msk, prlvl_msk = obs
 
-            ops_probs, prlvl_probs = policy(dag_batch, op_msk, prlvl_msk)
+            # # time the policy
+            # # t0 = time()
+
+            # # print('print 1')
+            # # tr.print_diff()
+
+
+            # # with profile(activities=[ProfilerActivity.CPU],
+            # #     profile_memory=True, record_shapes=True) as prof:
+
+            # # print(dag_batch, flush=True)
+
+            
+
+            # num_ops_per_dag = dag_batch.num_ops_per_dag
+
+            # ops_probs, prlvl_probs = policy(
+            #     dag_batch.to(device=device), 
+            #     num_ops_per_dag.to(device=device),
+            #     op_msk,
+            #     prlvl_msk)
+
+            # ops_probs = ops_probs.cpu()
+            # prlvl_probs = prlvl_probs.cpu()
+
+            # t1 = time()
+            # t_model += t1-t0
+
+            
+
+
+            
+
+            # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10), flush=True)
+
 
             # print('print 2')
             # tr.print_diff()
 
-            # t1 = time()
-            # t_model += t1-t0
+            
 
 
             # print('print 1')
@@ -139,12 +191,16 @@ def run_episode(
             next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs)
 
+            
+
             # print('print 3')
             # tr.print_diff()
 
             action_lgprobs[i] = action_lgprob
             rewards[i] = reward
             entropies[i] = entropy
+
+            # continue
 
             # print('print 4')
             # tr.print_diff()
@@ -164,12 +220,20 @@ def run_episode(
 
         i += 1
 
+        torch.cuda.empty_cache()
+
         # t1 = time()
         # t_env += t1-t0
+
+
+    
 
     # t_end = time()
     # t_total = t_end - t_start
 
+    # print('t_nn:', policy.policy_network.t + policy.encoder.t)
+
+    # print('t_model:', t_model)
 
     # print(f'policy: {t_model/t_total*100.: 3f}%; obs: {env.total_time/t_total*100.: 3f}%')
 
