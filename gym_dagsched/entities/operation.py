@@ -81,7 +81,7 @@ class Operation:
         return types
 
 
-    def add_worker(self, worker, wall_time, job_moving_cost, x):
+    def add_worker(self, worker, wall_time, x):
         assert self.n_saturated_tasks < self.n_tasks
         assert worker.can_assign(self)
 
@@ -93,7 +93,7 @@ class Operation:
 
         worker.task = task
         task.worker_id = worker.id_
-        task.t_accepted = wall_time + job_moving_cost
+        task.t_accepted = wall_time
         return task
 
 

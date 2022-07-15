@@ -25,16 +25,28 @@ from ..utils.device import device
 
 
 
-def sum_gradients(model):
-    size = float(dist.get_world_size())
-    for param in model.parameters():
+def send_ep_stats(out_q, loss, env):
+    out_q.put((
+        loss.item(),
+        avg_job_duration(env),
+        env.n_completed_jobs))
+
+
+
+def update_policy(policy, optim, loss):
+    optim.zero_grad()
+    loss.backward()
+    for param in policy.parameters():
         dist.all_reduce(param.grad)
+    optim.step()
 
 
-
-def episode_runner(rank, n_ep_per_seq, policy, discount, in_q, out_q):
+def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
+
+    policy = deepcopy(policy).to(device)
+    optim = torch.optim.SGD(policy.parameters(), lr=.005)
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,
@@ -49,54 +61,38 @@ def episode_runner(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     # this subprocess's copy of the environment
     env = DagSchedEnv()
 
-    policy = deepcopy(policy)
-    policy.to(device)
-
-    optim = torch.optim.Adam(policy.parameters(), lr=.005)
-    
-
     while data := in_q.get():
         # receive episode data from parent process
         initial_timeline, workers, ep_len, entropy_weight = data
 
         action_lgprobs, returns, entropies = \
             run_episode(
+                rank,
                 env,
                 initial_timeline,
                 workers,
                 ep_len,
                 policy,
                 discount
-            )      
-
-        # # send returns back to parent process
-        # out_q.put(returns)
-
-        # # receive baselines from parent process
-        # baselines = in_q.get()
+            )
 
         baselines = returns.clone()
         dist.all_reduce(baselines)
         baselines /= n_ep_per_seq
-
         advantages = returns - baselines
 
         policy_loss = -action_lgprobs @ advantages
         entropy_loss = entropy_weight * entropies.sum()
-
-        # update model parameters
-        optim.zero_grad()
         loss = (policy_loss + entropy_loss) / ep_len
-        # loss = policy_loss / ep_len
-        loss.backward()
-        sum_gradients(policy)
-        optim.step()
 
-        # signal end of parameter updates to parent
-        out_q.put((
-            loss.item(),
-            avg_job_duration(env),
-            env.n_completed_jobs))
+        if rank == 0:
+            print('advantages:', advantages)
+            print('policy loss:', policy_loss)
+            print('entropy loss:', entropy_loss)
+
+        update_policy(policy, optim, loss)
+
+        send_ep_stats(out_q, loss, env)
 
 
 
@@ -110,7 +106,7 @@ def launch_subprocesses(n_ep_per_seq, discount, policy):
         out_q = SimpleQueue()
         out_qs += [out_q]
         proc = Process(
-            target=episode_runner, 
+            target=run_episodes, 
             args=(rank, n_ep_per_seq, policy, discount, in_q, out_q))
         proc.start()
     return procs, in_qs, out_qs

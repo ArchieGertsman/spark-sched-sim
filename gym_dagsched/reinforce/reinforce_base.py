@@ -88,6 +88,7 @@ def bruh(policy, obs):
 
 
 def run_episode(
+    rank,
     env,
     initial_timeline,
     workers,
@@ -191,7 +192,7 @@ def run_episode(
             next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs)
 
-            
+            # print(rank, next_op.id_, prlvl)
 
             # print('print 3')
             # tr.print_diff()

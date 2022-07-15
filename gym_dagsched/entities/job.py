@@ -36,6 +36,8 @@ class Job:
     # operation completed executing
     t_completed = np.inf
 
+    local_workers = set()
+
 
 
     

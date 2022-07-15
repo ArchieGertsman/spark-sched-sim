@@ -1,21 +1,26 @@
 import heapq
 import itertools
 from dataclasses import dataclass
+from gym_dagsched.entities.job import Job
+
+from gym_dagsched.entities.operation import Operation
 
 from ..entities.task import Task
+from ..entities.worker import Worker
 
 
 @dataclass
-class Event:
-    obj: object
+class JobArrival(object):
+    job: Job
 
 @dataclass
-class JobArrival(Event):
-    pass
-
-@dataclass
-class TaskCompletion(Event):
+class TaskCompletion(object):
     task: Task
+
+@dataclass
+class WorkerArrival(object):
+    worker: Worker
+    job: Job
 
 
 

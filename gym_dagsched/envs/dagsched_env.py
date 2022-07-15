@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch_geometric.utils.convert import from_networkx
 from torch_geometric.data import Batch
 
-from ..utils.timeline import JobArrival, TaskCompletion
+from ..utils.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..utils.device import device
 
 
@@ -48,7 +48,7 @@ class DagSchedEnv:
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
-    MOVING_COST = 2000.
+    MOVING_COST = 0. #2000.
 
 
     @property
@@ -139,6 +139,9 @@ class DagSchedEnv:
 
             if len(tasks) > 0:
                 self._push_task_completion_events(tasks)
+            #     print('yes')
+            # else:
+            #     print('no')
         else:
             pass # an invalid action was taken
 
@@ -191,7 +194,7 @@ class DagSchedEnv:
     def _init_dag_batch(self):
         data_list = []
         for _,_,e in self.timeline.pq:
-            job = e.obj
+            job = e.job
             data = from_networkx(job.dag)
             data.x = torch.tensor(
                 job.form_feature_vectors(),
@@ -200,8 +203,8 @@ class DagSchedEnv:
             )
             data_list += [data]
 
-        self.dag_batch = Batch.from_data_list(data_list) #.to(device)
-        # self.dag_batch.pin_memory()
+        self.dag_batch = Batch.from_data_list(data_list)
+        self.dag_batch.pin_memory()
 
         # inc_dict = self.dag_batch._inc_dict['edge_index'] 
         # num_ops_per_dag = inc_dict
@@ -212,7 +215,7 @@ class DagSchedEnv:
 
         self.x_ptrs = {}
         for _,_,e in self.timeline.pq:
-            job = e.obj
+            job = e.job
             self.x_ptrs[job.id_] = self._get_feature_vecs(job.id_)
 
 
@@ -244,13 +247,15 @@ class DagSchedEnv:
 
         op_msk = torch.tensor(op_msk, device=device)
 
-        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers)), device=device)
+        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers)))
+        for i, job_id in enumerate(self.active_job_ids):
+            job = self.jobs[job_id]
+            prlvl_msk[i, :len(job.local_workers)] = 0
 
         # t1 = time.time()
         # self.total_time += t1-t0
 
-        return subbatch, op_msk, prlvl_msk
-
+        return subbatch, op_msk, prlvl_msk.to(device=device)
 
 
 
@@ -376,7 +381,7 @@ class DagSchedEnv:
         worker_type = self.workers[assigned_worker_id].type_
         t_completion = \
             task.t_accepted + op.task_duration[worker_type]
-        event = TaskCompletion(op, task)
+        event = TaskCompletion(task)
         self.timeline.push(t_completion, event)
 
 
@@ -390,21 +395,26 @@ class DagSchedEnv:
 
 
 
+    def _push_worker_arrival_event(self, worker, job):
+        moving_cost = np.random.exponential(self.MOVING_COST)
+        t_arrival = self.wall_time + moving_cost
+        event = WorkerArrival(worker, job)
+        self.timeline.push(t_arrival, event)
+
+
+
     def _process_scheduling_event(self, event):
         '''handles a scheduling event, which can be a job arrival,
         a task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
-            # job arrival event
-            job = event.obj
-            self._add_job(job)
+            self._add_job(event.job)
+        elif isinstance(event, WorkerArrival):
+            self._process_worker_arrival(event.worker, event.job)
         elif isinstance(event, TaskCompletion):
-            # task completion event
-            task = event.task
-            self._process_task_completion(task)
+            self._process_task_completion(event.task)
         else:
-            # nudge event
-            pass 
+            pass # nudge event
 
 
 
@@ -419,11 +429,22 @@ class DagSchedEnv:
 
 
 
+    def _process_worker_arrival(self, worker, job):
+        old_job_id = worker.task.job_id \
+            if worker.task is not None \
+            else None
+
+        job.local_workers.add(worker.id_)
+        if old_job_id is not None:
+            self.jobs[old_job_id].local_workers.remove(worker.id_)
+
+
+
     def _process_task_completion(self, task):
         '''performs some bookkeeping when a task completes'''
         job = self.jobs[task.job_id]
         op = job.ops[task.op_id]
-        op.add_task_completion(task, self.wall_time, self.x_ptrs[job.id_][op.id_]) #job.data.x[task.op_id])
+        op.add_task_completion(task, self.wall_time, self.x_ptrs[job.id_][op.id_])
 
         worker = self.workers[task.worker_id]
         worker.make_available()
@@ -453,17 +474,14 @@ class DagSchedEnv:
 
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
-        # print('job completion')
         assert job.id_ in self.jobs
-        # self.active_jobs.pop(job.id_)
-        # self.completed_jobs[job.id_] = job
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids += [job.id_]
         job.t_completed = self.wall_time
 
 
 
-    def _take_action(self, op, n_workers):
+    def _take_action(self, op, prlvl):
         '''updates the state of the environment based on the
         provided action = (op, n_workers)
 
@@ -475,19 +493,10 @@ class DagSchedEnv:
 
         Returns: a set of the Task objects which have been scheduled
         '''
-        tasks = set()
 
-        # find workers that are closest to this operation's job
-        for worker_type in op.compatible_worker_types:
-            if op.saturated:
-                break
-            n_remaining_requests = n_workers - len(tasks)
-            for _ in range(n_remaining_requests):
-                worker = self._find_closest_worker(op, worker_type)
-                if worker is None:
-                    break
-                task = self._schedule_worker(worker, op)
-                tasks.add(task)
+        self._send_more_workers(op, prlvl)
+
+        tasks = self._schedule_workers(op)
 
         # check if stage is now saturated; if so, remove from frontier
         if op.saturated:
@@ -498,73 +507,36 @@ class DagSchedEnv:
 
 
 
-    def _find_closest_worker(self, op, worker_type):
-        '''chooses an available worker for a stage's 
-        next task, according to the following priority:
-        1. worker is already at stage
-        2. worker is not at stage but is at stage's job
-        3. any other available worker
+    def _send_more_workers(self, op, prlvl):
+        job = self.jobs[op.job_id]
+        n_workers_to_send = prlvl - len(job.local_workers)
+        assert n_workers_to_send >= 0
 
-        Returns: if the stage is already saturated, or if no 
-        worker is found, then `None` is returned. Otherwise
-        a Worker object is returned.
-        '''
-        if op.saturated:
-            return None
-
-        # try to find available worker already at the stage
-        completed_tasks = list(op.completed_tasks)
-        for task in completed_tasks:
-            if task.worker_id == None:
-                continue
-            worker = self.workers[task.worker_id]
-            if worker.type_ == worker_type and worker.available:
-                return worker
-
-        # try to find available worker at stage's job;
-        # if none is found then return any available worker
-        avail_worker = None
         for worker in self.workers:
-            if worker.type_ == worker_type and worker.available:
-                if worker.task is not None and worker.task.job_id == op.job_id:
-                    return worker
-                elif avail_worker == None:
-                    avail_worker = worker
-        
-        return avail_worker
+            if n_workers_to_send == 0:
+                break
+            if worker.can_assign(op):
+                self._push_worker_arrival_event(worker, job)
+                n_workers_to_send -= 1
 
 
 
-    def _schedule_worker(self, worker, op):
-        '''sends a worker to an operation, taking into
-        account a moving cost, should the worker move 
-        between jobs
-        '''
-        old_job_id = worker.task.job_id \
-            if worker.task is not None \
-            else None
-        new_job_id = op.job_id
-        moving_cost = self._job_moving_cost(old_job_id, new_job_id)
+    def _schedule_workers(self, op):
+        tasks = set()
         job = self.jobs[op.job_id]
 
-        task = op.add_worker(
-            worker, 
-            self.wall_time, 
-            moving_cost,
-            self.x_ptrs[job.id_][op.id_])
+        for worker_id in job.local_workers:
+            if op.saturated:
+                break
+            worker = self.workers[worker_id]
+            if worker.can_assign(op):
+                task = op.add_worker(
+                    worker, 
+                    self.wall_time, 
+                    self.x_ptrs[op.job_id][op.id_])
+                tasks.add(task)
 
-        return task
-
-
-    
-    def _job_moving_cost(self, old_job_id, new_job_id):
-        '''calculates a moving cost between jobs, which is
-        either zero if the jobs are the same, or a sample
-        from a fixed exponential distribution
-        '''
-        return 0. if new_job_id == old_job_id \
-            else np.random.exponential(self.MOVING_COST)
-
+        return tasks
 
 
     def _actions_available(self):
