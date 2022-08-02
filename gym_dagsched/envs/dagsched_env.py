@@ -10,6 +10,7 @@ from torch_geometric.data import Batch
 
 from ..utils.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..utils.device import device
+from ..entities.operation import FeatureIdx
 
 
 class DagSchedEnv:
@@ -48,7 +49,7 @@ class DagSchedEnv:
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
-    MOVING_COST = 0. #2000.
+    MOVING_COST = 2000.
 
 
     @property
@@ -94,14 +95,13 @@ class DagSchedEnv:
         # the simulation
         self.wall_time = 0.
 
-        # list of job objects within the system.
-        # jobs don't get removed from this list
-        # after completing; they only get flagged.
-
+        # set of job objects within the system
         self.jobs = {}
 
+        # list of ids of all active jobs
         self.active_job_ids = []
 
+        # list of ids of all completed jobs
         self.completed_job_ids = []
 
         # operations in the system which are ready
@@ -115,6 +115,8 @@ class DagSchedEnv:
         self.saturated_ops = set()
 
         self._init_dag_batch()
+
+        self._init_data_ptrs()
 
         self.total_time = 0.
 
@@ -131,17 +133,9 @@ class DagSchedEnv:
         '''
 
         if op in self.frontier_ops:
-
-            # t0 = time() 
             tasks = self._take_action(op, n_workers)
-            # t1 = time()
-            # self.total_time += t1-t0
-
             if len(tasks) > 0:
                 self._push_task_completion_events(tasks)
-            #     print('yes')
-            # else:
-            #     print('no')
         else:
             pass # an invalid action was taken
 
@@ -150,7 +144,7 @@ class DagSchedEnv:
         # processing the most recent one, then push 
         # a "nudge" event to notify the scheduling agent
         # that another action can immediately be taken
-        if self._actions_available():
+        if self._are_actions_available():
             self._push_nudge_event()
 
         # check if simulation is done
@@ -161,9 +155,8 @@ class DagSchedEnv:
         # retreive the next scheduling event from the timeline
         t, event = self.timeline.pop()
 
-        prev_time = self.wall_time
-
         # update the current wall time
+        prev_time = self.wall_time
         self.wall_time = t
 
         reward = self._calculate_reward(prev_time)
@@ -192,27 +185,32 @@ class DagSchedEnv:
 
 
     def _init_dag_batch(self):
+        '''initializes the PyG batch of dags, `self.dag_batch`, in 
+        the system. This includes space for all the jobs which will 
+        arive, however sub-batches of this batch consisting of only 
+        active jobs will be revealed on observations of the environment
+        '''
         data_list = []
         for _,_,e in self.timeline.pq:
             job = e.job
             data = from_networkx(job.dag)
             data.x = torch.tensor(
                 job.form_feature_vectors(),
-                dtype=torch.float32 #,
-                # device=device
+                dtype=torch.float32
             )
             data_list += [data]
 
         self.dag_batch = Batch.from_data_list(data_list)
         self.dag_batch.pin_memory()
 
-        # inc_dict = self.dag_batch._inc_dict['edge_index'] 
-        # num_ops_per_dag = inc_dict
-        # num_ops_per_dag = torch.roll(num_ops_per_dag, -1)
-        # num_ops_per_dag[-1] = self.dag_batch.num_nodes
-        # num_ops_per_dag -= inc_dict
-        # self.num_ops_per_dag = num_ops_per_dag #.to(device)
+        
 
+    def _init_data_ptrs(self):
+        '''initializes a dict `self.x_ptrs` which maps job ids
+        to feature vectors stored at different parts of 
+        `self.dag_batch`. This dict is used for fast, copyless 
+        data accessing.
+        '''
         self.x_ptrs = {}
         for _,_,e in self.timeline.pq:
             job = e.job
@@ -221,41 +219,46 @@ class DagSchedEnv:
 
 
     def _observe(self):
-        '''Returns an observation of the state that can be
+        '''returns an observation of the state that can be
         directly passed into the model. This observation
-        consists of `dag_batch, op_msk, prlvl_msk`, where
-        - `dag_batch` is a mini-batch of PyG graphs, where
-            each graph is a dag in the system. See the
-            'Advanced Mini-Batching' section in PyG's docs
-        - `op_msk` is a mask indicating which operations
-            can be scheduled, i.e. op_msk[i] = 1 if the
-            i'th operation is in the frontier, 0 otherwise
-        - `prlvl_msk` is a mask indicating which parallelism
-            levels are valid for each job dag, i.e. 
-            prlvl_msk[i,l] = 1 if parallelism level `l` is
-            valid for job `i`
+        consists of `subbatch, op_msk, prlvl_msk`; see
+        `self._construct_...()` methods for what each of
+        these are
         '''
-        # t0 = time.time()
-        
-        subbatch = self._subbatch()
+        subbatch = self._construct_subbatch()
+        op_msk = self._construct_op_msk()
+        prlvl_msk = self._construct_prlvl_msk(subbatch)
 
+        return subbatch, op_msk, prlvl_msk
+
+
+
+    def _construct_op_msk(self):
+        '''returns a mask tensor indicating which operations
+        can be scheduled, i.e. op_msk[i] = 1 if the
+        i'th operation is in the frontier, 0 otherwise
+        '''
         op_msk = []
         for j in self.active_job_ids:
             # append this job's operations to the mask
             for op in self.jobs[j].ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
+        return torch.tensor(op_msk, device=device)
 
-        op_msk = torch.tensor(op_msk, device=device)
 
+    def _construct_prlvl_msk(self, subbatch):
+        '''returns a mask tensor indicating which parallelism
+        levels are valid for each job dag, i.e. 
+        prlvl_msk[i,l] = 1 if parallelism level `l` is
+        valid for job `i`
+        '''
         prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers)))
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
-            prlvl_msk[i, :len(job.local_workers)] = 0
-
-        # t1 = time.time()
-        # self.total_time += t1-t0
-
-        return subbatch, op_msk, prlvl_msk.to(device=device)
+            n_local = len(job.local_workers)
+            if n_local > 0:
+                prlvl_msk[i, :n_local-1] = 0
+        return prlvl_msk.to(device=device)
 
 
 
@@ -277,6 +280,9 @@ class DagSchedEnv:
 
 
     def _get_feature_vecs(self, i):
+        '''returns a reference to the feature vectors for 
+        job i's operations from `self.dag_batch` without copying
+        '''
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
         mask[i] = True
         mask = mask[self.dag_batch.batch]
@@ -285,26 +291,20 @@ class DagSchedEnv:
 
 
 
-    def _subbatch(self):
-        
-
+    def _construct_subbatch(self):
+        '''returns a mini-batch of PyG graphs, sub-batched
+        from `self.dag_batch`, where each graph is a dag in 
+        the system. See the 'Advanced Mini-Batching' section 
+        in PyG's docs
+        '''
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
         mask[self.active_job_ids] = True
-
-        
-
 
         node_mask = mask[self.dag_batch.batch]
 
         subbatch = self.dag_batch.subgraph(node_mask)
-        # subbatch.pin_memory()
-
-        
 
         subbatch._num_graphs = mask.sum().item()
-
-
-        
 
         assoc = torch.empty(self.dag_batch.num_graphs, dtype=torch.long)
         assoc[mask] = torch.arange(subbatch.num_graphs)
@@ -317,15 +317,11 @@ class DagSchedEnv:
         subbatch.ptr = ptr
 
         subbatch.num_ops_per_dag = num_nodes_per_graph[mask]
-        # subbatch.num_ops_per_dag.pin_memory()
 
         edge_ptr = self.dag_batch._slice_dict['edge_index']
         num_edges_per_graph = edge_ptr[1:] - edge_ptr[:-1]
         edge_ptr = torch.cumsum(num_edges_per_graph[mask], 0)
         edge_ptr = torch.cat([torch.tensor([0]), edge_ptr])
-
-
-       
 
         subbatch._inc_dict = defaultdict(
             dict, {
@@ -338,23 +334,13 @@ class DagSchedEnv:
             'edge_index': edge_ptr
         })
 
-
-        t0 = time()
-
         # update feature vectors with new worker info
         n_avail, n_avail_local = self.n_workers(mask)
         n_avail_local = n_avail_local[subbatch.batch]
-        # TODO: name indicies
-        subbatch.x[:, 3] = n_avail
-        subbatch.x[:, 4] = n_avail_local
+        subbatch.x[:, FeatureIdx.N_AVAIL_WORKERS] = n_avail
+        subbatch.x[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] = n_avail_local
 
-        t1 = time()
-        self.total_time += t1-t0
-
-
-        # subbatch.batch = subbatch.batch.to(device=device)
-        # subbatch.num_ops_per_dag = subbatch.num_ops_per_dag.to(device=device)
-        return subbatch #.to(device=device)
+        return subbatch
 
 
 
@@ -396,6 +382,9 @@ class DagSchedEnv:
 
 
     def _push_worker_arrival_event(self, worker, job):
+        '''pushes the event of a worker arriving to a job
+        to the timeline'''
+        worker.is_moving = True
         moving_cost = np.random.exponential(self.MOVING_COST)
         t_arrival = self.wall_time + moving_cost
         event = WorkerArrival(worker, job)
@@ -404,8 +393,9 @@ class DagSchedEnv:
 
 
     def _process_scheduling_event(self, event):
-        '''handles a scheduling event, which can be a job arrival,
-        a task completion, or a nudge
+        '''handles a scheduling event from the timeline, 
+        which can be a job arrival, a worker arrival, a 
+        task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
             self._add_job(event.job)
@@ -430,6 +420,9 @@ class DagSchedEnv:
 
 
     def _process_worker_arrival(self, worker, job):
+        '''performs some bookkeeping when a worker arrives'''
+        worker.is_moving = False
+
         old_job_id = worker.task.job_id \
             if worker.task is not None \
             else None
@@ -483,17 +476,15 @@ class DagSchedEnv:
 
     def _take_action(self, op, prlvl):
         '''updates the state of the environment based on the
-        provided action = (op, n_workers)
-
-        op: Operation object which shall receive work next
-        n_workers: number of workers to _try_ assigning to `op`.
-            in reality, `op` gets `min(n_workers, n_assignable_workers)`
-            where `n_assignable_workers` is the number of workers
-            which are both available and compatible with `op`
-
-        Returns: a set of the Task objects which have been scheduled
+        provided action = (op, prlvl), where
+        - op is an Operation object which shall receive work next, and
+        - prlvl is the number of workers to allocate to `op`'s job.
+            this must be at least the number of workers already
+            local to the job, and if it's larger then more workers
+            are sent to the job.
+        returns a set of the Task objects which have been scheduled
+        for processing
         '''
-
         self._send_more_workers(op, prlvl)
 
         tasks = self._schedule_workers(op)
@@ -508,6 +499,11 @@ class DagSchedEnv:
 
 
     def _send_more_workers(self, op, prlvl):
+        '''sends `min(n_workers_to_send, n_available_workers)` workers
+        to `op`'s job, where `n_workers_to_send` is the difference
+        between the requested `prlvl` and the number of workers already
+        at `op`'s job.
+        '''
         job = self.jobs[op.job_id]
         n_workers_to_send = prlvl - len(job.local_workers)
         assert n_workers_to_send >= 0
@@ -522,6 +518,9 @@ class DagSchedEnv:
 
 
     def _schedule_workers(self, op):
+        '''assigns all of the available workers at `op`'s job
+        to start working on `op`. Returns the tasks in `op` which
+        are schedule to receive work.'''
         tasks = set()
         job = self.jobs[op.job_id]
 
@@ -539,7 +538,8 @@ class DagSchedEnv:
         return tasks
 
 
-    def _actions_available(self):
+
+    def _are_actions_available(self):
         '''checks if there are any valid actions that can be
         taken by the scheduling agent.
         '''

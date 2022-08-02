@@ -6,11 +6,12 @@ class Worker:
     id_: int
     type_: int
     task = None
+    is_moving = False
 
 
     @property
     def available(self):
-        return self.task == None
+        return self.task == None and not self.is_moving
 
 
     def make_available(self):

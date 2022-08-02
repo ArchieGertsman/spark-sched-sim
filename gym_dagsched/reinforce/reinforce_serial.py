@@ -49,7 +49,6 @@ def learn_from_trajectories(
 def train(
     datagen, 
     policy, 
-    optim, 
     n_sequences,
     n_ep_per_seq,
     discount,
@@ -65,6 +64,8 @@ def train(
     '''train the model on multiple different job arrival sequences'''
 
     env = DagSchedEnv()
+
+    optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init

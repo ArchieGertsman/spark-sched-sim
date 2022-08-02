@@ -26,6 +26,9 @@ from ..utils.device import device
 
 
 def send_ep_stats(out_q, loss, env):
+    '''sends statistics back to main process for tensorboard 
+    logging
+    '''
     out_q.put((
         loss.item(),
         avg_job_duration(env),
@@ -34,6 +37,9 @@ def send_ep_stats(out_q, loss, env):
 
 
 def update_policy(policy, optim, loss):
+    '''updates the policy by summing gradients from each
+    of the subprocesses
+    '''
     optim.zero_grad()
     loss.backward()
     for param in policy.parameters():
@@ -41,10 +47,12 @@ def update_policy(policy, optim, loss):
     optim.step()
 
 
+
 def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
 
+    # set up local model and optimizer
     policy = deepcopy(policy).to(device)
     optim = torch.optim.SGD(policy.parameters(), lr=.005)
 
@@ -54,6 +62,7 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     torch.manual_seed(rank)
     np.random.seed(rank)
 
+    # set up torch.distributed for IPC
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group('gloo', rank=rank, world_size=n_ep_per_seq)
@@ -76,6 +85,7 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
                 discount
             )
 
+        # compute advantages
         baselines = returns.clone()
         dist.all_reduce(baselines)
         baselines /= n_ep_per_seq
@@ -124,8 +134,7 @@ def terminate_subprocesses(in_qs, procs):
 
 def train(
     datagen, 
-    policy, 
-    optim, 
+    policy,
     n_sequences,
     n_ep_per_seq,
     discount,
@@ -152,7 +161,7 @@ def train(
         # sample the length of the current episode
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
-        # ep_len = 7000
+        ep_len = min(ep_len, 4500)
 
         print(f'beginning training on sequence {epoch+1} with ep_len = {ep_len}', flush=True)
 
@@ -167,18 +176,6 @@ def train(
             data = initial_timeline, workers, ep_len, entropy_weight
             in_q.put(data)
 
-        # # retreieve returns from each of the subprocesses
-        # returns_list = [out_q.get() for out_q in out_qs]
-
-        # # compute baselines
-        # baselines = torch.stack(returns_list).mean(axis=0)
-
-        # # send baselines back to each of the subprocesses
-        # for in_q in in_qs:
-        #     in_q.put(baselines)
-
-        # optim.zero_grad()
-
         # wait for each of the subprocesses to finish parameter updates
         losses = np.empty(n_ep_per_seq)
         avg_job_durations = np.empty(n_ep_per_seq)
@@ -189,7 +186,7 @@ def train(
             avg_job_durations[j] = avg_job_duration
             n_completed_jobs_list[j] = n_completed_jobs
 
-        # optim.step()
+        print(n_completed_jobs_list, n_completed_jobs_list.mean())
 
         write_tensorboard(
             writer, 
@@ -203,6 +200,7 @@ def train(
         # increase the mean episode length
         mean_ep_len += ep_len_growth
 
+        # decrease the entropy weight
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)

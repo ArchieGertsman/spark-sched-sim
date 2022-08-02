@@ -54,7 +54,7 @@ def sample_action(env, op_probs, prlvl_probs):
 
     return \
         next_op, \
-        prlvl.item(), \
+        1+prlvl.item(), \
         action_lgprob, \
         entropy
 
@@ -73,7 +73,7 @@ def compute_returns(rewards, discount):
 
 
 
-def bruh(policy, obs):
+def invoke_policy(policy, obs):
     dag_batch, op_msk, prlvl_msk = obs
 
     num_ops_per_dag = dag_batch.num_ops_per_dag
@@ -96,11 +96,10 @@ def run_episode(
     policy,
     discount
 ):
-    '''runs one MDP episode for `ep_len` iterations given 
-    a job arrival sequence stored in `initial_timeline` and a 
-    set of workers, and returns the trajectory of action log
-    probabilities (which contain gradients) and returns, each 
-    of length `ep_len`
+    '''runs one MDP episode for `ep_len` steps on an environment
+    initialized with a job arrival sequence stored in `initial_timeline` 
+    and a set of workers stored in `workers`. Returns the trajectory of 
+    action log probabilities, returns, and entropies, each of length `ep_len`.
     '''
     env.reset(initial_timeline, workers)
 
@@ -115,128 +114,22 @@ def run_episode(
     done = False
     obs = None
 
-    t_model = 0.
-    # t_env = 0.
-
-    # t_start = time()
-
-    tr = tracker.SummaryTracker()
-
     i = 0
-
     while i < ep_len and not done:
-
-        # if len(action_lgprobs) % 200 == 0:
-        #     tr.print_diff()
-        #     print(flush=True)  
-        
-
-
         if obs is None or env.n_active_jobs == 0:
             next_op, prlvl = None, 0
         else:
-            # print(torch.cuda.memory_allocated() / 1000)
-
-            t0 = time()
-            ops_probs, prlvl_probs = bruh(policy, obs)
-            t1 = time()
-            t_model += t1-t0
-
-            # dag_batch, op_msk, prlvl_msk = obs
-
-            # # time the policy
-            # # t0 = time()
-
-            # # print('print 1')
-            # # tr.print_diff()
-
-
-            # # with profile(activities=[ProfilerActivity.CPU],
-            # #     profile_memory=True, record_shapes=True) as prof:
-
-            # # print(dag_batch, flush=True)
-
-            
-
-            # num_ops_per_dag = dag_batch.num_ops_per_dag
-
-            # ops_probs, prlvl_probs = policy(
-            #     dag_batch.to(device=device), 
-            #     num_ops_per_dag.to(device=device),
-            #     op_msk,
-            #     prlvl_msk)
-
-            # ops_probs = ops_probs.cpu()
-            # prlvl_probs = prlvl_probs.cpu()
-
-            # t1 = time()
-            # t_model += t1-t0
-
-            
-
-
-            
-
-            # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10), flush=True)
-
-
-            # print('print 2')
-            # tr.print_diff()
-
-            
-
-
-            # print('print 1')
-            # tr.print_diff()
+            ops_probs, prlvl_probs = invoke_policy(policy, obs)
 
             next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs)
-
-            # print(rank, next_op.id_, prlvl)
-
-            # print('print 3')
-            # tr.print_diff()
 
             action_lgprobs[i] = action_lgprob
             rewards[i] = reward
             entropies[i] = entropy
 
-            # continue
-
-            # print('print 4')
-            # tr.print_diff()
-
-        
-        # time the env
-        # t0 = time()
-
-
-    
         obs, reward, done = env.step(next_op, prlvl)
-
-        # print('print 5')
-        # tr.print_diff()
-
-        # print(flush=True)
-
         i += 1
-
-        torch.cuda.empty_cache()
-
-        # t1 = time()
-        # t_env += t1-t0
-
-
-    
-
-    # t_end = time()
-    # t_total = t_end - t_start
-
-    # print('t_nn:', policy.policy_network.t + policy.encoder.t)
-
-    # print('t_model:', t_model)
-
-    # print(f'policy: {t_model/t_total*100.: 3f}%; obs: {env.total_time/t_total*100.: 3f}%')
 
     returns = compute_returns(rewards.detach(), discount)
 

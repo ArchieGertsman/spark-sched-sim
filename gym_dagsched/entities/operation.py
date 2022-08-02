@@ -6,7 +6,7 @@ import numpy as np
 from .task import Task
 
 
-class OpFt(Enum):
+class FeatureIdx:
     N_REMAINING_TASKS = 0
     N_PROCESSING_TASKS = 1
     MEAN_TASK_DURATION = 2
@@ -88,8 +88,8 @@ class Operation:
         task = self.remaining_tasks.pop()
         self.processing_tasks.add(task)
 
-        x[OpFt.N_REMAINING_TASKS.value] -= 1
-        x[OpFt.N_PROCESSING_TASKS.value] += 1
+        x[FeatureIdx.N_REMAINING_TASKS] -= 1
+        x[FeatureIdx.N_PROCESSING_TASKS] += 1
 
         worker.task = task
         task.worker_id = worker.id_
@@ -104,7 +104,7 @@ class Operation:
         self.processing_tasks.remove(task)
         self.completed_tasks.add(task)
 
-        x[OpFt.N_PROCESSING_TASKS.value] -= 1
+        x[FeatureIdx.N_PROCESSING_TASKS] -= 1
 
         task.t_completed = wall_time
 

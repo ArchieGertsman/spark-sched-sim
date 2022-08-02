@@ -23,7 +23,9 @@ def _pick_first(env, key=None, reverse=False):
                 first_op = op
                 break
     
-    n_workers = int(first_op.n_remaining_tasks) \
+    # n_workers = int(first_op.n_remaining_tasks) \
+    #     if first_op is not None else 0
+    n_workers = len(env.workers) \
         if first_op is not None else 0
     
     return first_op, n_workers

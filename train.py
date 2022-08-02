@@ -24,12 +24,10 @@ if __name__ == '__main__':
     processing_mode = sys.argv[1]
     assert processing_mode in ['m', 's']
 
-    # print(torch.cuda.is_available())
+    print('cuda available:', torch.cuda.is_available())
 
     if processing_mode == 'm':
-        # assert not torch.cuda.is_available()
         set_start_method('spawn')
-        # torch.set_num_threads(1)
 
     datagen = RandomDataGen(
         max_ops=8, # 20
@@ -39,13 +37,9 @@ if __name__ == '__main__':
 
     # datagen = TPCHDataGen()
 
-    n_workers = 100
+    n_workers = 10
 
     policy = ActorNetwork(5, 8, n_workers)
-    # policy.share_memory()
-    # policy.to(device)
-
-    optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
     writer = SummaryWriter('tensorboard')
 
@@ -55,21 +49,20 @@ if __name__ == '__main__':
 
     train(
         datagen, 
-        policy, 
-        optim, 
+        policy,
         n_sequences=100,
         n_ep_per_seq=6,
         discount=.99,
-        entropy_weight_init=.1,
+        entropy_weight_init=.5,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
         n_workers=n_workers,
         # initial_mean_ep_len=5000, #50,
         # ep_len_growth=250, #10,
         # min_ep_len=1000, #50,
-        initial_mean_ep_len=250,
-        ep_len_growth=25,
-        min_ep_len=250,
+        initial_mean_ep_len=150,
+        ep_len_growth=10,
+        min_ep_len=100,
         writer=writer
     )
 

@@ -1,3 +1,4 @@
+from email.policy import Policy
 import sys
 
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
@@ -84,15 +85,20 @@ if __name__ == '__main__':
 
     n_workers = 10
 
-    policy0 = ActorNetwork(5, 8, n_workers)
-    policy0.load_state_dict(torch.load('policy0.pt'))
-    policy0.eval()
-    policy0.to(device)
+    policy = ActorNetwork(5, 8, n_workers)
+    policy.load_state_dict(torch.load('policy.pt'))
+    policy.eval()
+    policy.to(device)
 
-    policy1 = ActorNetwork(5, 8, n_workers)
-    policy1.load_state_dict(torch.load('policy1.pt'))
-    policy1.eval()
-    policy1.to(device)
+    # policy0 = ActorNetwork(5, 8, n_workers)
+    # policy0.load_state_dict(torch.load('policy2.pt'))
+    # policy0.eval()
+    # policy0.to(device)
+
+    # policy1 = ActorNetwork(5, 8, n_workers)
+    # policy1.load_state_dict(torch.load('policy1.pt'))
+    # policy1.eval()
+    # policy1.to(device)
 
     datagen = RandomDataGen(
         max_ops=8,
@@ -103,9 +109,9 @@ if __name__ == '__main__':
 
     n_seq = 10
 
-    heurs = [srt, decima, decima]
-    models = [None, policy0, policy1]
-    heur_names = ['srt', 'decima0', 'decima1']
+    heurs = [srt, decima]
+    models = [None, policy]
+    heur_names = ['srt', 'decima']
 
     ajds = np.zeros((n_seq, len(heurs)))
 
