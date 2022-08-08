@@ -185,7 +185,7 @@ class PolicyNetwork(nn.Module):
         t1 = time()
         self.t += t1-t0
 
-        ops -= (1-op_msk)*1000
+        ops -= (1-op_msk)*1e5
         ops = torch.softmax(ops, dim=0)
 
         return ops
@@ -205,7 +205,7 @@ class PolicyNetwork(nn.Module):
         t1 = time()
         self.t += t1-t0
 
-        prlvl -= (1-prlvl_msk)*1000
+        prlvl -= (1-prlvl_msk)*1e5
         prlvl = torch.softmax(prlvl, dim=1)
 
         return prlvl

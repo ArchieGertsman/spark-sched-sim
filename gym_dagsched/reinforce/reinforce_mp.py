@@ -54,7 +54,7 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
 
     # set up local model and optimizer
     policy = deepcopy(policy).to(device)
-    optim = torch.optim.SGD(policy.parameters(), lr=.005)
+    optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,

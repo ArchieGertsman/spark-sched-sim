@@ -101,7 +101,7 @@ if __name__ == '__main__':
     # policy1.to(device)
 
     datagen = RandomDataGen(
-        max_ops=8,
+        max_ops=16,
         max_tasks=4,
         mean_task_duration=2000.,
         n_worker_types=1)

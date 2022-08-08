@@ -22,11 +22,15 @@ def _pick_first(env, key=None, reverse=False):
             if worker.compatible_with(op):
                 first_op = op
                 break
-    
-    # n_workers = int(first_op.n_remaining_tasks) \
-    #     if first_op is not None else 0
-    n_workers = len(env.workers) \
-        if first_op is not None else 0
+
+
+    if first_op is not None:
+        # job = env.jobs[first_op.job_id]
+        # n_avail_local = sum([int(env.workers[worker_id].task is None) for worker_id in list(job.local_workers)])
+        # n_workers = len(job.local_workers) + max(0, int(first_op.n_remaining_tasks) - n_avail_local)
+        n_workers = len(env.workers)
+    else:
+        n_workers = 0
     
     return first_op, n_workers
 
