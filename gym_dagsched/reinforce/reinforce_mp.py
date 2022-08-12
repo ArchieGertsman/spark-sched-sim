@@ -53,8 +53,8 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     by communicating with the parent process'''
 
     # set up local model and optimizer
-    policy = deepcopy(policy).to(device)
-    optim = torch.optim.Adam(policy.parameters(), lr=.005)
+    # policy = deepcopy(policy).to(device)
+    # optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,
@@ -95,12 +95,13 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
         entropy_loss = entropy_weight * entropies.sum()
         loss = (policy_loss + entropy_loss) / ep_len
 
-        if rank == 0:
-            print('advantages:', advantages)
-            print('policy loss:', policy_loss)
-            print('entropy loss:', entropy_loss)
+        # if rank == 0:
+        #     print('advantages:', advantages)
+        #     print('policy loss:', policy_loss)
+        #     print('entropy loss:', entropy_loss)
 
-        update_policy(policy, optim, loss)
+        # update_policy(policy, optim, loss)
+        loss.backward()
 
         send_ep_stats(out_q, loss, env)
 
@@ -151,6 +152,9 @@ def train(
     `n_ep_per_seq` episodes are repeated on each sequence in parallel
     using multiprocessing'''
 
+    policy.to(device)
+    optim = torch.optim.SGD(policy.parameters(), lr=.005)
+
     procs, in_qs, out_qs = \
         launch_subprocesses(n_ep_per_seq, discount, policy)
 
@@ -170,6 +174,8 @@ def train(
             n_job_arrivals=100, n_init_jobs=0, mjit=2000.)
         workers = datagen.workers(n_workers=n_workers)
 
+        optim.zero_grad()
+
         # send episode data to each of the subprocesses, 
         # which starts the episodes
         for in_q in in_qs:
@@ -185,6 +191,8 @@ def train(
             losses[j] = loss
             avg_job_durations[j] = avg_job_duration
             n_completed_jobs_list[j] = n_completed_jobs
+
+        optim.step()
 
         print(n_completed_jobs_list, n_completed_jobs_list.mean())
 

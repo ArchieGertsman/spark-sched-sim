@@ -63,7 +63,7 @@ if __name__ == '__main__':
         # initial_mean_ep_len=5000, #50,
         # ep_len_growth=250, #10,
         # min_ep_len=1000, #50,
-        initial_mean_ep_len=1000,
+        initial_mean_ep_len=100,
         ep_len_growth=10,
         min_ep_len=100,
         writer=writer
