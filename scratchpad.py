@@ -1,5 +1,7 @@
 from email.policy import Policy
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="torch.distributed.reduce_op is deprecated")
 
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
 sys.path.append('./gym_dagsched/data_generation/tpch/')
@@ -33,7 +35,7 @@ def decima(env, policy):
             op_msk, 
             prlvl_msk)
         next_op, prlvl, _, _ = \
-            sample_action(env, ops_probs, prlvl_probs)
+            sample_action(env, ops_probs, prlvl_probs, op_msk, prlvl_msk)
     return next_op, prlvl
 
 

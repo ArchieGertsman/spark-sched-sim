@@ -24,6 +24,7 @@ if __name__ == '__main__':
     processing_mode = sys.argv[1]
     assert processing_mode in ['m', 's']
 
+    # n_workers = 50
     n_workers = 10
     policy = ActorNetwork(5, 8, n_workers)
 
@@ -56,14 +57,14 @@ if __name__ == '__main__':
         n_sequences=200,
         n_ep_per_seq=6,
         discount=.99,
-        entropy_weight_init=1.,
+        entropy_weight_init=5.,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
         n_workers=n_workers,
         # initial_mean_ep_len=5000, #50,
         # ep_len_growth=250, #10,
         # min_ep_len=1000, #50,
-        initial_mean_ep_len=100,
+        initial_mean_ep_len=250,
         ep_len_growth=10,
         min_ep_len=100,
         writer=writer

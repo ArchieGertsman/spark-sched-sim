@@ -144,7 +144,7 @@ class PolicyNetwork(nn.Module):
         # self.total_time = [0,0]
         self.t = 0.
         
-        
+    
     def forward(
         self, 
         num_ops_per_dag, 
@@ -185,8 +185,9 @@ class PolicyNetwork(nn.Module):
         t1 = time()
         self.t += t1-t0
 
-        ops -= (1-op_msk)*1e5
-        ops = torch.softmax(ops, dim=0)
+        # ops -= (1-op_msk) * 1e6
+        # ops[(1-op_msk).nonzero()] = torch.finfo(torch.float).min
+        # ops = torch.softmax(ops, dim=0)
 
         return ops
     
@@ -205,8 +206,9 @@ class PolicyNetwork(nn.Module):
         t1 = time()
         self.t += t1-t0
 
-        prlvl -= (1-prlvl_msk)*1e5
-        prlvl = torch.softmax(prlvl, dim=1)
+        # prlvl -= (1-prlvl_msk) * 1e6
+        # prlvl[(1-prlvl_msk).nonzero()] = torch.finfo(torch.float).min
+        # prlvl = torch.softmax(prlvl, dim=1)
 
         return prlvl
 

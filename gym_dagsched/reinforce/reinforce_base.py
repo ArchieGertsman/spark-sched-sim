@@ -1,4 +1,3 @@
-from memory_profiler import profile
 import sys
 sys.path.append('../data_generation/tpch/')
 from time import time
@@ -10,7 +9,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from scipy.signal import lfilter
 from pympler import tracker
-from torch.profiler import profile, record_function, ProfilerActivity
+# from torch.profiler import profile, record_function, ProfilerActivity
 from gym_dagsched.policies.decima_agent import ActorNetwork
 
 from ..utils.device import device
@@ -27,7 +26,7 @@ def calc_joint_entropy(op_probs, prlvl_probs):
 
 
 
-def sample_action(env, op_probs, prlvl_probs):
+def sample_action(env, op_probs, prlvl_probs, op_msk, prlvl_msk):
     '''given probabilities for selecting the next operation
     and the parallelism level for that operation's job (returned
     by the neural network), returns a randomly sampled 
@@ -38,19 +37,22 @@ def sample_action(env, op_probs, prlvl_probs):
     (which maintains a computational graph for learning) and the
     joint entropy of the distributions that came from the network
     '''
-    c = Categorical(probs=op_probs)
-    next_op_idx = c.sample()
-    next_op_idx_lgp = c.log_prob(next_op_idx)
+    op_probs[(1-op_msk).nonzero()] = torch.finfo(torch.float).min
+    c1 = Categorical(logits=op_probs)
+    next_op_idx = c1.sample()
+    next_op_idx_lgp = c1.log_prob(next_op_idx)
     next_op, job_idx = env.find_op(next_op_idx)
 
     prlvl_probs = prlvl_probs[job_idx]
-    c = Categorical(probs=prlvl_probs)        
-    prlvl = c.sample()
-    prlvl_lgp = c.log_prob(prlvl)
+    prlvl_probs[(1-prlvl_msk[job_idx]).nonzero()] = torch.finfo(torch.float).min
+    c2 = Categorical(logits=prlvl_probs)        
+    prlvl = c2.sample()
+    prlvl_lgp = c2.log_prob(prlvl)
 
     action_lgprob = next_op_idx_lgp + prlvl_lgp
 
-    entropy = calc_joint_entropy(op_probs, prlvl_probs)
+    # entropy = calc_joint_entropy(c1.probs, c2.probs)
+    entropy = c1.entropy() + c2.entropy()
 
     return \
         next_op, \
@@ -87,6 +89,10 @@ def invoke_policy(policy, obs):
 
 
 
+def print_time(name, t, total):
+    print(f'{name}: {t/total*100:.2f}')
+
+
 def run_episode(
     rank,
     env,
@@ -94,14 +100,19 @@ def run_episode(
     workers,
     ep_len,
     policy,
-    discount
+    discount,
+    last_obs,
+    last_reward,
+    done
 ):
     '''runs one MDP episode for `ep_len` steps on an environment
     initialized with a job arrival sequence stored in `initial_timeline` 
     and a set of workers stored in `workers`. Returns the trajectory of 
     action log probabilities, returns, and entropies, each of length `ep_len`.
     '''
-    env.reset(initial_timeline, workers)
+    if initial_timeline is not None:
+        assert workers is not None
+        env.reset(initial_timeline, workers)
 
     trajectory = torch.zeros((ep_len, 3))
 
@@ -111,29 +122,51 @@ def run_episode(
     rewards = trajectory[:,1]
     entropies = trajectory[:,2]
 
-    done = False
-    obs = None
+    # done = False
+    obs = last_obs
+    reward = last_reward
+
+    # t_env = 0
+    # t_model = 0
+    # t_sample = 0
+    # t_total = time()
 
     i = 0
     while i < ep_len and not done:
         if obs is None or env.n_active_jobs == 0:
             next_op, prlvl = None, 0
         else:
+            # t = time()
             ops_probs, prlvl_probs = invoke_policy(policy, obs)
+            # t_model += time() - t
 
+            # t = time()
             next_op, prlvl, action_lgprob, entropy = \
-                sample_action(env, ops_probs, prlvl_probs)
+                sample_action(env, ops_probs, prlvl_probs, obs[1], obs[2])
+            # t_sample += time() - t
 
             action_lgprobs[i] = action_lgprob
             rewards[i] = reward
             entropies[i] = entropy
 
+        # t = time()
         obs, reward, done = env.step(next_op, prlvl)
+        # t_env += time() - t
         i += 1
 
+    # t_total = time() - t_total
+
+    # if rank == 0:
+    #     print_time('t_env', t_env, t_total)
+    #     print_time('t_model', t_model, t_total)
+    #     print_time('t_sample', t_sample, t_total)
+
+
+    last_obs = obs
+    last_reward = reward
     returns = compute_returns(rewards.detach(), discount)
 
-    return action_lgprobs, returns, entropies
+    return last_obs, last_reward, done, action_lgprobs, returns, entropies
 
 
 

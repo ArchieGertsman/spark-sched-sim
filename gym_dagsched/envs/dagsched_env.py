@@ -137,6 +137,7 @@ class DagSchedEnv:
             if len(tasks) > 0:
                 self._push_task_completion_events(tasks)
         else:
+            # print('invalid action', op, self.frontier_ops)
             pass # an invalid action was taken
 
 

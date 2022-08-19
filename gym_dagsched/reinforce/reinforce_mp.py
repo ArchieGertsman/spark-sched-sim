@@ -30,7 +30,7 @@ def send_ep_stats(out_q, loss, env):
     logging
     '''
     out_q.put((
-        loss.item(),
+        loss,
         avg_job_duration(env),
         env.n_completed_jobs))
 
@@ -52,9 +52,12 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
 
+    if rank == 0:
+        tr = tracker.SummaryTracker()
+
     # set up local model and optimizer
-    # policy = deepcopy(policy).to(device)
-    # optim = torch.optim.Adam(policy.parameters(), lr=.005)
+    policy = deepcopy(policy).to(device)
+    optim = torch.optim.Adam(policy.parameters(), lr=.008)
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,
@@ -71,39 +74,72 @@ def run_episodes(rank, n_ep_per_seq, policy, discount, in_q, out_q):
     env = DagSchedEnv()
 
     while data := in_q.get():
+        
+
         # receive episode data from parent process
         initial_timeline, workers, ep_len, entropy_weight = data
 
-        action_lgprobs, returns, entropies = \
-            run_episode(
-                rank,
-                env,
-                initial_timeline,
-                workers,
-                ep_len,
-                policy,
-                discount
-            )
+        n_remaining_steps = ep_len
+        n_steps_per_window = 500
+        last_obs = None
+        last_reward = None
+        done = False
+        total_loss = 0.
 
-        # compute advantages
-        baselines = returns.clone()
-        dist.all_reduce(baselines)
-        baselines /= n_ep_per_seq
-        advantages = returns - baselines
+        while n_remaining_steps > 0 and not done:
+            # if rank == 0:
+            #     print('next iter')
+            #     tr.print_diff()
 
-        policy_loss = -action_lgprobs @ advantages
-        entropy_loss = entropy_weight * entropies.sum()
-        loss = (policy_loss + entropy_loss) / ep_len
+            n_steps = min(n_steps_per_window, n_remaining_steps)
 
-        # if rank == 0:
-        #     print('advantages:', advantages)
-        #     print('policy loss:', policy_loss)
-        #     print('entropy loss:', entropy_loss)
+            last_obs, last_reward, done, action_lgprobs, returns, entropies = \
+                run_episode(
+                    rank,
+                    env,
+                    initial_timeline,
+                    workers,
+                    n_steps,
+                    policy,
+                    discount,
+                    last_obs,
+                    last_reward,
+                    done
+                )
 
-        # update_policy(policy, optim, loss)
-        loss.backward()
+            # if rank == 0:
+            #     tr.print_diff()
+            #     print(flush=True)
 
-        send_ep_stats(out_q, loss, env)
+            initial_timeline = None
+            workers = None
+
+            n_remaining_steps -= n_steps
+
+            # compute advantages
+            baselines = returns.clone()
+            dist.all_reduce(baselines)
+            baselines /= n_ep_per_seq
+            advantages = returns - baselines
+
+            policy_loss = -action_lgprobs @ advantages
+            entropy_loss = entropy_weight * entropies.sum()
+            loss = (policy_loss + entropy_loss) / ep_len
+
+            update_policy(policy, optim, loss)
+
+            total_loss += loss.item()
+
+            done_t = torch.tensor(done, dtype=torch.int8)
+            dist.all_reduce(done_t, op=dist.ReduceOp.BOR)
+            done = bool(done_t.item())
+
+            if rank == 0 and done == True:
+                print('done, ', ep_len - n_remaining_steps)
+
+        
+
+        send_ep_stats(out_q, total_loss, env)
 
 
 
@@ -152,8 +188,8 @@ def train(
     `n_ep_per_seq` episodes are repeated on each sequence in parallel
     using multiprocessing'''
 
-    policy.to(device)
-    optim = torch.optim.SGD(policy.parameters(), lr=.005)
+    # policy.to(device)
+    # optim = torch.optim.SGD(policy.parameters(), lr=.005)
 
     procs, in_qs, out_qs = \
         launch_subprocesses(n_ep_per_seq, discount, policy)
@@ -165,7 +201,8 @@ def train(
         # sample the length of the current episode
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
-        ep_len = min(ep_len, 4500)
+        # ep_len = min(ep_len, 4500)
+        # ep_len = 250
 
         print(f'beginning training on sequence {epoch+1} with ep_len = {ep_len}', flush=True)
 
@@ -174,7 +211,7 @@ def train(
             n_job_arrivals=100, n_init_jobs=0, mjit=2000.)
         workers = datagen.workers(n_workers=n_workers)
 
-        optim.zero_grad()
+        # optim.zero_grad()
 
         # send episode data to each of the subprocesses, 
         # which starts the episodes
@@ -192,7 +229,7 @@ def train(
             avg_job_durations[j] = avg_job_duration
             n_completed_jobs_list[j] = n_completed_jobs
 
-        optim.step()
+        # optim.step()
 
         print(n_completed_jobs_list, n_completed_jobs_list.mean())
 
@@ -212,6 +249,9 @@ def train(
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
+
+        if (epoch+1) % 10 == 0:
+            torch.save(policy.state_dict(), 'policy.pt')
 
     terminate_subprocesses(in_qs, procs)
 
