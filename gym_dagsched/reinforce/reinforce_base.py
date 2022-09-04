@@ -122,45 +122,25 @@ def run_episode(
     rewards = trajectory[:,1]
     entropies = trajectory[:,2]
 
-    # done = False
     obs = last_obs
     reward = last_reward
-
-    # t_env = 0
-    # t_model = 0
-    # t_sample = 0
-    # t_total = time()
 
     i = 0
     while i < ep_len and not done:
         if obs is None or env.n_active_jobs == 0:
             next_op, prlvl = None, 0
         else:
-            # t = time()
             ops_probs, prlvl_probs = invoke_policy(policy, obs)
-            # t_model += time() - t
 
-            # t = time()
             next_op, prlvl, action_lgprob, entropy = \
                 sample_action(env, ops_probs, prlvl_probs, obs[1], obs[2])
-            # t_sample += time() - t
 
             action_lgprobs[i] = action_lgprob
             rewards[i] = reward
             entropies[i] = entropy
 
-        # t = time()
         obs, reward, done = env.step(next_op, prlvl)
-        # t_env += time() - t
         i += 1
-
-    # t_total = time() - t_total
-
-    # if rank == 0:
-    #     print_time('t_env', t_env, t_total)
-    #     print_time('t_model', t_model, t_total)
-    #     print_time('t_sample', t_sample, t_total)
-
 
     last_obs = obs
     last_reward = reward

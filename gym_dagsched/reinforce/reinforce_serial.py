@@ -4,9 +4,10 @@ from time import time
 
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 from .reinforce_base import *
-from ..envs.dagsched_env import DagSchedEnv
+from ..envs.vec_dagsched_env import VecDagSchedEnv
 from ..utils.metrics import avg_job_duration
 
 
@@ -14,26 +15,25 @@ from ..utils.metrics import avg_job_duration
 def learn_from_trajectories(
     optim,
     entropy_weight,
-    action_lgprobs_list, 
-    returns_list, 
-    entropies_list
+    action_lgps_batch, 
+    returns_batch, 
+    entropies_batch
 ):
     '''given a list of trajectories from multiple MDP episodes
     that were repeated on a fixed job arrival sequence, update the model 
     parameters using the REINFORCE algorithm as in the Decima paper.
     '''
-    action_lgprobs_mat = torch.stack(action_lgprobs_list).to(device=device)
-    returns_mat = torch.stack(returns_list)
-    entropies_mat = torch.stack(entropies_list).to(device=device)
+    action_lgps_batch = action_lgps_batch.to(device=device)
+    entropies_batch = entropies_batch.to(device=device)
 
-    baselines = returns_mat.mean(axis=0)
-    advantages_mat = returns_mat - baselines
+    baselines = returns_batch.mean(axis=0)
+    advantages_batch = returns_batch - baselines
 
-    action_lgprobs = action_lgprobs_mat.flatten().to(device=device)
-    advantages = advantages_mat.flatten().to(device=device)
+    action_lgprobs = action_lgps_batch.flatten().to(device=device)
+    advantages = advantages_batch.flatten().to(device=device)
 
     policy_loss  = -action_lgprobs @ advantages
-    entropy_loss = entropy_weight * entropies_mat.sum()
+    entropy_loss = entropy_weight * entropies_batch.sum()
 
     ep_len = baselines.numel()
 
@@ -43,6 +43,66 @@ def learn_from_trajectories(
     optim.step()
 
     return loss.item()
+
+
+
+
+
+def invoke_policy(policy, obs_batch, num_jobs_per_env):
+    dag_batch, op_msk_batch, prlvl_msk_batch = obs_batch 
+
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env = \
+        policy(
+            dag_batch.to(device=device), 
+            num_jobs_per_env.to(device=device)
+        )
+
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env = \
+        op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu()
+
+    op_scores_batch[(1-op_msk_batch).nonzero()] = torch.finfo(torch.float).min
+    prlvl_scores_batch[(1-prlvl_msk_batch).nonzero()] = torch.finfo(torch.float).min
+
+    op_scores_list = torch.split(op_scores_batch, num_ops_per_env.tolist())
+    op_scores_batch = pad_sequence(op_scores_list, padding_value=torch.finfo(torch.float).min).t()
+
+    return op_scores_batch, prlvl_scores_batch
+
+
+
+
+def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch):
+    c_op = Categorical(logits=op_scores_batch)
+    op_idx_batch = c_op.sample()
+    op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
+    op_batch, job_idx_batch = vec_env.find_op_batch(op_idx_batch)
+
+    prlvl_scores_batch = prlvl_scores_batch[job_idx_batch]
+    c_prlvl = Categorical(logits=prlvl_scores_batch)
+    prlvl_batch = c_prlvl.sample()
+    prlvl_lgp_batch = c_prlvl.log_prob(prlvl_batch)
+
+    action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
+
+    entropy_batch = c_op.entropy() + c_prlvl.entropy()
+
+    return op_batch, 1+prlvl_batch, action_lgp_batch, entropy_batch
+
+
+
+
+
+
+def compute_returns_batch(rewards_batch, discount):
+    rewards_batch = np.array(rewards_batch)
+    r = rewards_batch[...,::-1]
+    a = [1, -discount]
+    b = [1]
+    y = lfilter(b, a, x=r)
+    return torch.from_numpy(y[...,::-1].copy()).float()
+
+
+
 
 
 
@@ -63,9 +123,11 @@ def train(
 ):
     '''train the model on multiple different job arrival sequences'''
 
-    env = DagSchedEnv()
+    vec_env = VecDagSchedEnv(n=n_ep_per_seq)
 
     optim = torch.optim.Adam(policy.parameters(), lr=.005)
+
+    policy.to(device)
 
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init
@@ -75,69 +137,70 @@ def train(
 
         # ep_len = np.random.geometric(1/mean_ep_len)
         # ep_len = max(ep_len, min_ep_len)
-        ep_len = 8000
+        ep_len = 100
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=300, n_init_jobs=0, mjit=1000.)
+            n_job_arrivals=100, n_init_jobs=0, mjit=1000.)
         workers = datagen.workers(n_workers=n_workers)
 
         # run multiple episodes on this fixed sequence
-        action_lgprobs_list = []
-        returns_list = []
-        entropies_list = []
 
         avg_job_durations = np.zeros(n_ep_per_seq)
         n_completed_jobs_list = np.zeros(n_ep_per_seq)
 
-        # times = []
-        t_start = time()
-
-        for j in range(n_ep_per_seq):
-            # t0 = time()
-
-            t0 = time()
-            action_lgprobs, returns, entropies = \
-                run_episode(
-                    env,
-                    initial_timeline,
-                    workers,
-                    ep_len,
-                    policy,
-                    discount
-                )
-            t1 = time()
-            print('t_ep:', t1-t0)
-
-            action_lgprobs_list += [action_lgprobs]
-            returns_list += [returns]
-            entropies_list += [entropies]
-
-            avg_job_durations[j] = 0 # avg_job_duration(env)
-            n_completed_jobs_list[j] = env.n_completed_jobs
-
-            # print(f'episode {j+1} complete:', n_completed_jobs_list[j], avg_job_durations[j])
-
-            # t1 = time()
-            # times += [t1-t0]
-
-        # t_ep = np.mean(times)
 
 
-        t0 = time()
+
+
+
+
+
+        
+        vec_env.reset(initial_timeline, workers)
+
+        action_lgps_batch = torch.zeros((vec_env.n, ep_len))
+        rewards_batch = torch.zeros((vec_env.n, ep_len))
+        entropies_batch = torch.zeros((vec_env.n, ep_len))
+
+        obs_batch, reward_batch, done_batch = \
+            vec_env.step([None]*vec_env.n, [None]*vec_env.n)
+
+        i = 0
+        while i < ep_len and not done_batch.any().item():
+            op_scores_batch, prlvl_scores_batch = \
+                invoke_policy(
+                    policy, 
+                    obs_batch, 
+                    vec_env.num_jobs_per_env())
+
+            op_batch, prlvl_batch, action_lgp_batch, entropy_batch = \
+                sample_action_batch(
+                    vec_env, 
+                    op_scores_batch, 
+                    prlvl_scores_batch)
+
+            obs_batch, reward_batch, done_batch = \
+                vec_env.step(op_batch, prlvl_batch)
+
+            action_lgps_batch[:,i] = action_lgp_batch
+            rewards_batch[:,i] = reward_batch
+            entropies_batch[:,i] = entropy_batch
+
+            i += 1
+
+            
+
+
+
+        returns_batch = compute_returns_batch(rewards_batch.detach(), discount)
+
         loss = learn_from_trajectories(
             optim, 
             entropy_weight,
-            action_lgprobs_list, 
-            returns_list, 
-            entropies_list)
-        t1 = time()
-        t_learn = t1-t0
-        print('t_learn:', t_learn)
-
-        t_end = time()
-        t_total = t_end - t_start
-        print('t_total:', t_total)
+            action_lgps_batch, 
+            returns_batch, 
+            entropies_batch)
 
         write_tensorboard(
             writer, 
@@ -154,9 +217,7 @@ def train(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
 
-        
-
-        # print(f'ep: {t_ep/t_total*100.: 3f}%; learn: {t_learn/t_total*100.: 3f}%')
+    
 
     writer.close()
 

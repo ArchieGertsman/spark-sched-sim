@@ -1,13 +1,11 @@
 from time import time
-import gc
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 import torch_geometric.nn as gnn
-from pympler import tracker
+from torch_scatter import segment_add_csr
 
 from gym_dagsched.utils.device import device
 
@@ -28,45 +26,28 @@ class GCNConv(MessagePassing):
         super().__init__(aggr='add', flow='target_to_source')
         self.mlp1 = make_mlp(in_ch, 8)
         self.mlp2 = make_mlp(8, out_ch)
-        self.t = 0.
         
 
     def forward(self, x, edge_index):
-        # x has shape [N, in_channels]
-        # edge_index has shape [2, E]
-
-        # Step 1: Add self-loops to the adjacency matrix.
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
 
-        # Step 2: Linearly transform node feature matrix.
-        t0 = time()
         x = self.mlp1(x)
-        t1 = time()
-        self.t += t1-t0
 
-        # Step 3: Compute normalization.
         row, col = edge_index
         deg = degree(col, x.size(0), dtype=x.dtype)
         deg_inv_sqrt = deg.pow(-0.5)
         deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
         norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
 
-        # Step 4-5: Start propagating messages.
         return self.propagate(edge_index, x=x, norm=norm)
 
 
     def message(self, x_j, norm):
-        # x_j has shape [E, out_channels]
-
-        # Step 4: Normalize node features.
         return norm.view(-1, 1) * x_j
 
     
     def update(self, aggr_out):
-        # t0 = time()
         x = self.mlp2(aggr_out)
-        # t1 = time()
-        # self.t += t1-t0
         return x
     
     
@@ -77,33 +58,12 @@ class GraphEncoderNetwork(nn.Module):
         self.conv1 = GCNConv(in_ch, dim_embed)
         self.mlp_dag = make_mlp(in_ch + dim_embed, dim_embed)
         self.mlp_global = make_mlp(dim_embed, dim_embed)
-        self.t = 0.
 
 
-    def forward(self, dag_batch, tr):
-        # print('print 1')
-        # tr.print_diff()
-
-        # t0 = time()
+    def forward(self, dag_batch, job_indptr):
         x = self._compute_node_level_embeddings(dag_batch)
-        # t1 = time()
-        # self.t += t1-t0
-
-        # self.t += self.conv1.t
-
-        # print('print 2')
-        # tr.print_diff()
-
         y = self._compute_dag_level_embeddings(x, dag_batch)
-
-        # print('print 3')
-        # tr.print_diff()
-
-        z = self._compute_global_embedding(y)
-
-        # print('print 4')
-        # tr.print_diff()
-
+        z = self._compute_global_embedding(y, job_indptr)
         return x, y, z
 
     
@@ -112,25 +72,15 @@ class GraphEncoderNetwork(nn.Module):
     
 
     def _compute_dag_level_embeddings(self, x, dag_batch):
-        x_combined = torch.cat([dag_batch.x, x], dim=1).to(device=device)
+        x_combined = torch.cat([dag_batch.x, x], dim=1)
         y = gnn.global_add_pool(x_combined, dag_batch.batch)
-
-        t0 = time()
         y = self.mlp_dag(y)
-        t1 = time()
-        self.t += t1-t0
-
         return y
     
 
-    def _compute_global_embedding(self, y):
-        z = torch.sum(y, dim=0)
-
-        t0 = time()
+    def _compute_global_embedding(self, y, job_indptr):
+        z = segment_add_csr(y, job_indptr)
         z = self.mlp_global(z)
-        t1 = time()
-        self.t += t1-t0
-
         return z
         
         
@@ -141,76 +91,49 @@ class PolicyNetwork(nn.Module):
         self.mlp_op_score = make_mlp(3*dim_embed, 1)
         self.mlp_prlvl_score = make_mlp(2*dim_embed+1, 1)
         self.num_workers = num_workers
-        # self.total_time = [0,0]
-        self.t = 0.
         
     
     def forward(
         self, 
-        num_ops_per_dag, 
-        num_dags, 
-        x, y, z, 
-        op_msk, 
-        prlvl_msk,
-        tr
+        num_ops_per_job,
+        num_ops_per_env,
+        num_jobs_per_env, 
+        x, y, z
     ):
-        # print('print 5')
-        # tr.print_diff()
-
-        # 6.130%
-        ops = self._compute_ops(num_ops_per_dag, x, y, z, op_msk)
-
-        # print('print 6')
-        # tr.print_diff()
-
-        # 6.953%
-        prlvl = self._compute_prlvl(num_dags, y, z, prlvl_msk)
-
-        # print('print 7')
-        # tr.print_diff()
-
-        return ops, prlvl
-    
-    
-    def _compute_ops(self, num_ops_per_dag, x, y, z, op_msk):
-        y_ops = torch.repeat_interleave(y, num_ops_per_dag, dim=0)
+        op_scores = self._compute_op_scores(num_ops_per_job, num_ops_per_env, x, y, z)
         
-        num_total_ops = num_ops_per_dag.sum(dim=0)
-        z_ops = z.repeat(num_total_ops, 1)
+        prlvl_scores = self._compute_prlvl_scores(num_jobs_per_env, y, z)
+
+        return op_scores, prlvl_scores
+    
+    
+    def _compute_op_scores(self, num_ops_per_job, num_ops_per_env, x, y, z):
+        y_repeat = torch.repeat_interleave(y, num_ops_per_job, dim=0)
         
-        ops = torch.cat([x,y_ops,z_ops], dim=1)
+        z_repeat = torch.repeat_interleave(z, num_ops_per_env, dim=0)
+        
+        op_scores = torch.cat([x, y_repeat, z_repeat], dim=1)
 
-        t0 = time()
-        ops = self.mlp_op_score(ops).squeeze(-1)
-        t1 = time()
-        self.t += t1-t0
+        op_scores = self.mlp_op_score(op_scores).squeeze(-1)
 
-        # ops -= (1-op_msk) * 1e6
-        # ops[(1-op_msk).nonzero()] = torch.finfo(torch.float).min
-        # ops = torch.softmax(ops, dim=0)
-
-        return ops
+        return op_scores
     
     
-    def _compute_prlvl(self, num_dags, y, z, prlvl_msk):
+    def _compute_prlvl_scores(self, num_jobs_per_env, y, z):
+        num_total_jobs = num_jobs_per_env.sum()
+
         limits = torch.arange(1, self.num_workers+1, device=device)
-        limits = limits.repeat(num_dags).unsqueeze(1)
-        y_prlvl = torch.repeat_interleave(y, self.num_workers, dim=0)
-        z_prlvl = z.repeat(num_dags * self.num_workers, 1)
+        limits = limits.repeat(num_total_jobs).unsqueeze(1)
         
-        prlvl = torch.cat([limits, y_prlvl, z_prlvl], dim=1)
-        prlvl = prlvl.reshape(num_dags, self.num_workers, prlvl.shape[1])
+        y_repeat = torch.repeat_interleave(y, self.num_workers, dim=0)
+        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * self.num_workers, dim=0)
         
-        t0 = time()
-        prlvl = self.mlp_prlvl_score(prlvl).squeeze(-1)
-        t1 = time()
-        self.t += t1-t0
+        prlvl_scores = torch.cat([limits, y_repeat, z_repeat], dim=1)
+        prlvl_scores = prlvl_scores.reshape(num_total_jobs, self.num_workers, prlvl_scores.shape[1])
+        
+        prlvl_scores = self.mlp_prlvl_score(prlvl_scores).squeeze(-1)
 
-        # prlvl -= (1-prlvl_msk) * 1e6
-        # prlvl[(1-prlvl_msk).nonzero()] = torch.finfo(torch.float).min
-        # prlvl = torch.softmax(prlvl, dim=1)
-
-        return prlvl
+        return prlvl_scores
 
     
     
@@ -219,37 +142,27 @@ class ActorNetwork(nn.Module):
         super().__init__()
         self.encoder = GraphEncoderNetwork(in_ch, dim_embed)
         self.policy_network = PolicyNetwork(dim_embed, num_workers)
-        self.tr = tracker.SummaryTracker()
         
         
-    def forward(self, dag_batch, num_ops_per_dag, op_msk, prlvl_msk):
-        # print('print 1')
-        # self.tr.print_diff()
+    def forward(self, dag_batch, num_jobs_per_env):
+        job_indptr = torch.zeros(len(num_jobs_per_env)+1, device=device, dtype=torch.long)
+        torch.cumsum(num_jobs_per_env, 0, out=job_indptr[1:])
 
-        x, y, z = self.encoder(dag_batch, self.tr)
-
-        # print('print 2')
-        # self.tr.print_diff()
+        ptr = dag_batch.batch.bincount().cumsum(dim=0)
+        dag_batch.ptr = torch.cat([torch.tensor([0], device=device), ptr], dim=0)
         
+        x, y, z = self.encoder(dag_batch, job_indptr)
 
-        # t0 = time.time()
+        num_ops_per_job = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
+        num_ops_per_env = segment_add_csr(num_ops_per_job, job_indptr)
 
-        # refs = gc.get_referrers(dag_batch)
-        # print('len(refs) =', len(refs))
+        op_scores, prlvl_scores = self.policy_network(
+            num_ops_per_job,
+            num_ops_per_env,
+            num_jobs_per_env,
+            x, y, z)
 
-        ops, prlvl = self.policy_network(
-            num_ops_per_dag, 
-            dag_batch.num_graphs, 
-            x, y, z, 
-            op_msk, 
-            prlvl_msk,
-            self.tr)
-
-        # print('print 3')
-        # self.tr.print_diff()
-
-        # t1 = time.time()
-        # print(t1-t0)
+        op_indptr = torch.zeros(len(num_ops_per_env)+1, device=device, dtype=torch.long)
+        torch.cumsum(num_ops_per_env, 0, out=op_indptr[1:])
         
-        return ops, prlvl
- 
+        return op_scores, prlvl_scores, num_ops_per_env

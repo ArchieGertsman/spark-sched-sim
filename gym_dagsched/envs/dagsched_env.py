@@ -78,7 +78,7 @@ class DagSchedEnv:
 
 
 
-    def reset(self, initial_timeline, workers):
+    def reset(self, initial_timeline, workers, x_ptrs):
         '''resets the simulation. should be called before
         each run (including first). all state data is found here.
         '''
@@ -114,11 +114,7 @@ class DagSchedEnv:
         # they need assigned to them
         self.saturated_ops = set()
 
-        self._init_dag_batch()
-
-        self._init_data_ptrs()
-
-        self.total_time = 0.
+        self.x_ptrs = x_ptrs
 
 
 
@@ -151,7 +147,7 @@ class DagSchedEnv:
         # check if simulation is done
         if self.timeline.empty:
             assert self.all_jobs_complete
-            return None, None, True
+            return None, True
             
         # retreive the next scheduling event from the timeline
         t, event = self.timeline.pop()
@@ -164,73 +160,7 @@ class DagSchedEnv:
         
         self._process_scheduling_event(event)
 
-        return self._observe(), reward, False
-
-
-
-    def find_op(self, op_idx):
-        '''returns an Operation object corresponding to
-        the `op_idx`th operation in the system'''
-        i = 0
-        op = None
-        for j, job_id in enumerate(self.active_job_ids):
-            job = self.jobs[job_id]
-            if op_idx < i + len(job.ops):
-                op = job.ops[op_idx - i]
-                break
-            else:
-                i += len(job.ops)
-        assert op is not None
-        return op, j
-
-
-
-    def _init_dag_batch(self):
-        '''initializes the PyG batch of dags, `self.dag_batch`, in 
-        the system. This includes space for all the jobs which will 
-        arive, however sub-batches of this batch consisting of only 
-        active jobs will be revealed on observations of the environment
-        '''
-        data_list = []
-        for _,_,e in self.timeline.pq:
-            job = e.job
-            data = from_networkx(job.dag)
-            data.x = torch.tensor(
-                job.form_feature_vectors(),
-                dtype=torch.float32
-            )
-            data_list += [data]
-
-        self.dag_batch = Batch.from_data_list(data_list)
-        self.dag_batch.pin_memory()
-
-        
-
-    def _init_data_ptrs(self):
-        '''initializes a dict `self.x_ptrs` which maps job ids
-        to feature vectors stored at different parts of 
-        `self.dag_batch`. This dict is used for fast, copyless 
-        data accessing.
-        '''
-        self.x_ptrs = {}
-        for _,_,e in self.timeline.pq:
-            job = e.job
-            self.x_ptrs[job.id_] = self._get_feature_vecs(job.id_)
-
-
-
-    def _observe(self):
-        '''returns an observation of the state that can be
-        directly passed into the model. This observation
-        consists of `subbatch, op_msk, prlvl_msk`; see
-        `self._construct_...()` methods for what each of
-        these are
-        '''
-        subbatch = self._construct_subbatch()
-        op_msk = self._construct_op_msk()
-        prlvl_msk = self._construct_prlvl_msk(subbatch)
-
-        return subbatch, op_msk, prlvl_msk
+        return reward, False
 
 
 
@@ -244,104 +174,23 @@ class DagSchedEnv:
             # append this job's operations to the mask
             for op in self.jobs[j].ops:
                 op_msk += [1] if op in self.frontier_ops else [0]
-        return torch.tensor(op_msk, device=device)
+        return torch.tensor(op_msk)
 
 
-    def _construct_prlvl_msk(self, subbatch):
+
+    def _construct_prlvl_msk(self):
         '''returns a mask tensor indicating which parallelism
         levels are valid for each job dag, i.e. 
         prlvl_msk[i,l] = 1 if parallelism level `l` is
         valid for job `i`
         '''
-        prlvl_msk = torch.ones((subbatch.num_graphs, len(self.workers)))
+        prlvl_msk = torch.ones((self.n_active_jobs, len(self.workers)))
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
             n_local = len(job.local_workers)
             if n_local > 0:
                 prlvl_msk[i, :n_local-1] = 0
-        return prlvl_msk.to(device=device)
-
-
-
-    def n_workers(self, mask):
-        '''returns a tuple `(n_avail, n_avail_local)` where
-        `n_avail` is the total number of available workers in
-        the system, and `n_avail_local` is the number of 
-        those workers that are local to this job.
-        '''
-        n_avail = 0
-        n_avail_local = torch.zeros(self.dag_batch.num_graphs)
-        for worker in self.workers:
-            if worker.available:
-                n_avail += 1
-                if worker.task is not None:
-                    n_avail_local[worker.task.job_id] += 1
-        return n_avail, n_avail_local[mask]
-    
-
-
-    def _get_feature_vecs(self, i):
-        '''returns a reference to the feature vectors for 
-        job i's operations from `self.dag_batch` without copying
-        '''
-        mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
-        mask[i] = True
-        mask = mask[self.dag_batch.batch]
-        idx = mask.nonzero().flatten()
-        return self.dag_batch.x[idx[0] : idx[-1]+1]
-
-
-
-    def _construct_subbatch(self):
-        '''returns a mini-batch of PyG graphs, sub-batched
-        from `self.dag_batch`, where each graph is a dag in 
-        the system. See the 'Advanced Mini-Batching' section 
-        in PyG's docs
-        '''
-        mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
-        mask[self.active_job_ids] = True
-
-        node_mask = mask[self.dag_batch.batch]
-
-        subbatch = self.dag_batch.subgraph(node_mask)
-
-        subbatch._num_graphs = mask.sum().item()
-
-        assoc = torch.empty(self.dag_batch.num_graphs, dtype=torch.long)
-        assoc[mask] = torch.arange(subbatch.num_graphs)
-        subbatch.batch = assoc[self.dag_batch.batch][node_mask]
-
-        ptr = self.dag_batch._slice_dict['x']
-        num_nodes_per_graph = ptr[1:] - ptr[:-1]
-        ptr = torch.cumsum(num_nodes_per_graph[mask], 0)
-        ptr = torch.cat([torch.tensor([0]), ptr])
-        subbatch.ptr = ptr
-
-        subbatch.num_ops_per_dag = num_nodes_per_graph[mask]
-
-        edge_ptr = self.dag_batch._slice_dict['edge_index']
-        num_edges_per_graph = edge_ptr[1:] - edge_ptr[:-1]
-        edge_ptr = torch.cumsum(num_edges_per_graph[mask], 0)
-        edge_ptr = torch.cat([torch.tensor([0]), edge_ptr])
-
-        subbatch._inc_dict = defaultdict(
-            dict, {
-                'x': torch.zeros(subbatch.num_graphs, dtype=torch.long),
-                'edge_index': ptr[:-1]
-            })
-
-        subbatch._slice_dict = defaultdict(dict, {
-            'x': ptr,
-            'edge_index': edge_ptr
-        })
-
-        # update feature vectors with new worker info
-        n_avail, n_avail_local = self.n_workers(mask)
-        n_avail_local = n_avail_local[subbatch.batch]
-        subbatch.x[:, FeatureIdx.N_AVAIL_WORKERS] = n_avail
-        subbatch.x[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] = n_avail_local
-
-        return subbatch
+        return prlvl_msk
 
 
 
