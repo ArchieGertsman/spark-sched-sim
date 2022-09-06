@@ -54,8 +54,8 @@ if __name__ == '__main__':
     train(
         datagen, 
         policy,
-        n_sequences=200,
-        n_ep_per_seq=6,
+        n_sequences=100,
+        n_ep_per_seq=8,
         discount=.99,
         entropy_weight_init=5.,
         entropy_weight_decay=1e-3,

@@ -26,11 +26,13 @@ class RandomDataGen(DataGen):
     def _job(self, id, t_arrival):
         ops = self._ops(id)
         dag = self._dag(len(ops))
-        return Job(
+        job = Job(
             id_=id, 
             ops=ops, 
             dag=dag,
             t_arrival=t_arrival)
+        job.local_workers = set()
+        return job
 
 
 

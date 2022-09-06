@@ -248,12 +248,16 @@ class DagSchedEnv:
         task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
+            # print('job arrival')
             self._add_job(event.job)
         elif isinstance(event, WorkerArrival):
+            # print('worker arrival')
             self._process_worker_arrival(event.worker, event.job)
         elif isinstance(event, TaskCompletion):
+            # print('task completion')
             self._process_task_completion(event.task)
         else:
+            # print('nudge')
             pass # nudge event
 
 
@@ -273,13 +277,15 @@ class DagSchedEnv:
         '''performs some bookkeeping when a worker arrives'''
         worker.is_moving = False
 
-        old_job_id = worker.task.job_id \
-            if worker.task is not None \
-            else None
+        # old_job_id = worker.task.job_id \
+        #     if worker.task is not None \
+        #     else None
+
+        if worker.job_id is not None:
+            self.jobs[worker.job_id].local_workers.remove(worker.id_)
 
         job.local_workers.add(worker.id_)
-        if old_job_id is not None:
-            self.jobs[old_job_id].local_workers.remove(worker.id_)
+        worker.job_id = job.id_
 
 
 
@@ -335,6 +341,7 @@ class DagSchedEnv:
         returns a set of the Task objects which have been scheduled
         for processing
         '''
+        # print(op.job_id, op.id_, prlvl)
         self._send_more_workers(op, prlvl)
 
         tasks = self._schedule_workers(op)
@@ -356,6 +363,7 @@ class DagSchedEnv:
         '''
         job = self.jobs[op.job_id]
         n_workers_to_send = prlvl - len(job.local_workers)
+        # print(job.id_, prlvl, len(job.local_workers))
         assert n_workers_to_send >= 0
 
         for worker in self.workers:

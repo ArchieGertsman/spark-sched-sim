@@ -54,6 +54,7 @@ class TPCHDataGen(DataGen):
         for _,_,d in dag.edges(data=True):
             d.clear()
         job = Job(id_=id, ops=ops, dag=dag, t_arrival=t_arrival)
+        job.local_workers = set()
         
         return job
 

@@ -6,6 +6,7 @@ class Worker:
     id_: int
     type_: int
     task = None
+    job_id = None
     is_moving = False
 
 

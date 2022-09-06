@@ -23,14 +23,14 @@ def learn_from_trajectories(
     that were repeated on a fixed job arrival sequence, update the model 
     parameters using the REINFORCE algorithm as in the Decima paper.
     '''
-    action_lgps_batch = action_lgps_batch.to(device=device)
-    entropies_batch = entropies_batch.to(device=device)
+    action_lgps_batch = action_lgps_batch#.to(device=device)
+    entropies_batch = entropies_batch#.to(device=device)
 
     baselines = returns_batch.mean(axis=0)
     advantages_batch = returns_batch - baselines
 
-    action_lgprobs = action_lgps_batch.flatten().to(device=device)
-    advantages = advantages_batch.flatten().to(device=device)
+    action_lgprobs = action_lgps_batch.flatten()#.to(device=device)
+    advantages = advantages_batch.flatten()#.to(device=device)
 
     policy_loss  = -action_lgprobs @ advantages
     entropy_loss = entropy_weight * entropies_batch.sum()
@@ -61,7 +61,9 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env):
         op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu()
 
     op_scores_batch[(1-op_msk_batch).nonzero()] = torch.finfo(torch.float).min
-    prlvl_scores_batch[(1-prlvl_msk_batch).nonzero()] = torch.finfo(torch.float).min
+
+    idx = (1-prlvl_msk_batch).nonzero()
+    prlvl_scores_batch[idx[:,0], idx[:,1]] = torch.finfo(torch.float).min
 
     op_scores_list = torch.split(op_scores_batch, num_ops_per_env.tolist())
     op_scores_batch = pad_sequence(op_scores_list, padding_value=torch.finfo(torch.float).min).t()
@@ -133,11 +135,12 @@ def train(
     entropy_weight = entropy_weight_init
 
     for epoch in range(n_sequences):
-        print(f'beginning training on sequence {epoch+1}')
+        ep_len = np.random.geometric(1/mean_ep_len)
+        ep_len = max(ep_len, min_ep_len)
+        ep_len = min(ep_len, 4500)
+        # ep_len = 1000
 
-        # ep_len = np.random.geometric(1/mean_ep_len)
-        # ep_len = max(ep_len, min_ep_len)
-        ep_len = 100
+        print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}')
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
@@ -166,23 +169,37 @@ def train(
         obs_batch, reward_batch, done_batch = \
             vec_env.step([None]*vec_env.n, [None]*vec_env.n)
 
+        t_start = time()
+        t_policy = 0
+        t_sample = 0
+        t_env = 0
+
         i = 0
         while i < ep_len and not done_batch.any().item():
+            # print()
+
+            t = time()
             op_scores_batch, prlvl_scores_batch = \
                 invoke_policy(
                     policy, 
                     obs_batch, 
                     vec_env.num_jobs_per_env())
+            t_policy += time() - t
 
+            t = time()
             op_batch, prlvl_batch, action_lgp_batch, entropy_batch = \
                 sample_action_batch(
                     vec_env, 
                     op_scores_batch, 
                     prlvl_scores_batch)
+            t_sample += time() - t
 
+            t = time()
             obs_batch, reward_batch, done_batch = \
                 vec_env.step(op_batch, prlvl_batch)
+            t_env += time() - t
 
+            # if (i+1) % 10 == 0:
             action_lgps_batch[:,i] = action_lgp_batch
             rewards_batch[:,i] = reward_batch
             entropies_batch[:,i] = entropy_batch
@@ -195,19 +212,32 @@ def train(
 
         returns_batch = compute_returns_batch(rewards_batch.detach(), discount)
 
+        t = time()
         loss = learn_from_trajectories(
             optim, 
             entropy_weight,
             action_lgps_batch, 
             returns_batch, 
             entropies_batch)
+        t_learn = time() - t
+
+
+        t_total = time() - t_start
+
+        # print(t_total)
+        # print(t_policy, t_sample, t_env, t_learn)
+        # print(vec_env.t_step, sum(vec_env.t_observe), vec_env.t_observe)
+
+
+        avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])
+
 
         write_tensorboard(
             writer, 
             epoch, 
             ep_len, 
             loss, 
-            avg_job_durations.mean(), 
+            avg_job_durations.mean() if avg_job_durations.all() else np.inf, 
             n_completed_jobs_list.mean()
         )
 
