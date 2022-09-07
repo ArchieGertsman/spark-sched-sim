@@ -144,7 +144,7 @@ def train(
 
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=100, n_init_jobs=0, mjit=1000.)
+            n_job_arrivals=10, n_init_jobs=0, mjit=1000.)
         workers = datagen.workers(n_workers=n_workers)
 
         # run multiple episodes on this fixed sequence
@@ -224,9 +224,11 @@ def train(
 
         t_total = time() - t_start
 
-        # print(t_total)
-        # print(t_policy, t_sample, t_env, t_learn)
-        # print(vec_env.t_step, sum(vec_env.t_observe), vec_env.t_observe)
+        print(f'{t_total:.2f}')
+        print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
+        a = [f'{t:.2f}' for t in vec_env.t_observe]
+        print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
+        print()
 
 
         avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])

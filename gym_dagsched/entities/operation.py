@@ -79,34 +79,7 @@ class Operation:
             if self.task_duration[worker_type] < np.inf:
                 types.add(worker_type)
         return types
-
-
-    def add_worker(self, worker, wall_time, x):
-        assert self.n_saturated_tasks < self.n_tasks
-        assert worker.can_assign(self)
-
-        task = self.remaining_tasks.pop()
-        self.processing_tasks.add(task)
-
-        x[FeatureIdx.N_REMAINING_TASKS] -= 1
-        x[FeatureIdx.N_PROCESSING_TASKS] += 1
-
-        worker.task = task
-        task.worker_id = worker.id_
-        task.t_accepted = wall_time
-        return task
-
-
-    def add_task_completion(self, task, wall_time, x):
-        assert not self.is_complete
-        assert task in self.processing_tasks
-
-        self.processing_tasks.remove(task)
-        self.completed_tasks.add(task)
-
-        x[FeatureIdx.N_PROCESSING_TASKS] -= 1
-
-        task.t_completed = wall_time
+        
 
 
     

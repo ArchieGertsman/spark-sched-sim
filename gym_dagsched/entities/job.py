@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
+from .operation import FeatureIdx
+
 
 
 @dataclass
@@ -35,6 +37,8 @@ class Job:
     t_completed = np.inf
 
     local_workers = set()
+
+    x_ptr = None
 
 
 
@@ -143,3 +147,48 @@ class Job:
             mean_task_duration,
             0, 0
         ] 
+
+
+    def update_n_avail_local(self, n):
+        self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] += n
+        assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] >= 0).all()
+
+
+    def add_local_worker(self, worker_id, x_ptr):
+        self.local_workers.add(worker_id)
+        self.update_n_avail_local(x_ptr, 1)
+
+
+    def remove_local_worker(self, worker_id, x_ptr):
+        self.local_workers.remove(worker_id)
+        self.update_n_avail_local(x_ptr, -1)
+
+
+    def assign_worker(self, worker, op, wall_time):
+        assert op.n_saturated_tasks < op.n_tasks
+        assert worker.can_assign(op)
+
+        task = op.remaining_tasks.pop()
+        self.processing_tasks.add(task)
+
+        self.x_ptr[op.id_, FeatureIdx.N_REMAINING_TASKS] -= 1
+        self.x_ptr[op.id_, FeatureIdx.N_PROCESSING_TASKS] += 1
+        self.update_n_avail_local(self.x_ptr, -1)
+
+        worker.task = task
+        task.worker_id = worker.id_
+        task.t_accepted = wall_time
+        return task
+
+
+    def add_task_completion(self, op, task, wall_time):
+        assert not op.is_complete
+        assert task in op.processing_tasks
+
+        op.processing_tasks.remove(task)
+        op.completed_tasks.add(task)
+
+        self.x_ptr[op.id_, FeatureIdx.N_PROCESSING_TASKS] -= 1
+        self.update_n_avail_local(self.x_ptr, 1)
+
+        task.t_completed = wall_time

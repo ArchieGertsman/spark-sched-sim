@@ -24,8 +24,8 @@ if __name__ == '__main__':
     processing_mode = sys.argv[1]
     assert processing_mode in ['m', 's']
 
-    # n_workers = 50
-    n_workers = 10
+    n_workers = 50
+    # n_workers = 10
     policy = ActorNetwork(5, 8, n_workers)
 
     if len(sys.argv) == 3:
@@ -37,13 +37,13 @@ if __name__ == '__main__':
     if processing_mode == 'm':
         set_start_method('spawn')
 
-    datagen = RandomDataGen(
-        max_ops=8, # 20
-        max_tasks=4, # 200
-        mean_task_duration=2000.,
-        n_worker_types=1)
+    # datagen = RandomDataGen(
+    #     max_ops=8, # 20
+    #     max_tasks=4, # 200
+    #     mean_task_duration=2000.,
+    #     n_worker_types=1)
 
-    # datagen = TPCHDataGen()
+    datagen = TPCHDataGen()
 
     writer = SummaryWriter('tensorboard')
 
@@ -55,9 +55,9 @@ if __name__ == '__main__':
         datagen, 
         policy,
         n_sequences=100,
-        n_ep_per_seq=8,
+        n_ep_per_seq=16,
         discount=.99,
-        entropy_weight_init=5.,
+        entropy_weight_init=1.,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
         n_workers=n_workers,

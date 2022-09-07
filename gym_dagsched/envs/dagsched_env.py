@@ -116,6 +116,10 @@ class DagSchedEnv:
 
         self.x_ptrs = x_ptrs
 
+        # self.n_avail_workers = len(self.workers)
+
+        self.avail_worker_ids = set()
+
 
 
     def step(self, op, n_workers):
@@ -234,7 +238,6 @@ class DagSchedEnv:
     def _push_worker_arrival_event(self, worker, job):
         '''pushes the event of a worker arriving to a job
         to the timeline'''
-        worker.is_moving = True
         moving_cost = np.random.exponential(self.MOVING_COST)
         t_arrival = self.wall_time + moving_cost
         event = WorkerArrival(worker, job)
@@ -270,21 +273,14 @@ class DagSchedEnv:
         self.active_job_ids += [job.id_]
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
+        job.x_ptr = self.x_ptrs[job.id_]
 
 
 
     def _process_worker_arrival(self, worker, job):
         '''performs some bookkeeping when a worker arrives'''
+        job.add_local_worker(worker.id_)
         worker.is_moving = False
-
-        # old_job_id = worker.task.job_id \
-        #     if worker.task is not None \
-        #     else None
-
-        if worker.job_id is not None:
-            self.jobs[worker.job_id].local_workers.remove(worker.id_)
-
-        job.local_workers.add(worker.id_)
         worker.job_id = job.id_
 
 
@@ -293,10 +289,11 @@ class DagSchedEnv:
         '''performs some bookkeeping when a task completes'''
         job = self.jobs[task.job_id]
         op = job.ops[task.op_id]
-        op.add_task_completion(task, self.wall_time, self.x_ptrs[job.id_][op.id_])
+        job.add_task_completion(op, task, self.wall_time)
 
         worker = self.workers[task.worker_id]
         worker.make_available()
+        self.avail_worker_ids.add(worker.id_)
 
         if op.is_complete:
             self._process_op_completion(op)
@@ -363,15 +360,24 @@ class DagSchedEnv:
         '''
         job = self.jobs[op.job_id]
         n_workers_to_send = prlvl - len(job.local_workers)
-        # print(job.id_, prlvl, len(job.local_workers))
         assert n_workers_to_send >= 0
 
-        for worker in self.workers:
+        for worker_id in list(self.avail_worker_ids):
             if n_workers_to_send == 0:
                 break
+            worker = self.workers[worker_id]
             if worker.can_assign(op):
-                self._push_worker_arrival_event(worker, job)
+                self._send_worker(worker, job)    
                 n_workers_to_send -= 1
+            
+
+
+    def _send_worker(self, worker, job):
+        if worker.job_id is not None:
+            old_job = self.jobs[worker.job_id]
+            old_job.remove_local_worker(worker.id_)
+        worker.is_moving = True
+        self._push_worker_arrival_event(worker, job)
 
 
 
@@ -387,11 +393,12 @@ class DagSchedEnv:
                 break
             worker = self.workers[worker_id]
             if worker.can_assign(op):
-                task = op.add_worker(
+                task = job.assign_worker(
                     worker, 
-                    self.wall_time, 
-                    self.x_ptrs[op.job_id][op.id_])
+                    op,
+                    self.wall_time)
                 tasks.add(task)
+                self.avail_worker_ids.remove(worker_id)
 
         return tasks
 
