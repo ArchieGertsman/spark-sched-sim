@@ -161,4 +161,4 @@ def write_tensorboard(
     writer.add_scalar('episode length', ep_len, epoch)
     writer.add_scalar('loss', loss, epoch)
     writer.add_scalar('avg job duration', avg_job_durations_mean / ep_len, epoch)
-    writer.add_scalar('n completed jobs', n_completed_jobs_mean / ep_len, epoch)
+    writer.add_scalar('n completed jobs', n_completed_jobs_mean, epoch)

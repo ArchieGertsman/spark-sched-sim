@@ -127,7 +127,7 @@ def train(
 
     vec_env = VecDagSchedEnv(n=n_ep_per_seq)
 
-    optim = torch.optim.Adam(policy.parameters(), lr=.005)
+    optim = torch.optim.Adam(policy.parameters(), lr=.001)
 
     policy.to(device)
 
@@ -135,17 +135,26 @@ def train(
     entropy_weight = entropy_weight_init
 
     for epoch in range(n_sequences):
+        t_start = time()
+        t_policy = 0
+        t_sample = 0
+        t_env = 0
+
+
+        
         ep_len = np.random.geometric(1/mean_ep_len)
         ep_len = max(ep_len, min_ep_len)
-        ep_len = min(ep_len, 4500)
-        # ep_len = 1000
+        # ep_len = min(ep_len, 4500)
+        # ep_len = 10000
 
         print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}')
 
+        
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=10, n_init_jobs=0, mjit=1000.)
+            n_job_arrivals=100, n_init_jobs=0, mjit=1000.)
         workers = datagen.workers(n_workers=n_workers)
+        
 
         # run multiple episodes on this fixed sequence
 
@@ -153,13 +162,6 @@ def train(
         n_completed_jobs_list = np.zeros(n_ep_per_seq)
 
 
-
-
-
-
-
-
-        
         vec_env.reset(initial_timeline, workers)
 
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
@@ -169,10 +171,8 @@ def train(
         obs_batch, reward_batch, done_batch = \
             vec_env.step([None]*vec_env.n, [None]*vec_env.n)
 
-        t_start = time()
-        t_policy = 0
-        t_sample = 0
-        t_env = 0
+        
+        
 
         i = 0
         while i < ep_len and not done_batch.any().item():
@@ -228,10 +228,13 @@ def train(
         print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
         a = [f'{t:.2f}' for t in vec_env.t_observe]
         print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
-        print()
+        # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
+        # print(f'wall time s/step: {t_total/ep_len:.4f}')
+        # print()
 
 
         avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])
+        n_completed_jobs_list = [env.n_completed_jobs for env in vec_env.envs]
 
 
         write_tensorboard(
@@ -240,7 +243,7 @@ def train(
             ep_len, 
             loss, 
             avg_job_durations.mean() if avg_job_durations.all() else np.inf, 
-            n_completed_jobs_list.mean()
+            np.mean(n_completed_jobs_list)
         )
 
         mean_ep_len += ep_len_growth

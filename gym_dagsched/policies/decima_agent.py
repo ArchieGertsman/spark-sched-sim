@@ -145,24 +145,29 @@ class ActorNetwork(nn.Module):
         
         
     def forward(self, dag_batch, num_jobs_per_env):
-        job_indptr = torch.zeros(len(num_jobs_per_env)+1, device=device, dtype=torch.long)
-        torch.cumsum(num_jobs_per_env, 0, out=job_indptr[1:])
+        job_indptr, num_ops_per_job, num_ops_per_env = \
+            self._bookkeep(num_jobs_per_env, dag_batch)
 
-        ptr = dag_batch.batch.bincount().cumsum(dim=0)
-        dag_batch.ptr = torch.cat([torch.tensor([0], device=device), ptr], dim=0)
-        
         x, y, z = self.encoder(dag_batch, job_indptr)
-
-        num_ops_per_job = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
-        num_ops_per_env = segment_add_csr(num_ops_per_job, job_indptr)
 
         op_scores, prlvl_scores = self.policy_network(
             num_ops_per_job,
             num_ops_per_env,
             num_jobs_per_env,
             x, y, z)
-
-        op_indptr = torch.zeros(len(num_ops_per_env)+1, device=device, dtype=torch.long)
-        torch.cumsum(num_ops_per_env, 0, out=op_indptr[1:])
         
         return op_scores, prlvl_scores, num_ops_per_env
+
+
+    def _bookkeep(self, num_jobs_per_env, dag_batch):
+        job_indptr = torch.zeros(len(num_jobs_per_env)+1, device=device, dtype=torch.long)
+        torch.cumsum(num_jobs_per_env, 0, out=job_indptr[1:])
+
+        ptr = dag_batch.batch.bincount().cumsum(dim=0)
+        dag_batch.ptr = torch.cat([torch.tensor([0], device=device), ptr], dim=0)
+        
+        num_ops_per_job = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
+        num_ops_per_env = segment_add_csr(num_ops_per_job, job_indptr)
+
+        return job_indptr, num_ops_per_job, num_ops_per_env
+    

@@ -40,6 +40,8 @@ class Job:
 
     x_ptr = None
 
+    n_avail_local = 0
+
 
 
     
@@ -149,19 +151,26 @@ class Job:
         ] 
 
 
+    # @property
+    # def n_avail_local(self):
+    #     return self.x_ptr[0, FeatureIdx.N_AVAIL_LOCAL_WORKERS]
+
+
     def update_n_avail_local(self, n):
+        self.n_avail_local += n
         self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] += n
         assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] >= 0).all()
+        assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] <= len(self.local_workers)).all()
 
 
-    def add_local_worker(self, worker_id, x_ptr):
+    def add_local_worker(self, worker_id):
         self.local_workers.add(worker_id)
-        self.update_n_avail_local(x_ptr, 1)
+        self.update_n_avail_local(1)
 
 
-    def remove_local_worker(self, worker_id, x_ptr):
+    def remove_local_worker(self, worker_id):
         self.local_workers.remove(worker_id)
-        self.update_n_avail_local(x_ptr, -1)
+        self.update_n_avail_local(-1)
 
 
     def assign_worker(self, worker, op, wall_time):
@@ -169,11 +178,11 @@ class Job:
         assert worker.can_assign(op)
 
         task = op.remaining_tasks.pop()
-        self.processing_tasks.add(task)
+        op.processing_tasks.add(task)
 
         self.x_ptr[op.id_, FeatureIdx.N_REMAINING_TASKS] -= 1
         self.x_ptr[op.id_, FeatureIdx.N_PROCESSING_TASKS] += 1
-        self.update_n_avail_local(self.x_ptr, -1)
+        self.update_n_avail_local(-1)
 
         worker.task = task
         task.worker_id = worker.id_
@@ -189,6 +198,6 @@ class Job:
         op.completed_tasks.add(task)
 
         self.x_ptr[op.id_, FeatureIdx.N_PROCESSING_TASKS] -= 1
-        self.update_n_avail_local(self.x_ptr, 1)
+        self.update_n_avail_local(1)
 
         task.t_completed = wall_time

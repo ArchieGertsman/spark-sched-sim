@@ -1,5 +1,6 @@
 from collections import defaultdict
 from copy import deepcopy as dcp
+from copy import copy as cp
 from time import time
 
 import numpy as np
@@ -49,7 +50,11 @@ class DagSchedEnv:
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
-    MOVING_COST = 2000.
+    MOVING_COST = 10000.
+
+
+    def __init__(self, rank):
+        self.rank = rank
 
 
     @property
@@ -85,7 +90,8 @@ class DagSchedEnv:
 
         # a priority queue containing scheduling 
         # events indexed by wall time of occurance
-        self.timeline = dcp(initial_timeline)
+        self.timeline = cp(initial_timeline)
+        self.timeline.pq = cp(initial_timeline.pq)
 
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
@@ -116,9 +122,7 @@ class DagSchedEnv:
 
         self.x_ptrs = x_ptrs
 
-        # self.n_avail_workers = len(self.workers)
-
-        self.avail_worker_ids = set()
+        self.avail_worker_ids = set([worker.id_ for worker in self.workers])
 
 
 
@@ -136,8 +140,10 @@ class DagSchedEnv:
             tasks = self._take_action(op, n_workers)
             if len(tasks) > 0:
                 self._push_task_completion_events(tasks)
+
         else:
-            # print('invalid action', op, self.frontier_ops)
+            # if self.rank == 0:
+            #     print('invalid action', op, self.frontier_ops)
             pass # an invalid action was taken
 
 
@@ -176,8 +182,12 @@ class DagSchedEnv:
         op_msk = []
         for j in self.active_job_ids:
             # append this job's operations to the mask
-            for op in self.jobs[j].ops:
-                op_msk += [1] if op in self.frontier_ops else [0]
+            job = self.jobs[j]
+            if job.n_avail_local > 0 or len(self.avail_worker_ids) > 0:
+                for op in job.ops:
+                    op_msk += [1] if op in self.frontier_ops else [0]
+            else:
+                op_msk += [0] * len(job.ops)
         return torch.tensor(op_msk)
 
 
@@ -188,12 +198,15 @@ class DagSchedEnv:
         prlvl_msk[i,l] = 1 if parallelism level `l` is
         valid for job `i`
         '''
-        prlvl_msk = torch.ones((self.n_active_jobs, len(self.workers)))
+        prlvl_msk = torch.zeros((self.n_active_jobs, len(self.workers)))
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
             n_local = len(job.local_workers)
-            if n_local > 0:
-                prlvl_msk[i, :n_local-1] = 0
+            # if n_local > 0:
+            #     prlvl_msk[i, :n_local-1] = 0
+            i_min = max(0, n_local-1)
+            i_max = max(0, n_local + len(self.avail_worker_ids))
+            prlvl_msk[i, i_min:i_max] = 1
         return prlvl_msk
 
 
@@ -251,17 +264,28 @@ class DagSchedEnv:
         task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
-            # print('job arrival')
-            self._add_job(event.job)
+            # if self.rank == 0:
+            #     print('job arrival')
+            self._process_job_arrival(event.job)
         elif isinstance(event, WorkerArrival):
-            # print('worker arrival')
+            # if self.rank == 0:
+            #     print('worker arrival')
             self._process_worker_arrival(event.worker, event.job)
         elif isinstance(event, TaskCompletion):
-            # print('task completion')
+            # if self.rank == 0:
+            #     print('task completion')
             self._process_task_completion(event.task)
         else:
-            # print('nudge')
+            # if self.rank == 0:
+            #     print('nudge')
             pass # nudge event
+
+
+
+    def _process_job_arrival(self, job):
+        self._add_job(job)
+        if not self._are_actions_available():
+            self.step(None, None)
 
 
 
@@ -269,17 +293,19 @@ class DagSchedEnv:
         '''adds a new job to the list of jobs, and adds all of
         its source operations to the frontier
         '''
-        self.jobs[job.id_] = job
+        job_cp = dcp(job)
+        job_cp.x_ptr = self.x_ptrs[job.id_]
+        self.jobs[job.id_] = job_cp
         self.active_job_ids += [job.id_]
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
-        job.x_ptr = self.x_ptrs[job.id_]
 
 
 
     def _process_worker_arrival(self, worker, job):
         '''performs some bookkeeping when a worker arrives'''
         job.add_local_worker(worker.id_)
+        self.avail_worker_ids.add(worker.id_)
         worker.is_moving = False
         worker.job_id = job.id_
 
@@ -290,6 +316,9 @@ class DagSchedEnv:
         job = self.jobs[task.job_id]
         op = job.ops[task.op_id]
         job.add_task_completion(op, task, self.wall_time)
+        # print(job.x_ptr)
+        # print(self.x_ptrs[job.id_])
+        # print()
 
         worker = self.workers[task.worker_id]
         worker.make_available()
@@ -338,7 +367,6 @@ class DagSchedEnv:
         returns a set of the Task objects which have been scheduled
         for processing
         '''
-        # print(op.job_id, op.id_, prlvl)
         self._send_more_workers(op, prlvl)
 
         tasks = self._schedule_workers(op)
@@ -377,6 +405,7 @@ class DagSchedEnv:
             old_job = self.jobs[worker.job_id]
             old_job.remove_local_worker(worker.id_)
         worker.is_moving = True
+        self.avail_worker_ids.remove(worker.id_)
         self._push_worker_arrival_event(worker, job)
 
 
@@ -408,23 +437,14 @@ class DagSchedEnv:
         '''checks if there are any valid actions that can be
         taken by the scheduling agent.
         '''
-        avail_workers = self._find_available_workers()
+        return len(self.avail_worker_ids) > 0 and len(self.frontier_ops) > 0
 
-        if len(avail_workers) == 0 or len(self.frontier_ops) == 0:
-            return False
+        # for op in self.frontier_ops:
+        #     for worker_id in self.avail_worker_ids:
+        #         if self.workers[worker_id].compatible_with(op):
+        #             return True
 
-        for op in self.frontier_ops:
-            for worker in avail_workers:
-                if worker.compatible_with(op):
-                    return True
-
-        return False
-
-
-
-    def _find_available_workers(self):
-        '''returns all the available workers in the system'''
-        return [worker for worker in self.workers if worker.available]
+        # return False
 
 
 

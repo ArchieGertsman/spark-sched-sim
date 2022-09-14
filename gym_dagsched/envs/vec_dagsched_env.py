@@ -13,16 +13,18 @@ from ..entities.operation import FeatureIdx
 class VecDagSchedEnv:
     def __init__(self, n):
         self.n = n
-        self.envs = [DagSchedEnv() for _ in range(n)]
+        self.envs = [DagSchedEnv(rank) for rank in range(n)]
 
 
     def reset(self, initial_timeline, workers):
         self.timeline = initial_timeline
         self.n_job_arrivals = len(initial_timeline.pq)
         self._init_dag_batch()
+
         for i, env in enumerate(self.envs):
             x_ptrs = [self._get_x_ptr(i, j) for j in range(self.n_job_arrivals)]
-            env.reset(dcp(initial_timeline), dcp(workers), x_ptrs)
+            env.reset(initial_timeline, workers, x_ptrs)
+
         self.t_step = 0
         self.t_observe = [0,0,0]
 
@@ -30,19 +32,19 @@ class VecDagSchedEnv:
     def step(self, op_vec, prlvl_vec):
         rewards = torch.zeros(self.n)
         dones = torch.zeros(self.n, dtype=torch.bool)
+        t = time()
         for i, (env, op, prlvl) in enumerate(zip(self.envs, op_vec, prlvl_vec)):
             if prlvl is not None:
                 prlvl = prlvl.item()
             
-            t = time()
             reward, done = env.step(op, prlvl)
-            self.t_step += time() - t
 
             rewards[i] = reward
             dones[i] = done
             if not done:
                 while env.n_active_jobs == 0 or len(env.frontier_ops) == 0:
                     env.step(None, None)
+        self.t_step += time() - t
 
         # t = time()
         obs = self._observe()
@@ -79,17 +81,17 @@ class VecDagSchedEnv:
 
 
     def _observe(self):
-        # t = time()
+        t = time()
         subbatch = self._construct_subbatch()
-        # self.t_observe[0] += time() - t
+        self.t_observe[0] += time() - t
 
-        # t = time()
+        t = time()
         op_msk_batch = torch.cat([env._construct_op_msk() for env in self.envs])
-        # self.t_observe[1] += time() - t
+        self.t_observe[1] += time() - t
 
-        # t = time()
+        t = time()
         prlvl_msk_batch = torch.cat([env._construct_prlvl_msk() for env in self.envs])
-        # self.t_observe[2] += time() - t
+        self.t_observe[2] += time() - t
 
         return subbatch, op_msk_batch, prlvl_msk_batch
 
@@ -97,16 +99,16 @@ class VecDagSchedEnv:
     def _construct_subbatch(self):
         mask = torch.zeros(self.dag_batch.num_graphs, dtype=torch.bool)
 
-        t = time()
+        # t = time()
         for i,env in enumerate(self.envs):
             mask[i * self.n_job_arrivals + torch.tensor(env.active_job_ids)] = True
-        self.t_observe[0] += time() - t
+        # self.t_observe[0] += time() - t
 
         node_mask = mask[self.dag_batch.batch]
 
-        t = time()
+        # t = time()
         subbatch = self.dag_batch.subgraph(node_mask)
-        self.t_observe[1] += time() - t
+        # self.t_observe[1] += time() - t
 
 
 
@@ -140,14 +142,20 @@ class VecDagSchedEnv:
 
 
 
-        t = time()
+        # t = time()
 
         n_avail = torch.tensor([len(env.avail_worker_ids) for env in self.envs])
         n_avail = torch.repeat_interleave(n_avail, self.num_jobs_per_env())
         n_avail = n_avail[subbatch.batch]
         subbatch.x[:, FeatureIdx.N_AVAIL_WORKERS] = n_avail
+        # print(subbatch.x[:self.envs[0].n_active_jobs, FeatureIdx.N_AVAIL_LOCAL_WORKERS])
+        # print([self.envs[0].x_ptrs[j] for j in self.envs[0].active_job_ids])
+        
+        # print(subbatch.x[0, :])
+        # print(self.envs[0].x_ptrs[0][0])
+        # print()
 
-        self.t_observe[2] += time() - t
+        # self.t_observe[2] += time() - t
 
         return subbatch
 
