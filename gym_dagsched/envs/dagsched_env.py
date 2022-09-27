@@ -50,7 +50,7 @@ class DagSchedEnv:
 
     # expected time to move a worker between jobs
     # (mean of exponential distribution)
-    MOVING_COST = 10000.
+    MOVING_COST = 2000.
 
 
     def __init__(self, rank):

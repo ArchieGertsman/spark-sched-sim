@@ -23,22 +23,20 @@ def learn_from_trajectories(
     that were repeated on a fixed job arrival sequence, update the model 
     parameters using the REINFORCE algorithm as in the Decima paper.
     '''
-    action_lgps_batch = action_lgps_batch#.to(device=device)
-    entropies_batch = entropies_batch#.to(device=device)
-
     baselines = returns_batch.mean(axis=0)
     advantages_batch = returns_batch - baselines
 
-    action_lgprobs = action_lgps_batch.flatten()#.to(device=device)
-    advantages = advantages_batch.flatten()#.to(device=device)
+    action_lgprobs = action_lgps_batch.flatten()
+    advantages = advantages_batch.flatten()
 
     policy_loss  = -action_lgprobs @ advantages
     entropy_loss = entropy_weight * entropies_batch.sum()
 
     ep_len = baselines.numel()
+    num_envs = baselines.shape[0]
 
     optim.zero_grad()
-    loss = (policy_loss + entropy_loss) / ep_len
+    loss = (policy_loss + entropy_loss) / (ep_len * num_envs)
     loss.backward()
     optim.step()
 
@@ -78,6 +76,10 @@ def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch):
     op_idx_batch = c_op.sample()
     op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
     op_batch, job_idx_batch = vec_env.find_op_batch(op_idx_batch)
+
+    if len(op_batch) < 8:
+        print(op_scores_batch)
+        assert False
 
     prlvl_scores_batch = prlvl_scores_batch[job_idx_batch]
     c_prlvl = Categorical(logits=prlvl_scores_batch)
@@ -127,7 +129,7 @@ def train(
 
     vec_env = VecDagSchedEnv(n=n_ep_per_seq)
 
-    optim = torch.optim.Adam(policy.parameters(), lr=.001)
+    optim = torch.optim.Adam(policy.parameters(), lr=.005)
 
     policy.to(device)
 
@@ -157,9 +159,6 @@ def train(
         
 
         # run multiple episodes on this fixed sequence
-
-        avg_job_durations = np.zeros(n_ep_per_seq)
-        n_completed_jobs_list = np.zeros(n_ep_per_seq)
 
 
         vec_env.reset(initial_timeline, workers)
@@ -224,12 +223,12 @@ def train(
 
         t_total = time() - t_start
 
-        print(f'{t_total:.2f}')
-        print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
-        a = [f'{t:.2f}' for t in vec_env.t_observe]
-        print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
+        # print(f'{t_total:.2f}')
+        # print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
+        # a = [f'{t:.2f}' for t in vec_env.t_observe]
+        # print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
         # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
-        # print(f'wall time s/step: {t_total/ep_len:.4f}')
+        print(f'wall time s/step: {t_total/ep_len:.4f}')
         # print()
 
 

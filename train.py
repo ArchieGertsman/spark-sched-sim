@@ -25,7 +25,7 @@ if __name__ == '__main__':
     assert processing_mode in ['m', 's']
 
     # n_workers = 50
-    n_workers = 10
+    n_workers = 20
     policy = ActorNetwork(5, 8, n_workers)
 
     if len(sys.argv) == 3:
@@ -65,8 +65,8 @@ if __name__ == '__main__':
         # ep_len_growth=250, #10,
         # min_ep_len=1000, #50,
         initial_mean_ep_len=250,
-        ep_len_growth=10,
-        min_ep_len=100,
+        ep_len_growth=20,
+        min_ep_len=250,
         writer=writer
     )
 

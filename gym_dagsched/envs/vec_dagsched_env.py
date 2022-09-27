@@ -42,7 +42,7 @@ class VecDagSchedEnv:
             rewards[i] = reward
             dones[i] = done
             if not done:
-                while env.n_active_jobs == 0 or len(env.frontier_ops) == 0:
+                while not env._are_actions_available():
                     env.step(None, None)
         self.t_step += time() - t
 
@@ -162,19 +162,19 @@ class VecDagSchedEnv:
 
     def find_op_batch(self, op_idx_batch):
         n_jobs_traversed = 0
-        job_idx_batch = []
-        op_batch = []
+        job_idx_batch = [None] * len(op_idx_batch)
+        op_batch = [None] * len(op_idx_batch)
 
-        for env, op_idx in zip(self.envs, op_idx_batch):
-            i = 0
+        for i, (env, op_idx) in enumerate(zip(self.envs, op_idx_batch)):
+            n_ops_traversed = 0
             for j, job_id in enumerate(env.active_job_ids):
                 job = env.jobs[job_id]
-                if op_idx < i + len(job.ops):
-                    op_batch += [job.ops[op_idx - i]]
-                    job_idx_batch += [n_jobs_traversed + j]
+                if op_idx < n_ops_traversed + len(job.ops):
+                    op_batch[i] = job.ops[op_idx - n_ops_traversed]
+                    job_idx_batch[i] = n_jobs_traversed + j
                     break
                 else:
-                    i += len(job.ops)
+                    n_ops_traversed += len(job.ops)
             n_jobs_traversed += env.n_active_jobs
             
         return op_batch, job_idx_batch
