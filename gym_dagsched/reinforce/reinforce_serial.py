@@ -136,6 +136,9 @@ def train(
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init
 
+    ep_lens = np.zeros(n_sequences)
+    ep_durations = np.zeros(n_sequences)
+
     for epoch in range(n_sequences):
         t_start = time()
         t_policy = 0
@@ -144,17 +147,16 @@ def train(
 
 
         
-        ep_len = np.random.geometric(1/mean_ep_len)
-        ep_len = max(ep_len, min_ep_len)
-        # ep_len = min(ep_len, 4500)
-        # ep_len = 10000
+        # ep_len = np.random.geometric(1/mean_ep_len)
+        # ep_len = max(ep_len, min_ep_len)
+        ep_len = mean_ep_len
 
         print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}')
 
         
         # sample a job arrival sequence and worker types
         initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=100, n_init_jobs=0, mjit=1000.)
+            n_job_arrivals=200, n_init_jobs=1, mjit=25000.)
         workers = datagen.workers(n_workers=n_workers)
         
 
@@ -221,14 +223,14 @@ def train(
         t_learn = time() - t
 
 
-        t_total = time() - t_start
+        # t_total = time() - t_start
 
         # print(f'{t_total:.2f}')
         # print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
         # a = [f'{t:.2f}' for t in vec_env.t_observe]
         # print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
         # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
-        print(f'wall time s/step: {t_total/ep_len:.4f}')
+        # print(f'wall time s/step: {t_total/ep_len:.4f}')
         # print()
 
 
@@ -250,6 +252,15 @@ def train(
         entropy_weight = max(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
+
+        t_total = time() - t_start
+        print(t_total)
+
+        ep_lens[epoch] = ep_len
+        ep_durations[epoch] = t_total
+
+
+    np.save('bruh.npy', np.stack([ep_lens, ep_durations]))
 
     
 
