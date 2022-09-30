@@ -136,8 +136,8 @@ def train(
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init
 
-    ep_lens = np.zeros(n_sequences)
-    ep_durations = np.zeros(n_sequences)
+    # ep_lens = np.zeros(n_sequences)
+    # ep_durations = np.zeros(n_sequences)
 
     for epoch in range(n_sequences):
         t_start = time()
@@ -163,7 +163,7 @@ def train(
         # run multiple episodes on this fixed sequence
 
 
-        vec_env.reset(initial_timeline, workers)
+        vec_env.reset(initial_timeline, workers, ep_len)
 
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
         rewards_batch = torch.zeros((vec_env.n, ep_len))
@@ -175,8 +175,8 @@ def train(
         
         
 
-        i = 0
-        while i < ep_len and not done_batch.any().item():
+        # i = 0
+        while not done_batch.any().item():
             # print()
 
             t = time()
@@ -200,15 +200,17 @@ def train(
                 vec_env.step(op_batch, prlvl_batch)
             t_env += time() - t
 
-            # if (i+1) % 10 == 0:
-            action_lgps_batch[:,i] = action_lgp_batch
-            rewards_batch[:,i] = reward_batch
-            entropies_batch[:,i] = entropy_batch
+            for i, env in enumerate(vec_env.envs):
+                if env.step_num < ep_len:
+                    action_lgps_batch[i, env.step_num] += action_lgp_batch[i]
+                    rewards_batch[i, env.step_num] += reward_batch[i]
+                    entropies_batch[i, env.step_num] += entropy_batch[i]
 
-            i += 1
+            # i += 1
 
             
-
+        # print('wall times:', [(env.step_num, env.wall_time) for env in vec_env.envs])
+        # print('avg wall time:', np.mean([env.wall_time for env in vec_env.envs]))
 
 
         returns_batch = compute_returns_batch(rewards_batch.detach(), discount)
@@ -223,12 +225,12 @@ def train(
         t_learn = time() - t
 
 
-        # t_total = time() - t_start
+        t_total = time() - t_start
 
-        # print(f'{t_total:.2f}')
-        # print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
-        # a = [f'{t:.2f}' for t in vec_env.t_observe]
-        # print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
+        print(f'{t_total:.2f}')
+        print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
+        a = [f'{t:.2f}' for t in vec_env.t_observe]
+        print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
         # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
         # print(f'wall time s/step: {t_total/ep_len:.4f}')
         # print()
@@ -253,11 +255,11 @@ def train(
             entropy_weight - entropy_weight_decay, 
             entropy_weight_min)
 
-        t_total = time() - t_start
-        print(t_total)
+        # t_total = time() - t_start
+        # print(t_total)
 
-        ep_lens[epoch] = ep_len
-        ep_durations[epoch] = t_total
+        # ep_lens[epoch] = ep_len
+        # ep_durations[epoch] = t_total
 
 
     np.save('bruh.npy', np.stack([ep_lens, ep_durations]))

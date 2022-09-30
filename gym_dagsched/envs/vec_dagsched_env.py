@@ -16,14 +16,14 @@ class VecDagSchedEnv:
         self.envs = [DagSchedEnv(rank) for rank in range(n)]
 
 
-    def reset(self, initial_timeline, workers):
+    def reset(self, initial_timeline, workers, ep_len):
         self.timeline = initial_timeline
         self.n_job_arrivals = len(initial_timeline.pq)
         self._init_dag_batch()
 
         for i, env in enumerate(self.envs):
             x_ptrs = [self._get_x_ptr(i, j) for j in range(self.n_job_arrivals)]
-            env.reset(initial_timeline, workers, x_ptrs)
+            env.reset(initial_timeline, workers, ep_len, x_ptrs)
 
         self.t_step = 0
         self.t_observe = [0,0,0]
@@ -39,11 +39,14 @@ class VecDagSchedEnv:
             
             reward, done = env.step(op, prlvl)
 
-            rewards[i] = reward
             dones[i] = done
+
             if not done:
                 while not env._are_actions_available():
-                    env.step(None, None)
+                    reward, _ = env.step(None, None)
+
+            rewards[i] = reward
+
         self.t_step += time() - t
 
         # t = time()
