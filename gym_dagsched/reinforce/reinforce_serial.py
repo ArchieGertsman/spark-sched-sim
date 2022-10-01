@@ -77,16 +77,14 @@ def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch):
     op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
     op_batch, job_idx_batch = vec_env.find_op_batch(op_idx_batch)
 
-    if len(op_batch) < 8:
-        print(op_scores_batch)
-        assert False
-
     prlvl_scores_batch = prlvl_scores_batch[job_idx_batch]
     c_prlvl = Categorical(logits=prlvl_scores_batch)
     prlvl_batch = c_prlvl.sample()
     prlvl_lgp_batch = c_prlvl.log_prob(prlvl_batch)
 
     action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
+
+    # print(len(prlvl_scores_batch), len(op_idx_lgp_batch), len(action_lgp_batch))
 
     entropy_batch = c_op.entropy() + c_prlvl.entropy()
 
@@ -163,7 +161,7 @@ def train(
         # run multiple episodes on this fixed sequence
 
 
-        vec_env.reset(initial_timeline, workers, ep_len)
+        vec_env.reset(initial_timeline, workers)
 
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
         rewards_batch = torch.zeros((vec_env.n, ep_len))
@@ -175,8 +173,8 @@ def train(
         
         
 
-        # i = 0
-        while not done_batch.any().item():
+        i = 0
+        while i < ep_len and not done_batch.all().item():
             # print()
 
             t = time()
@@ -184,7 +182,7 @@ def train(
                 invoke_policy(
                     policy, 
                     obs_batch, 
-                    vec_env.num_jobs_per_env())
+                    vec_env.num_jobs_per_participating_env())
             t_policy += time() - t
 
             t = time()
@@ -195,18 +193,21 @@ def train(
                     prlvl_scores_batch)
             t_sample += time() - t
 
+            participating_envs_msk = torch.tensor(
+                [env._are_actions_available() for env in vec_env.envs],
+                dtype=torch.bool
+            )
+
             t = time()
             obs_batch, reward_batch, done_batch = \
                 vec_env.step(op_batch, prlvl_batch)
             t_env += time() - t
 
-            for i, env in enumerate(vec_env.envs):
-                if env.step_num < ep_len:
-                    action_lgps_batch[i, env.step_num] += action_lgp_batch[i]
-                    rewards_batch[i, env.step_num] += reward_batch[i]
-                    entropies_batch[i, env.step_num] += entropy_batch[i]
+            action_lgps_batch[participating_envs_msk, i] = action_lgp_batch
+            entropies_batch[participating_envs_msk, i] = entropy_batch
+            rewards_batch[:, i] = reward_batch
 
-            # i += 1
+            i += 1
 
             
         # print('wall times:', [(env.step_num, env.wall_time) for env in vec_env.envs])
@@ -262,7 +263,7 @@ def train(
         # ep_durations[epoch] = t_total
 
 
-    np.save('bruh.npy', np.stack([ep_lens, ep_durations]))
+    # np.save('bruh.npy', np.stack([ep_lens, ep_durations]))
 
     
 

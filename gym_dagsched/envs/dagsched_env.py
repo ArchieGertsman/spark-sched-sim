@@ -83,7 +83,7 @@ class DagSchedEnv:
 
 
 
-    def reset(self, initial_timeline, workers, ep_len, x_ptrs):
+    def reset(self, initial_timeline, workers, x_ptrs):
         '''resets the simulation. should be called before
         each run (including first). all state data is found here.
         '''
@@ -123,10 +123,6 @@ class DagSchedEnv:
         self.x_ptrs = x_ptrs
 
         self.avail_worker_ids = set([worker.id_ for worker in self.workers])
-
-        self.ep_len = ep_len
-
-        self.step_num = 0
 
 
 
@@ -174,8 +170,7 @@ class DagSchedEnv:
         
         self._process_scheduling_event(event)
 
-        done = self.step_num >= self.ep_len
-        return reward, done
+        return reward, False
 
 
 
@@ -272,17 +267,14 @@ class DagSchedEnv:
             # if self.rank == 0:
             #     print('job arrival')
             self._process_job_arrival(event.job)
-            self.step_num += 1
         elif isinstance(event, WorkerArrival):
             # if self.rank == 0:
             #     print('worker arrival')
             self._process_worker_arrival(event.worker, event.job)
-            self.step_num += 1
         elif isinstance(event, TaskCompletion):
             # if self.rank == 0:
             #     print('task completion')
             self._process_task_completion(event.task)
-            self.step_num += 1
         else:
             # if self.rank == 0:
             #     print('nudge')

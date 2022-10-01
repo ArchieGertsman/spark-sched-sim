@@ -16,14 +16,14 @@ class VecDagSchedEnv:
         self.envs = [DagSchedEnv(rank) for rank in range(n)]
 
 
-    def reset(self, initial_timeline, workers, ep_len):
+    def reset(self, initial_timeline, workers):
         self.timeline = initial_timeline
         self.n_job_arrivals = len(initial_timeline.pq)
         self._init_dag_batch()
 
         for i, env in enumerate(self.envs):
             x_ptrs = [self._get_x_ptr(i, j) for j in range(self.n_job_arrivals)]
-            env.reset(initial_timeline, workers, ep_len, x_ptrs)
+            env.reset(initial_timeline, workers, x_ptrs)
 
         self.t_step = 0
         self.t_observe = [0,0,0]
@@ -32,25 +32,26 @@ class VecDagSchedEnv:
     def step(self, op_vec, prlvl_vec):
         rewards = torch.zeros(self.n)
         dones = torch.zeros(self.n, dtype=torch.bool)
+
         t = time()
-        for i, (env, op, prlvl) in enumerate(zip(self.envs, op_vec, prlvl_vec)):
-            if prlvl is not None:
-                prlvl = prlvl.item()
-            
+        j = 0
+        for i, env in enumerate(self.envs):
+            if env._are_actions_available() and prlvl_vec is not None:
+                op, prlvl = op_vec[j], prlvl_vec[j].item()
+                j += 1
+            else:
+                op, prlvl = None, None
+
             reward, done = env.step(op, prlvl)
-
             dones[i] = done
-
-            if not done:
-                while not env._are_actions_available():
-                    reward, _ = env.step(None, None)
-
             rewards[i] = reward
 
         self.t_step += time() - t
 
         # t = time()
         obs = self._observe()
+        if obs is None:
+            return self.step(None, None)
         # self.t_observe += time() - t
 
         return obs, rewards, dones
@@ -84,16 +85,19 @@ class VecDagSchedEnv:
 
 
     def _observe(self):
+        if len([0 for env in self.envs if env._are_actions_available()]) == 0:
+            return None
+
         t = time()
         subbatch = self._construct_subbatch()
         self.t_observe[0] += time() - t
 
         t = time()
-        op_msk_batch = torch.cat([env._construct_op_msk() for env in self.envs])
+        op_msk_batch = torch.cat([env._construct_op_msk() for env in self.envs if env._are_actions_available()])
         self.t_observe[1] += time() - t
 
         t = time()
-        prlvl_msk_batch = torch.cat([env._construct_prlvl_msk() for env in self.envs])
+        prlvl_msk_batch = torch.cat([env._construct_prlvl_msk() for env in self.envs if env._are_actions_available()])
         self.t_observe[2] += time() - t
 
         return subbatch, op_msk_batch, prlvl_msk_batch
@@ -104,7 +108,8 @@ class VecDagSchedEnv:
 
         # t = time()
         for i,env in enumerate(self.envs):
-            mask[i * self.n_job_arrivals + torch.tensor(env.active_job_ids)] = True
+            if env._are_actions_available():
+                mask[i * self.n_job_arrivals + torch.tensor(env.active_job_ids)] = True
         # self.t_observe[0] += time() - t
 
         node_mask = mask[self.dag_batch.batch]
@@ -147,16 +152,10 @@ class VecDagSchedEnv:
 
         # t = time()
 
-        n_avail = torch.tensor([len(env.avail_worker_ids) for env in self.envs])
-        n_avail = torch.repeat_interleave(n_avail, self.num_jobs_per_env())
+        n_avail = torch.tensor([len(env.avail_worker_ids) for env in self.envs if env._are_actions_available()])
+        n_avail = torch.repeat_interleave(n_avail, self.num_jobs_per_participating_env())
         n_avail = n_avail[subbatch.batch]
         subbatch.x[:, FeatureIdx.N_AVAIL_WORKERS] = n_avail
-        # print(subbatch.x[:self.envs[0].n_active_jobs, FeatureIdx.N_AVAIL_LOCAL_WORKERS])
-        # print([self.envs[0].x_ptrs[j] for j in self.envs[0].active_job_ids])
-        
-        # print(subbatch.x[0, :])
-        # print(self.envs[0].x_ptrs[0][0])
-        # print()
 
         # self.t_observe[2] += time() - t
 
@@ -165,10 +164,14 @@ class VecDagSchedEnv:
 
     def find_op_batch(self, op_idx_batch):
         n_jobs_traversed = 0
+        i = 0
         job_idx_batch = [None] * len(op_idx_batch)
         op_batch = [None] * len(op_idx_batch)
 
-        for i, (env, op_idx) in enumerate(zip(self.envs, op_idx_batch)):
+        for env in self.envs:
+            if not env._are_actions_available():
+                continue
+            op_idx = op_idx_batch[i]
             n_ops_traversed = 0
             for j, job_id in enumerate(env.active_job_ids):
                 job = env.jobs[job_id]
@@ -179,10 +182,13 @@ class VecDagSchedEnv:
                 else:
                     n_ops_traversed += len(job.ops)
             n_jobs_traversed += env.n_active_jobs
+            i += 1
             
         return op_batch, job_idx_batch
 
 
 
-    def num_jobs_per_env(self):
-        return torch.tensor([env.n_active_jobs for env in self.envs])
+    def num_jobs_per_participating_env(self):
+        return torch.tensor(
+            [env.n_active_jobs for env in self.envs if env._are_actions_available()], 
+            dtype=int)
