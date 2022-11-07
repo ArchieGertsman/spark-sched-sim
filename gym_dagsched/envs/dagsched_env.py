@@ -2,6 +2,7 @@ from collections import defaultdict
 from copy import deepcopy as dcp
 from copy import copy as cp
 from time import time
+from sys import getsizeof as sizeof
 
 import numpy as np
 import torch
@@ -55,6 +56,9 @@ class DagSchedEnv:
 
     def __init__(self, rank):
         self.rank = rank
+        self.t_step = 0
+        self.t_add_task_completion = 0
+        self.t_schedule_worker = 0
 
 
     @property
@@ -83,6 +87,15 @@ class DagSchedEnv:
 
 
 
+    @property
+    def are_actions_available(self):
+        '''checks if there are any valid actions that can be
+        taken by the scheduling agent.
+        '''
+        return len(self.avail_worker_ids) > 0 and len(self.frontier_ops) > 0
+
+
+
     def reset(self, initial_timeline, workers, x_ptrs):
         '''resets the simulation. should be called before
         each run (including first). all state data is found here.
@@ -90,12 +103,15 @@ class DagSchedEnv:
 
         # a priority queue containing scheduling 
         # events indexed by wall time of occurance
-        self.timeline = cp(initial_timeline)
-        self.timeline.pq = cp(initial_timeline.pq)
-
+        # self.timeline = cp(initial_timeline)
+        # self.timeline.pq = cp(initial_timeline.pq)
+        self.timeline = initial_timeline
+        self.n_total_jobs = len(initial_timeline.pq)
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
-        self.workers = dcp(workers)
+        # self.workers = dcp(workers)
+        self.workers = workers
+        self.n_workers = len(workers)
 
         # wall clock time, keeps increasing throughout
         # the simulation
@@ -124,9 +140,25 @@ class DagSchedEnv:
 
         self.avail_worker_ids = set([worker.id_ for worker in self.workers])
 
+        self.n_job_arrivals = 0
+        self.n_worker_arrivals = 0
+        self.n_task_completions = 0
+
+        self.max_ops = np.max([len(e.job.ops) for _,_,e in initial_timeline.pq])
 
 
-    def step(self, op, n_workers):
+        # if self.rank == 0:
+        #     print(f'{self.t_step:.3f}, {self.t_add_task_completion:.3f}, {self.t_schedule_worker:.3f}')
+
+        # print(f'{self.rank}: {self.t_step:.3f}')
+
+        self.t_step = 0
+        self.t_add_task_completion = 0
+        self.t_schedule_worker = 0
+
+
+
+    def step(self, job_id, op_id, n_workers):
         '''steps onto the next scheduling event on the timeline, 
         which can be one of the following:
         (1) new job arrival
@@ -136,95 +168,74 @@ class DagSchedEnv:
             the policy should consider taking one of them
         '''
 
-        if op in self.frontier_ops:
-            tasks = self._take_action(op, n_workers)
-            if len(tasks) > 0:
-                self._push_task_completion_events(tasks)
+        t_step = time()
 
-        else:
-            # if self.rank == 0:
-            #     print('invalid action', op, self.frontier_ops)
-            pass # an invalid action was taken
+        if job_id is not None:
+            op = self.jobs[job_id].ops[op_id]
+            assert op in self.frontier_ops
+            self._take_action(op, n_workers)
 
-
-        # if there are still actions available after
-        # processing the most recent one, then push 
-        # a "nudge" event to notify the scheduling agent
-        # that another action can immediately be taken
-        if self._are_actions_available():
-            self._push_nudge_event()
-
-        # check if simulation is done
-        if self.timeline.empty:
-            assert self.all_jobs_complete
-            return None, True
-            
-        # retreive the next scheduling event from the timeline
-        t, event = self.timeline.pop()
-
-        # update the current wall time
         prev_time = self.wall_time
-        self.wall_time = t
-
-        reward = self._calculate_reward(prev_time)
         
-        self._process_scheduling_event(event)
+        # step through timeline until agent needs to be consulted
 
-        return reward, False
+        needs_agent = False
+        while not needs_agent and not self.timeline.empty:
+            t, event = self.timeline.pop()
+            self.wall_time = t
+
+            needs_agent = self._process_scheduling_event(event)
+
+        done = self.timeline.empty and len(self.avail_worker_ids) == len(self.workers)
+        reward = self._calculate_reward(prev_time)
+
+        self.t_step += time() - t_step
+
+        return reward, done
 
 
 
-    def _construct_op_msk(self):
+
+    def construct_op_msk(self):
         '''returns a mask tensor indicating which operations
         can be scheduled, i.e. op_msk[i] = 1 if the
         i'th operation is in the frontier, 0 otherwise
         '''
-        op_msk = []
+        op_msk = torch.zeros((self.n_total_jobs, self.max_ops), dtype=torch.bool)
         for j in self.active_job_ids:
-            # append this job's operations to the mask
             job = self.jobs[j]
             if job.n_avail_local > 0 or len(self.avail_worker_ids) > 0:
-                for op in job.ops:
-                    op_msk += [1] if op in self.frontier_ops else [0]
-            else:
-                op_msk += [0] * len(job.ops)
-        return torch.tensor(op_msk)
+                for i,op in enumerate(job.ops):
+                    if op in self.frontier_ops:
+                        op_msk[j, i] = 1
+        return op_msk
 
 
 
-    def _construct_prlvl_msk(self):
+    def construct_prlvl_msk(self):
         '''returns a mask tensor indicating which parallelism
         levels are valid for each job dag, i.e. 
         prlvl_msk[i,l] = 1 if parallelism level `l` is
         valid for job `i`
         '''
-        prlvl_msk = torch.zeros((self.n_active_jobs, len(self.workers)))
-        for i, job_id in enumerate(self.active_job_ids):
-            job = self.jobs[job_id]
-            n_local = len(job.local_workers)
-            # if n_local > 0:
-            #     prlvl_msk[i, :n_local-1] = 0
-            i_min = max(0, n_local-1)
-            i_max = max(0, n_local + len(self.avail_worker_ids))
-            prlvl_msk[i, i_min:i_max] = 1
+        prlvl_msk = torch.zeros((self.n_total_jobs, self.n_workers), dtype=torch.bool)
+        # for i, job_id in enumerate(self.active_job_ids):
+        #     job = self.jobs[job_id]
+        #     n_local = len(job.local_workers)
+        #     i_min = max(0, n_local)
+        #     i_max = max(0, n_local + len(self.avail_worker_ids))
+        #     prlvl_msk[i, i_min:i_max] = 1
+        prlvl_msk[:, :len(self.avail_worker_ids)+1] = 1
         return prlvl_msk
 
 
 
-    def _push_task_completion_events(self, tasks):
+    def _push_task_completion_events(self, op, tasks):
         '''Given a set of task ids and the operation they belong to,
         pushes each of their completions as events to the timeline
         '''
-        assert len(tasks) > 0
-
-        task = tasks.pop()
-        job_id = task.job_id
-        op_id = task.op_id
-        op = self.jobs[job_id].ops[op_id]
-
-        while task is not None:
-            self._push_task_completion_event(op, task)
-            task = tasks.pop() if len(tasks) > 0 else None
+        while len(tasks) > 0:
+            self._push_task_completion_event(op, tasks.pop())
 
 
     
@@ -234,26 +245,17 @@ class DagSchedEnv:
         worker_type = self.workers[assigned_worker_id].type_
         t_completion = \
             task.t_accepted + op.task_duration[worker_type]
-        event = TaskCompletion(task)
+        event = TaskCompletion(op, task)
         self.timeline.push(t_completion, event)
 
 
 
-    def _push_nudge_event(self):
-        '''Pushes a "nudge" event to the timeline at the current
-        wall time, so that the scheduling agent can immediately
-        choose another action
-        '''
-        self.timeline.push(self.wall_time, None)
-
-
-
-    def _push_worker_arrival_event(self, worker, job):
+    def _push_worker_arrival_event(self, worker, op):
         '''pushes the event of a worker arriving to a job
         to the timeline'''
         # moving_cost = np.random.exponential(self.MOVING_COST)
         t_arrival = self.wall_time + self.MOVING_COST
-        event = WorkerArrival(worker, job)
+        event = WorkerArrival(worker, op)
         self.timeline.push(t_arrival, event)
 
 
@@ -264,28 +266,25 @@ class DagSchedEnv:
         task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
-            # if self.rank == 0:
-            #     print('job arrival')
-            self._process_job_arrival(event.job)
+            self.n_job_arrivals += 1
+            return self._process_job_arrival(event.job)
         elif isinstance(event, WorkerArrival):
-            # if self.rank == 0:
-            #     print('worker arrival')
-            self._process_worker_arrival(event.worker, event.job)
+            self.n_worker_arrivals += 1
+            return self._process_worker_arrival(event.worker, event.op)
         elif isinstance(event, TaskCompletion):
-            # if self.rank == 0:
-            #     print('task completion')
-            self._process_task_completion(event.task)
+            self.n_task_completions += 1
+            return self._process_task_completion(event.op, event.task)
         else:
-            # if self.rank == 0:
-            #     print('nudge')
-            pass # nudge event
+            print('invalid event')
+            assert False
 
 
 
     def _process_job_arrival(self, job):
         self._add_job(job)
-        if not self._are_actions_available():
-            self.step(None, None)
+        # if not self.are_actions_available:
+        #     self.step(None, None)
+        return True
 
 
 
@@ -293,43 +292,70 @@ class DagSchedEnv:
         '''adds a new job to the list of jobs, and adds all of
         its source operations to the frontier
         '''
-        job_cp = dcp(job)
+        job_cp = job #dcp(job)
+
         job_cp.x_ptr = self.x_ptrs[job.id_]
         self.jobs[job.id_] = job_cp
         self.active_job_ids += [job.id_]
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
+        
 
 
 
-    def _process_worker_arrival(self, worker, job):
+    def _process_worker_arrival(self, worker, op):
         '''performs some bookkeeping when a worker arrives'''
+        job = self.jobs[op.job_id]
         job.add_local_worker(worker.id_)
-        self.avail_worker_ids.add(worker.id_)
         worker.is_moving = False
         worker.job_id = job.id_
 
 
+        if op.is_complete or op.saturated:
+            self.avail_worker_ids.add(worker.id_)
+            return True
+        else:
+            self._schedule_worker(worker, op)
+            return False
+            
 
-    def _process_task_completion(self, task):
+
+
+
+    def _process_task_completion(self, op, task):
         '''performs some bookkeeping when a task completes'''
-        job = self.jobs[task.job_id]
-        op = job.ops[task.op_id]
-        job.add_task_completion(op, task, self.wall_time)
-        # print(job.x_ptr)
-        # print(self.x_ptrs[job.id_])
-        # print()
 
-        worker = self.workers[task.worker_id]
-        worker.make_available()
-        self.avail_worker_ids.add(worker.id_)
+        # 22%
 
-        if op.is_complete:
-            self._process_op_completion(op)
-        
+        # t_step = time()
+
         job = self.jobs[op.job_id]
+
+        t = time()
+        job.add_task_completion(op, task, self.wall_time)
+        self.t_add_task_completion += time() - t
+        
+        
+        worker = self.workers[task.worker_id]
+        worker.task = None
+
+        needs_agent = False
+        
+        if op.is_complete:
+            self.avail_worker_ids.add(worker.id_)
+            self._process_op_completion(op)
+            needs_agent = True
+        elif not op.saturated:
+            t = time()
+            self._schedule_worker(worker, op)
+            self.t_schedule_worker += time() - t
+
         if job.is_complete:
             self._process_job_completion(job)
+
+        # self.t_step += time() - t_step
+
+        return needs_agent
 
 
         
@@ -368,15 +394,9 @@ class DagSchedEnv:
         for processing
         '''
         self._send_more_workers(op, prlvl)
-
         tasks = self._schedule_workers(op)
-
-        # check if stage is now saturated; if so, remove from frontier
-        if op.saturated:
-            self.frontier_ops.remove(op)
-            self.saturated_ops.add(op)
-
-        return tasks
+        if len(tasks) > 0:
+            self._push_task_completion_events(op, tasks)
 
 
 
@@ -386,27 +406,27 @@ class DagSchedEnv:
         between the requested `prlvl` and the number of workers already
         at `op`'s job.
         '''
-        job = self.jobs[op.job_id]
-        n_workers_to_send = prlvl - len(job.local_workers)
-        assert n_workers_to_send >= 0
+        # n_workers_to_send = prlvl - len(job.local_workers)
+        # assert n_workers_to_send >= 0
+        n_workers_to_send = prlvl
 
         for worker_id in list(self.avail_worker_ids):
             if n_workers_to_send == 0:
                 break
             worker = self.workers[worker_id]
             if worker.can_assign(op):
-                self._send_worker(worker, job)    
+                self._send_worker(worker, op)    
                 n_workers_to_send -= 1
             
 
 
-    def _send_worker(self, worker, job):
+    def _send_worker(self, worker, op):
         if worker.job_id is not None:
             old_job = self.jobs[worker.job_id]
             old_job.remove_local_worker(worker.id_)
         worker.is_moving = True
         self.avail_worker_ids.remove(worker.id_)
-        self._push_worker_arrival_event(worker, job)
+        self._push_worker_arrival_event(worker, op)
 
 
 
@@ -427,24 +447,33 @@ class DagSchedEnv:
                     op,
                     self.wall_time)
                 tasks.add(task)
-                self.avail_worker_ids.remove(worker_id)
+
+        # check if stage is now saturated; if so, remove from frontier
+        if op.saturated and op in self.frontier_ops:
+            self.frontier_ops.remove(op)
+            self.saturated_ops.add(op)
 
         return tasks
 
 
+    def _schedule_worker(self, worker, op):
+        # t = time()
 
-    def _are_actions_available(self):
-        '''checks if there are any valid actions that can be
-        taken by the scheduling agent.
-        '''
-        return len(self.avail_worker_ids) > 0 and len(self.frontier_ops) > 0
+        job = self.jobs[op.job_id]
+        
+        task = job.assign_worker(
+                worker, 
+                op,
+                self.wall_time)
 
-        # for op in self.frontier_ops:
-        #     for worker_id in self.avail_worker_ids:
-        #         if self.workers[worker_id].compatible_with(op):
-        #             return True
+        self._push_task_completion_event(op, task)
 
-        # return False
+        if op.saturated and op in self.frontier_ops:
+            self.frontier_ops.remove(op)
+            self.saturated_ops.add(op)
+
+        # self.t_step += time() - t
+
 
 
 
@@ -461,3 +490,7 @@ class DagSchedEnv:
             end = min(job.t_completed, self.wall_time)
             reward -= (end - start)
         return reward * self.REWARD_SCALE
+
+
+    def n_ops_per_job(self):
+        return [len(self.jobs[j].ops) for j in self.active_job_ids]

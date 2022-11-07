@@ -15,10 +15,6 @@ class Worker:
         return self.task == None and not self.is_moving
 
 
-    def make_available(self):
-        self.task = None
-
-
     def compatible_with(self, op):
         return self.type_ in op.compatible_worker_types
 

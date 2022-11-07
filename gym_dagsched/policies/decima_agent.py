@@ -156,7 +156,7 @@ class ActorNetwork(nn.Module):
             num_jobs_per_env,
             x, y, z)
         
-        return op_scores, prlvl_scores, num_ops_per_env
+        return op_scores, prlvl_scores, num_ops_per_env, job_indptr
 
 
     def _bookkeep(self, num_jobs_per_env, dag_batch):

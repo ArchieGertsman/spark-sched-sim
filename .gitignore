@@ -11,3 +11,4 @@ tensorboard
 *.txt
 *.png
 bruh.npy
+*.csv

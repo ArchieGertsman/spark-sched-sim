@@ -10,8 +10,9 @@ from ..utils.timeline import Timeline, JobArrival
 
 class DataGen:
 
-    def __init__(self, n_worker_types=1):
+    def __init__(self, np_random, n_worker_types=1):
         self.N_WORKER_TYPES = n_worker_types
+        self.np_random = np_random
 
 
 
@@ -30,7 +31,7 @@ class DataGen:
                 job = self._job(id, t)
             else:
                 # sample time until next arrival
-                dt_interarrival = np.random.exponential(mjit)
+                dt_interarrival = self.np_random.exponential(mjit)
                 t += dt_interarrival
                 job = self._job(id, t)
 
@@ -50,7 +51,7 @@ class DataGen:
 
     def _worker(self, i):
         type_ = i if i < self.N_WORKER_TYPES \
-            else np.random.randint(low=0, high=self.N_WORKER_TYPES)
+            else self.np_random.randint(low=0, high=self.N_WORKER_TYPES)
         return Worker(id_=i, type_=type_)
 
 

@@ -4,7 +4,9 @@ from time import time
 
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+from torch_scatter import segment_add_csr
+import pandas as pd
 
 from .reinforce_base import *
 from ..envs.vec_dagsched_env import VecDagSchedEnv
@@ -33,10 +35,10 @@ def learn_from_trajectories(
     entropy_loss = entropy_weight * entropies_batch.sum()
 
     ep_len = baselines.numel()
-    num_envs = baselines.shape[0]
+    # num_envs = baselines.shape[0]
 
     optim.zero_grad()
-    loss = (policy_loss + entropy_loss) / (ep_len * num_envs)
+    loss = (policy_loss + entropy_loss) / ep_len
     loss.backward()
     optim.step()
 
@@ -46,49 +48,66 @@ def learn_from_trajectories(
 
 
 
-def invoke_policy(policy, obs_batch, num_jobs_per_env):
+def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job):
     dag_batch, op_msk_batch, prlvl_msk_batch = obs_batch 
+    num_jobs_per_env = torch.tensor(num_jobs_per_env, dtype=int)
 
-    op_scores_batch, prlvl_scores_batch, num_ops_per_env = \
+    ts = np.zeros(4)
+
+    t = time()
+    dag_batch = dag_batch.to(device=device)
+    num_jobs_per_env = num_jobs_per_env.to(device=device)
+    ts[0] = time() - t
+
+    t = time()
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env, job_indptr = \
         policy(
-            dag_batch.to(device=device), 
-            num_jobs_per_env.to(device=device)
+            dag_batch, #.to(device=device), 
+            num_jobs_per_env #.to(device=device)
         )
+    ts[1] = time() - t
 
-    op_scores_batch, prlvl_scores_batch, num_ops_per_env = \
-        op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu()
+    t = time()
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env, job_indptr = \
+        op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu(), job_indptr.cpu()
+    ts[2] = time() - t
 
-    op_scores_batch[(1-op_msk_batch).nonzero()] = torch.finfo(torch.float).min
-
-    idx = (1-prlvl_msk_batch).nonzero()
-    prlvl_scores_batch[idx[:,0], idx[:,1]] = torch.finfo(torch.float).min
-
+    t = time()
+    op_msk_batch = op_msk_batch[num_ops_per_job[:,None] > torch.arange(op_msk_batch.shape[1])]
+    op_scores_batch[(~op_msk_batch).nonzero()] = torch.finfo(torch.float).min
     op_scores_list = torch.split(op_scores_batch, num_ops_per_env.tolist())
     op_scores_batch = pad_sequence(op_scores_list, padding_value=torch.finfo(torch.float).min).t()
 
-    return op_scores_batch, prlvl_scores_batch
+    idx = (~prlvl_msk_batch).nonzero()
+    prlvl_scores_batch[idx[:,0], idx[:,1]] = torch.finfo(torch.float).min
+    ts[3] = time() - t
+
+    return op_scores_batch, prlvl_scores_batch, job_indptr, ts
 
 
 
 
-def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch):
+def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, job_indptr):
     c_op = Categorical(logits=op_scores_batch)
     op_idx_batch = c_op.sample()
     op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
-    op_batch, job_idx_batch = vec_env.find_op_batch(op_idx_batch)
 
-    prlvl_scores_batch = prlvl_scores_batch[job_idx_batch]
-    c_prlvl = Categorical(logits=prlvl_scores_batch)
+    t = time()
+    job_idx_batch, op_id_batch = vec_env.find_job_indices(op_idx_batch)
+    t = time() - t
+
+    prlvl_scores_batch_selected = prlvl_scores_batch[job_idx_batch]
+    c_prlvl = Categorical(logits=prlvl_scores_batch_selected)
     prlvl_batch = c_prlvl.sample()
     prlvl_lgp_batch = c_prlvl.log_prob(prlvl_batch)
 
     action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
 
-    # print(len(prlvl_scores_batch), len(op_idx_lgp_batch), len(action_lgp_batch))
+    prlvl_entropy = Categorical(logits=prlvl_scores_batch).entropy()
+    prlvl_entropy_per_env = segment_add_csr(prlvl_entropy, job_indptr)
+    entropy_batch = c_op.entropy() + prlvl_entropy_per_env
 
-    entropy_batch = c_op.entropy() + c_prlvl.entropy()
-
-    return op_batch, 1+prlvl_batch, action_lgp_batch, entropy_batch
+    return op_id_batch, prlvl_batch, action_lgp_batch, entropy_batch, t
 
 
 
@@ -109,7 +128,7 @@ def compute_returns_batch(rewards_batch, discount):
 
 
 def train(
-    datagen, 
+    # datagen, 
     policy, 
     n_sequences,
     n_ep_per_seq,
@@ -137,6 +156,12 @@ def train(
     # ep_lens = np.zeros(n_sequences)
     # ep_durations = np.zeros(n_sequences)
 
+    vec_env.run()
+
+    df = pd.DataFrame(
+        index=np.arange(100,1000+100,100), 
+        columns=['total', 't_env', 't_reset', 't_step_total', 't_step_sub'])
+
     for epoch in range(n_sequences):
         t_start = time()
         t_policy = 0
@@ -147,71 +172,81 @@ def train(
         
         # ep_len = np.random.geometric(1/mean_ep_len)
         # ep_len = max(ep_len, min_ep_len)
+        # ep_len = mean_ep_len
         ep_len = mean_ep_len
 
         print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}')
 
         
         # sample a job arrival sequence and worker types
-        initial_timeline = datagen.initial_timeline(
-            n_job_arrivals=200, n_init_jobs=1, mjit=25000.)
-        workers = datagen.workers(n_workers=n_workers)
+        # initial_timeline = datagen.initial_timeline(
+        #     n_job_arrivals=200, n_init_jobs=1, mjit=25000.)
+        # workers = datagen.workers(n_workers=n_workers)
         
 
         # run multiple episodes on this fixed sequence
 
 
-        vec_env.reset(initial_timeline, workers)
+        # t = time()
+        # vec_env.reset(initial_timeline, workers)
+        vec_env.reset()
+        a = torch.arange(vec_env.max_ops)
+        # t_env += time() - t
 
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
         rewards_batch = torch.zeros((vec_env.n, ep_len))
         entropies_batch = torch.zeros((vec_env.n, ep_len))
 
-        obs_batch, reward_batch, done_batch = \
-            vec_env.step([None]*vec_env.n, [None]*vec_env.n)
+        obs_batch, reward_batch, done_batch = vec_env.step()
 
         
+        participating_idxs = torch.arange(vec_env.n)
         
+        ts_total = np.zeros(4)
 
         i = 0
         while i < ep_len and not done_batch.all().item():
             # print()
 
             t = time()
-            op_scores_batch, prlvl_scores_batch = \
+            op_scores_batch, prlvl_scores_batch, job_indptr, ts = \
                 invoke_policy(
                     policy, 
                     obs_batch, 
-                    vec_env.num_jobs_per_participating_env())
+                    vec_env.n_active_jobs_batch,
+                    vec_env.n_ops_per_job_batch
+                )
             t_policy += time() - t
+            ts_total += ts
 
-            t = time()
-            op_batch, prlvl_batch, action_lgp_batch, entropy_batch = \
+            # t = time()
+            op_id_batch, prlvl_batch, action_lgp_batch, entropy_batch, t = \
                 sample_action_batch(
                     vec_env, 
                     op_scores_batch, 
-                    prlvl_scores_batch)
-            t_sample += time() - t
-
-            participating_envs_msk = torch.tensor(
-                [env._are_actions_available() for env in vec_env.envs],
-                dtype=torch.bool
-            )
+                    prlvl_scores_batch,
+                    job_indptr
+                )
+            t_sample += t
+            # t_sample += time() - t
 
             t = time()
             obs_batch, reward_batch, done_batch = \
-                vec_env.step(op_batch, prlvl_batch)
+                vec_env.step(op_id_batch, prlvl_batch)
             t_env += time() - t
 
-            action_lgps_batch[participating_envs_msk, i] = action_lgp_batch
-            entropies_batch[participating_envs_msk, i] = entropy_batch
+            action_lgps_batch[participating_idxs, i] = action_lgp_batch
+            entropies_batch[participating_idxs, i] = entropy_batch
             rewards_batch[:, i] = reward_batch
 
+            participating_idxs = vec_env.participating_msk.nonzero().flatten()
+            
             i += 1
 
-            
-        # print('wall times:', [(env.step_num, env.wall_time) for env in vec_env.envs])
         # print('avg wall time:', np.mean([env.wall_time for env in vec_env.envs]))
+
+        # env = vec_env.envs[0]
+        # print(env.n_job_arrivals, env.n_worker_arrivals, env.n_task_completions)
 
 
         returns_batch = compute_returns_batch(rewards_batch.detach(), discount)
@@ -231,24 +266,33 @@ def train(
         print(f'{t_total:.2f}')
         print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
         a = [f'{t:.2f}' for t in vec_env.t_observe]
-        print(f'{vec_env.t_step:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
+        # print(f'{vec_env.t_reset:.2f}, {vec_env.t_step:.2f}, {vec_env.t_substep:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
+        t_substep = vec_env.t_substep.item()
+        print(f'{vec_env.t_reset:.2f}, {vec_env.t_step:.2f}, {t_substep:.2f}')
+        # percent = (t_substep / vec_env.t_step) * 100
+        # print(f'{percent:.2f}')
+        a = [f'{t:.3f}' for t in ts_total]
+        print('ts:', a)
+
+        df.loc[ep_len] = (t_total, t_env, vec_env.t_reset, vec_env.t_step, t_substep)
+
         # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
         # print(f'wall time s/step: {t_total/ep_len:.4f}')
         # print()
 
 
-        avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])
-        n_completed_jobs_list = [env.n_completed_jobs for env in vec_env.envs]
+        # avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])
+        # n_completed_jobs_list = [env.n_completed_jobs for env in vec_env.envs]
 
 
-        write_tensorboard(
-            writer, 
-            epoch, 
-            ep_len, 
-            loss, 
-            avg_job_durations.mean() if avg_job_durations.all() else np.inf, 
-            np.mean(n_completed_jobs_list)
-        )
+        # write_tensorboard(
+        #     writer, 
+        #     epoch, 
+        #     ep_len, 
+        #     loss, 
+        #     avg_job_durations.mean() if avg_job_durations.all() else np.inf, 
+        #     np.mean(n_completed_jobs_list)
+        # )
 
         mean_ep_len += ep_len_growth
 
@@ -265,9 +309,11 @@ def train(
 
     # np.save('bruh.npy', np.stack([ep_lens, ep_durations]))
 
-    
+    vec_env.terminate()
 
     writer.close()
+
+    df.to_csv('timing.csv')
 
 
 

@@ -15,12 +15,13 @@ class JobArrival(object):
 
 @dataclass
 class TaskCompletion(object):
+    op: Operation
     task: Task
 
 @dataclass
 class WorkerArrival(object):
     worker: Worker
-    job: Job
+    op: Operation
 
 
 

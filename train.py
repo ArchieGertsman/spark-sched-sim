@@ -43,7 +43,7 @@ if __name__ == '__main__':
     #     mean_task_duration=2000.,
     #     n_worker_types=1)
 
-    datagen = TPCHDataGen()
+    # datagen = TPCHDataGen()
 
     writer = SummaryWriter('tensorboard')
 
@@ -52,20 +52,19 @@ if __name__ == '__main__':
         else reinforce_serial.train
 
     train(
-        datagen, 
+        # datagen, 
         policy,
         n_sequences=10,
         n_ep_per_seq=16,
         discount=.99,
-        entropy_weight_init=10.,
+        entropy_weight_init=1.,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
         n_workers=n_workers,
-        # initial_mean_ep_len=5000,
-        # ep_len_growth=250, #10,
-        # min_ep_len=1000, #50,
-        initial_mean_ep_len=3500,
+        # initial_mean_ep_len=1000,
+        initial_mean_ep_len=1000,
         ep_len_growth=100,
+        # min_ep_len=500,
         min_ep_len=100,
         writer=writer
     )
