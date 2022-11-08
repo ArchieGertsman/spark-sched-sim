@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch_geometric.utils.convert import from_networkx
 from torch_geometric.data import Batch
 
-from ..utils.timeline import JobArrival, TaskCompletion, WorkerArrival
+from ..entities.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..utils.device import device
 from ..entities.operation import FeatureIdx
 
@@ -106,7 +106,7 @@ class DagSchedEnv:
         # self.timeline = cp(initial_timeline)
         # self.timeline.pq = cp(initial_timeline.pq)
         self.timeline = initial_timeline
-        self.n_total_jobs = len(initial_timeline.pq)
+        self.n_job_arrivals = len(initial_timeline.pq)
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
         # self.workers = dcp(workers)
@@ -139,10 +139,6 @@ class DagSchedEnv:
         self.x_ptrs = x_ptrs
 
         self.avail_worker_ids = set([worker.id_ for worker in self.workers])
-
-        self.n_job_arrivals = 0
-        self.n_worker_arrivals = 0
-        self.n_task_completions = 0
 
         self.max_ops = np.max([len(e.job.ops) for _,_,e in initial_timeline.pq])
 
@@ -201,7 +197,7 @@ class DagSchedEnv:
         can be scheduled, i.e. op_msk[i] = 1 if the
         i'th operation is in the frontier, 0 otherwise
         '''
-        op_msk = torch.zeros((self.n_total_jobs, self.max_ops), dtype=torch.bool)
+        op_msk = torch.zeros((self.n_job_arrivals, self.max_ops), dtype=torch.bool)
         for j in self.active_job_ids:
             job = self.jobs[j]
             if job.n_avail_local > 0 or len(self.avail_worker_ids) > 0:
@@ -218,7 +214,7 @@ class DagSchedEnv:
         prlvl_msk[i,l] = 1 if parallelism level `l` is
         valid for job `i`
         '''
-        prlvl_msk = torch.zeros((self.n_total_jobs, self.n_workers), dtype=torch.bool)
+        prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers), dtype=torch.bool)
         # for i, job_id in enumerate(self.active_job_ids):
         #     job = self.jobs[job_id]
         #     n_local = len(job.local_workers)
@@ -266,13 +262,10 @@ class DagSchedEnv:
         task completion, or a nudge
         '''
         if isinstance(event, JobArrival):
-            self.n_job_arrivals += 1
             return self._process_job_arrival(event.job)
         elif isinstance(event, WorkerArrival):
-            self.n_worker_arrivals += 1
             return self._process_worker_arrival(event.worker, event.op)
         elif isinstance(event, TaskCompletion):
-            self.n_task_completions += 1
             return self._process_task_completion(event.op, event.task)
         else:
             print('invalid event')
@@ -281,26 +274,16 @@ class DagSchedEnv:
 
 
     def _process_job_arrival(self, job):
-        self._add_job(job)
-        # if not self.are_actions_available:
-        #     self.step(None, None)
-        return True
-
-
-
-    def _add_job(self, job):
         '''adds a new job to the list of jobs, and adds all of
         its source operations to the frontier
         '''
-        job_cp = job #dcp(job)
-
-        job_cp.x_ptr = self.x_ptrs[job.id_]
-        self.jobs[job.id_] = job_cp
+        job.x_ptr = self.x_ptrs[job.id_]
+        self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
+        return True
         
-
 
 
     def _process_worker_arrival(self, worker, op):
@@ -325,8 +308,6 @@ class DagSchedEnv:
     def _process_task_completion(self, op, task):
         '''performs some bookkeeping when a task completes'''
 
-        # 22%
-
         # t_step = time()
 
         job = self.jobs[op.job_id]
@@ -342,8 +323,7 @@ class DagSchedEnv:
         needs_agent = False
         
         if op.is_complete:
-            self.avail_worker_ids.add(worker.id_)
-            self._process_op_completion(op)
+            self._process_op_completion(op, worker)
             needs_agent = True
         elif not op.saturated:
             t = time()
@@ -359,8 +339,10 @@ class DagSchedEnv:
 
 
         
-    def _process_op_completion(self, op):
+    def _process_op_completion(self, op, worker):
         '''performs some bookkeeping when an operation completes'''
+        self.avail_worker_ids.add(worker.id_)
+
         job = self.jobs[op.job_id]
         job.add_op_completion()
         

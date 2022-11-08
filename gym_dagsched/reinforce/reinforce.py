@@ -2,15 +2,17 @@ import sys
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from time import time
 
-import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
+from torch.nn.utils.rnn import pad_sequence
+from torch.distributions import Categorical
 from torch_scatter import segment_add_csr
+import numpy as np
 import pandas as pd
+from scipy.signal import lfilter
 
-from .reinforce_base import *
 from ..envs.vec_dagsched_env import VecDagSchedEnv
 from ..utils.metrics import avg_job_duration
+from ..utils.device import device
 
 
 
@@ -46,9 +48,7 @@ def learn_from_trajectories(
 
 
 
-
-
-def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job):
+def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers):
     dag_batch, op_msk_batch, prlvl_msk_batch = obs_batch 
     num_jobs_per_env = torch.tensor(num_jobs_per_env, dtype=int)
 
@@ -62,8 +62,9 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job):
     t = time()
     op_scores_batch, prlvl_scores_batch, num_ops_per_env, job_indptr = \
         policy(
-            dag_batch, #.to(device=device), 
-            num_jobs_per_env #.to(device=device)
+            dag_batch,
+            num_jobs_per_env,
+            n_workers
         )
     ts[1] = time() - t
 
@@ -83,7 +84,6 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job):
     ts[3] = time() - t
 
     return op_scores_batch, prlvl_scores_batch, job_indptr, ts
-
 
 
 
@@ -111,9 +111,6 @@ def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, job_indptr
 
 
 
-
-
-
 def compute_returns_batch(rewards_batch, discount):
     rewards_batch = np.array(rewards_batch)
     r = rewards_batch[...,::-1]
@@ -124,11 +121,7 @@ def compute_returns_batch(rewards_batch, discount):
 
 
 
-
-
-
 def train(
-    # datagen, 
     policy, 
     n_sequences,
     n_ep_per_seq,
@@ -136,6 +129,9 @@ def train(
     entropy_weight_init,
     entropy_weight_decay,
     entropy_weight_min,
+    n_job_arrivals, 
+    n_init_jobs, 
+    mjit,
     n_workers,
     initial_mean_ep_len,
     ep_len_growth,
@@ -143,6 +139,8 @@ def train(
     writer
 ):
     '''train the model on multiple different job arrival sequences'''
+    
+    print('cuda available:', torch.cuda.is_available())
 
     vec_env = VecDagSchedEnv(n=n_ep_per_seq)
 
@@ -160,7 +158,7 @@ def train(
 
     df = pd.DataFrame(
         index=np.arange(100,1000+100,100), 
-        columns=['total', 't_env', 't_reset', 't_step_total', 't_step_sub'])
+        columns=['total', 't_env', 't_reset', 't_step_total'])
 
     for epoch in range(n_sequences):
         t_start = time()
@@ -177,21 +175,10 @@ def train(
 
         print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}')
 
-        
-        # sample a job arrival sequence and worker types
-        # initial_timeline = datagen.initial_timeline(
-        #     n_job_arrivals=200, n_init_jobs=1, mjit=25000.)
-        # workers = datagen.workers(n_workers=n_workers)
-        
 
-        # run multiple episodes on this fixed sequence
-
-
-        # t = time()
-        # vec_env.reset(initial_timeline, workers)
-        vec_env.reset()
-        a = torch.arange(vec_env.max_ops)
-        # t_env += time() - t
+        t = time()
+        vec_env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
+        t_env += time() - t
 
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
         rewards_batch = torch.zeros((vec_env.n, ep_len))
@@ -214,7 +201,8 @@ def train(
                     policy, 
                     obs_batch, 
                     vec_env.n_active_jobs_batch,
-                    vec_env.n_ops_per_job_batch
+                    vec_env.n_ops_per_job_batch,
+                    n_workers
                 )
             t_policy += time() - t
             ts_total += ts
@@ -265,20 +253,11 @@ def train(
 
         print(f'{t_total:.2f}')
         print(f'{t_policy:.2f}, {t_sample:.2f}, {t_env:.2f}, {t_learn:.2f}')
-        a = [f'{t:.2f}' for t in vec_env.t_observe]
-        # print(f'{vec_env.t_reset:.2f}, {vec_env.t_step:.2f}, {vec_env.t_substep:.2f}, {sum(vec_env.t_observe):.2f}, {a}')
-        t_substep = vec_env.t_substep.item()
-        print(f'{vec_env.t_reset:.2f}, {vec_env.t_step:.2f}, {t_substep:.2f}')
-        # percent = (t_substep / vec_env.t_step) * 100
-        # print(f'{percent:.2f}')
+        print(f'{vec_env.t_reset:.2f}, {vec_env.t_step:.2f}')
         a = [f'{t:.3f}' for t in ts_total]
         print('ts:', a)
 
-        df.loc[ep_len] = (t_total, t_env, vec_env.t_reset, vec_env.t_step, t_substep)
-
-        # print(f'sim ms/step: {np.mean([env.wall_time for env in vec_env.envs]) / ep_len:.2f}')
-        # print(f'wall time s/step: {t_total/ep_len:.4f}')
-        # print()
+        df.loc[ep_len] = (t_total, t_env, vec_env.t_reset, vec_env.t_step)
 
 
         # avg_job_durations = np.array([avg_job_duration(env) for env in vec_env.envs])

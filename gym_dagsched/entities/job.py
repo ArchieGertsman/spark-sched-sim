@@ -5,7 +5,7 @@ import time
 import networkx as nx
 import numpy as np
 import torch
-from torch_geometric.data import Data
+from torch_geometric.utils.convert import from_networkx
 
 from .operation import FeatureIdx
 
@@ -41,12 +41,6 @@ class Job:
     x_ptr = None
 
     n_avail_local = 0
-
-    # x_ptr_update = None
-
-
-
-    
 
 
 
@@ -134,8 +128,11 @@ class Job:
 
 
 
-    def init_feature_vectors(self):
-        return [self.init_feature_vector(op) for op in self.ops]
+    def init_pyg_data(self):
+        feature_vectors = [self.init_feature_vector(op) for op in self.ops]
+        pyg_data = from_networkx(self.dag)
+        pyg_data.x = torch.tensor(feature_vectors, dtype=torch.float32)
+        return pyg_data
 
 
 
@@ -153,6 +150,7 @@ class Job:
         ] 
 
 
+
     def update_n_avail_local(self, n):
         self.n_avail_local += n
         self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] += n
@@ -160,14 +158,17 @@ class Job:
         # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] <= len(self.local_workers)).all()
 
 
+
     def add_local_worker(self, worker_id):
         self.local_workers.add(worker_id)
         self.update_n_avail_local(1)
 
 
+
     def remove_local_worker(self, worker_id):
         self.local_workers.remove(worker_id)
         self.update_n_avail_local(-1)
+
 
 
     def assign_worker(self, worker, op, wall_time):
@@ -191,6 +192,7 @@ class Job:
         return task
 
 
+
     def add_task_completion(self, op, task, wall_time):
         assert not op.is_complete
         assert task in op.processing_tasks
@@ -206,6 +208,8 @@ class Job:
             n_avail_local_workers=1)
 
         task.t_completed = wall_time
+
+
 
     def update_x_ptr(
         self,

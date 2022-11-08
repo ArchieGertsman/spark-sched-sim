@@ -5,7 +5,7 @@ import networkx as nx
 from ..entities.job import Job
 from ..entities.operation import Operation
 from ..entities.worker import Worker
-from ..utils.timeline import Timeline, JobArrival
+from ..entities.timeline import Timeline, JobArrival
 
 
 class DataGen:

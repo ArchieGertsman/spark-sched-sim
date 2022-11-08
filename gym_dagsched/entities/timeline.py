@@ -5,8 +5,8 @@ from gym_dagsched.entities.job import Job
 
 from gym_dagsched.entities.operation import Operation
 
-from ..entities.task import Task
-from ..entities.worker import Worker
+from .task import Task
+from .worker import Worker
 
 
 @dataclass

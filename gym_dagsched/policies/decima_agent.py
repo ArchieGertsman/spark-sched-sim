@@ -86,11 +86,10 @@ class GraphEncoderNetwork(nn.Module):
         
         
 class PolicyNetwork(nn.Module):
-    def __init__(self, dim_embed, num_workers):
+    def __init__(self, dim_embed):
         super().__init__()
         self.mlp_op_score = make_mlp(3*dim_embed, 1)
         self.mlp_prlvl_score = make_mlp(2*dim_embed+1, 1)
-        self.num_workers = num_workers
         
     
     def forward(
@@ -98,11 +97,12 @@ class PolicyNetwork(nn.Module):
         num_ops_per_job,
         num_ops_per_env,
         num_jobs_per_env, 
+        n_workers,
         x, y, z
     ):
         op_scores = self._compute_op_scores(num_ops_per_job, num_ops_per_env, x, y, z)
         
-        prlvl_scores = self._compute_prlvl_scores(num_jobs_per_env, y, z)
+        prlvl_scores = self._compute_prlvl_scores(num_jobs_per_env, n_workers, y, z)
 
         return op_scores, prlvl_scores
     
@@ -119,17 +119,17 @@ class PolicyNetwork(nn.Module):
         return op_scores
     
     
-    def _compute_prlvl_scores(self, num_jobs_per_env, y, z):
+    def _compute_prlvl_scores(self, num_jobs_per_env, n_workers, y, z):
         num_total_jobs = num_jobs_per_env.sum()
 
-        limits = torch.arange(1, self.num_workers+1, device=device)
+        limits = torch.arange(1, n_workers+1, device=device)
         limits = limits.repeat(num_total_jobs).unsqueeze(1)
         
-        y_repeat = torch.repeat_interleave(y, self.num_workers, dim=0)
-        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * self.num_workers, dim=0)
+        y_repeat = torch.repeat_interleave(y, n_workers, dim=0)
+        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * n_workers, dim=0)
         
         prlvl_scores = torch.cat([limits, y_repeat, z_repeat], dim=1)
-        prlvl_scores = prlvl_scores.reshape(num_total_jobs, self.num_workers, prlvl_scores.shape[1])
+        prlvl_scores = prlvl_scores.reshape(num_total_jobs, n_workers, prlvl_scores.shape[1])
         
         prlvl_scores = self.mlp_prlvl_score(prlvl_scores).squeeze(-1)
 
@@ -138,13 +138,13 @@ class PolicyNetwork(nn.Module):
     
     
 class ActorNetwork(nn.Module):
-    def __init__(self, in_ch, dim_embed, num_workers):
+    def __init__(self, in_ch=5, dim_embed=8):
         super().__init__()
         self.encoder = GraphEncoderNetwork(in_ch, dim_embed)
-        self.policy_network = PolicyNetwork(dim_embed, num_workers)
+        self.policy_network = PolicyNetwork(dim_embed)
         
         
-    def forward(self, dag_batch, num_jobs_per_env):
+    def forward(self, dag_batch, num_jobs_per_env, n_workers):
         job_indptr, num_ops_per_job, num_ops_per_env = \
             self._bookkeep(num_jobs_per_env, dag_batch)
 
@@ -154,6 +154,7 @@ class ActorNetwork(nn.Module):
             num_ops_per_job,
             num_ops_per_env,
             num_jobs_per_env,
+            n_workers,
             x, y, z)
         
         return op_scores, prlvl_scores, num_ops_per_env, job_indptr
