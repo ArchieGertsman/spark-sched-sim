@@ -122,14 +122,14 @@ class PolicyNetwork(nn.Module):
     def _compute_prlvl_scores(self, num_jobs_per_env, n_workers, y, z):
         num_total_jobs = num_jobs_per_env.sum()
 
-        limits = torch.arange(1, n_workers+1, device=device)
+        limits = torch.arange(0, n_workers+1, device=device)
         limits = limits.repeat(num_total_jobs).unsqueeze(1)
         
-        y_repeat = torch.repeat_interleave(y, n_workers, dim=0)
-        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * n_workers, dim=0)
+        y_repeat = torch.repeat_interleave(y, (n_workers+1), dim=0)
+        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * (n_workers+1), dim=0)
         
         prlvl_scores = torch.cat([limits, y_repeat, z_repeat], dim=1)
-        prlvl_scores = prlvl_scores.reshape(num_total_jobs, n_workers, prlvl_scores.shape[1])
+        prlvl_scores = prlvl_scores.reshape(num_total_jobs, (n_workers+1), prlvl_scores.shape[1])
         
         prlvl_scores = self.mlp_prlvl_score(prlvl_scores).squeeze(-1)
 

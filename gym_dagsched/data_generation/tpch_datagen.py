@@ -49,7 +49,8 @@ class TPCHDataGen(DataGen):
                 [i for l in task_duration['fresh_durations'].values() for i in l])
 
             # generate a node
-            op = Operation(op_id, id, num_tasks, np.array([rough_duration]))
+            # op = Operation(op_id, id, num_tasks, np.array([rough_duration]))
+            op = Operation(op_id, id, num_tasks, task_duration, rough_duration)
             ops += [op]
 
         # generate DAG

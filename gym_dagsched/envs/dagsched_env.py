@@ -3,16 +3,16 @@ from copy import deepcopy as dcp
 from copy import copy as cp
 from time import time
 from sys import getsizeof as sizeof
+from enum import Enum, auto
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch_geometric.utils.convert import from_networkx
-from torch_geometric.data import Batch
+import networkx as nx
 
+from .state import State, WorkerState
 from ..entities.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..utils.device import device
-from ..entities.operation import FeatureIdx
+
 
 
 class DagSchedEnv:
@@ -56,9 +56,8 @@ class DagSchedEnv:
 
     def __init__(self, rank):
         self.rank = rank
+        self.state = State()
         self.t_step = 0
-        self.t_add_task_completion = 0
-        self.t_schedule_worker = 0
 
 
     @property
@@ -87,14 +86,22 @@ class DagSchedEnv:
 
 
 
-    @property
-    def are_actions_available(self):
-        '''checks if there are any valid actions that can be
-        taken by the scheduling agent.
-        '''
-        return len(self.avail_worker_ids) > 0 and len(self.frontier_ops) > 0
+    # @property
+    # def are_actions_available(self):
+    #     '''checks if there are any valid actions that can be
+    #     taken by the scheduling agent.
+    #     '''
+    #     return self.n_avail_workers > 0 and len(self.frontier_ops) > 0
 
 
+
+    def n_ops_per_job(self):
+        return [len(self.jobs[j].ops) for j in self.active_job_ids]
+
+
+
+
+    ## OpenAI Gym style interface - reset & step
 
     def reset(self, initial_timeline, workers, x_ptrs):
         '''resets the simulation. should be called before
@@ -103,13 +110,11 @@ class DagSchedEnv:
 
         # a priority queue containing scheduling 
         # events indexed by wall time of occurance
-        # self.timeline = cp(initial_timeline)
-        # self.timeline.pq = cp(initial_timeline.pq)
         self.timeline = initial_timeline
         self.n_job_arrivals = len(initial_timeline.pq)
+        
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
-        # self.workers = dcp(workers)
         self.workers = workers
         self.n_workers = len(workers)
 
@@ -131,331 +136,355 @@ class DagSchedEnv:
         # dependencies are satisfied
         self.frontier_ops = set()
 
-        # operations in the system which have not 
-        # yet completed but have all the resources
-        # they need assigned to them
-        self.saturated_ops = set()
-
         self.x_ptrs = x_ptrs
 
-        self.avail_worker_ids = set([worker.id_ for worker in self.workers])
+        # self.avail_worker_ids = set([worker.id_ for worker in self.workers])
 
         self.max_ops = np.max([len(e.job.ops) for _,_,e in initial_timeline.pq])
 
-
-        # if self.rank == 0:
-        #     print(f'{self.t_step:.3f}, {self.t_add_task_completion:.3f}, {self.t_schedule_worker:.3f}')
-
-        # print(f'{self.rank}: {self.t_step:.3f}')
+        self.executor_interval_map = self._get_executor_interval_map()
 
         self.t_step = 0
-        self.t_add_task_completion = 0
-        self.t_schedule_worker = 0
+
+        self.state.reset()
+
+        self.selected_ops = set()
+
+        self.done = False
 
 
 
     def step(self, job_id, op_id, n_workers):
-        '''steps onto the next scheduling event on the timeline, 
-        which can be one of the following:
-        (1) new job arrival
-        (2) task completion
-        (3) "nudge," meaning that there are available actions,
-            even though neither (1) nor (2) have occurred, so 
-            the policy should consider taking one of them
-        '''
-
-        t_step = time()
+        if self.done:
+            return 0, True
 
         if job_id is not None:
             op = self.jobs[job_id].ops[op_id]
-            assert op in self.frontier_ops
-            self._take_action(op, n_workers)
-
-        prev_time = self.wall_time
+            assert op in (self.frontier_ops - self.selected_ops)
+            # mark op as selected so that it doesn't get
+            # selected again during this commitment round
+            self.selected_ops.add(op)
+            self.state.add_commitment(n_workers, job_id, op_id)
         
-        # step through timeline until agent needs to be consulted
+        if not self.state.all_source_workers_committed:
+            # current commitment round is not over yet,
+            # so consult the agent again
+            return 0, False
+            
+        # commitment round has completed, i.e.
+        # all the workers at the current source
+        # have somewhere to go
+        self.selected_ops.clear()
+        self._fulfill_source_commitments()
 
-        needs_agent = False
-        while not needs_agent and not self.timeline.empty:
-            t, event = self.timeline.pop()
-            self.wall_time = t
+        t_prev = self.wall_time
 
-            needs_agent = self._process_scheduling_event(event)
+        while not self.timeline.empty and self.state.all_source_workers_committed:
+            self.wall_time, event = self.timeline.pop()
+            self._process_scheduling_event(event)
 
-        done = self.timeline.empty and len(self.avail_worker_ids) == len(self.workers)
-        reward = self._calculate_reward(prev_time)
+        reward = self._calculate_reward(t_prev)
+        self.done = self.timeline.empty
 
-        self.t_step += time() - t_step
+        # if the episode isn't done, then start a new commitment 
+        # round at the current worker source
 
-        return reward, done
+        return reward, self.done
 
 
 
+
+    ## Action masks
 
     def construct_op_msk(self):
-        '''returns a mask tensor indicating which operations
-        can be scheduled, i.e. op_msk[i] = 1 if the
-        i'th operation is in the frontier, 0 otherwise
-        '''
         op_msk = torch.zeros((self.n_job_arrivals, self.max_ops), dtype=torch.bool)
         for j in self.active_job_ids:
             job = self.jobs[j]
-            if job.n_avail_local > 0 or len(self.avail_worker_ids) > 0:
-                for i,op in enumerate(job.ops):
-                    if op in self.frontier_ops:
-                        op_msk[j, i] = 1
+            for i,op in enumerate(job.ops):
+                if op in (self.frontier_ops - self.selected_ops):
+                    op_msk[j, i] = 1
         return op_msk
 
 
 
     def construct_prlvl_msk(self):
-        '''returns a mask tensor indicating which parallelism
-        levels are valid for each job dag, i.e. 
-        prlvl_msk[i,l] = 1 if parallelism level `l` is
-        valid for job `i`
-        '''
-        prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers), dtype=torch.bool)
-        # for i, job_id in enumerate(self.active_job_ids):
-        #     job = self.jobs[job_id]
-        #     n_local = len(job.local_workers)
-        #     i_min = max(0, n_local)
-        #     i_max = max(0, n_local + len(self.avail_worker_ids))
-        #     prlvl_msk[i, i_min:i_max] = 1
-        prlvl_msk[:, :len(self.avail_worker_ids)+1] = 1
+        prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers+1), dtype=torch.bool)
+        # prlvl_msk[:, 1:len(self.avail_worker_ids)+1] = 1
+        prlvl_msk[:, 1:] = 1
         return prlvl_msk
 
 
 
-    def _push_task_completion_events(self, op, tasks):
-        '''Given a set of task ids and the operation they belong to,
-        pushes each of their completions as events to the timeline
-        '''
-        while len(tasks) > 0:
-            self._push_task_completion_event(op, tasks.pop())
 
-
-    
-    def _push_task_completion_event(self, op, task):
-        '''pushes a single task completion event to the timeline'''
-        assigned_worker_id = task.worker_id
-        worker_type = self.workers[assigned_worker_id].type_
-        t_completion = \
-            task.t_accepted + op.task_duration[worker_type]
-        event = TaskCompletion(op, task)
-        self.timeline.push(t_completion, event)
-
-
-
-    def _push_worker_arrival_event(self, worker, op):
-        '''pushes the event of a worker arriving to a job
-        to the timeline'''
-        # moving_cost = np.random.exponential(self.MOVING_COST)
-        t_arrival = self.wall_time + self.MOVING_COST
-        event = WorkerArrival(worker, op)
-        self.timeline.push(t_arrival, event)
-
-
+    ## Scheduling events
 
     def _process_scheduling_event(self, event):
-        '''handles a scheduling event from the timeline, 
-        which can be a job arrival, a worker arrival, a 
-        task completion, or a nudge
-        '''
         if isinstance(event, JobArrival):
-            return self._process_job_arrival(event.job)
+            self._process_job_arrival(event.job)
         elif isinstance(event, WorkerArrival):
-            return self._process_worker_arrival(event.worker, event.op)
+            self._process_worker_arrival(event.worker, event.op)
         elif isinstance(event, TaskCompletion):
-            return self._process_task_completion(event.op, event.task)
+            self._process_task_completion(event.op, event.task)
         else:
             print('invalid event')
             assert False
 
 
 
+
+    ## Job arrivals
+
     def _process_job_arrival(self, job):
-        '''adds a new job to the list of jobs, and adds all of
-        its source operations to the frontier
-        '''
         job.x_ptr = self.x_ptrs[job.id_]
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
-        return True
-        
+
+        self.state.add_job(job.id_)
+        self.state.add_ops(job.id_, (op.id_ for op in iter(src_ops)))
+
+        if self.state.null_pool_has_workers:
+            # if there are any workers that don't
+            # belong to any job, then give the 
+            # agent a chance to assign them to this 
+            # job by starting a new commitment round
+            # at the 'null' pool
+            self.state.update_worker_source()
+     
+
+
+
+    ## Worker arrivals
+
+    def _push_worker_arrival_event(self, worker, op):
+        '''pushes the event of a worker arriving to a job
+        to the timeline'''
+        t_arrival = self.wall_time + self.MOVING_COST
+        event = WorkerArrival(worker, op)
+        self.timeline.push(t_arrival, event)
+
 
 
     def _process_worker_arrival(self, worker, op):
         '''performs some bookkeeping when a worker arrives'''
         job = self.jobs[op.job_id]
-        job.add_local_worker(worker.id_)
-        worker.is_moving = False
-        worker.job_id = job.id_
+
+        if job.is_complete:
+            self._try_backup_schedule(worker)
+            return
+        
+        job.add_local_worker(worker)
+
+        if op.saturated:
+            self.state.move_worker_to_job_pool(worker.id_)
+            return
+
+        self.state.update_worker_state(worker.id_, WorkerState.PRESENT)
+        self._work_on_op(worker, op)
 
 
-        if op.is_complete or op.saturated:
-            self.avail_worker_ids.add(worker.id_)
-            return True
-        else:
-            self._schedule_worker(worker, op)
-            return False
-            
+    
 
+    ## Task completions
+
+    def _push_task_completion_event(self, op, task):
+        '''pushes a single task completion event to the timeline'''
+        worker = self.workers[task.worker_id]
+
+        n_local_workers = len(self.jobs[op.job_id].local_workers)
+        duration = op.sample_task_duration(
+            task, 
+            worker, 
+            n_local_workers, 
+            self.executor_interval_map)
+        t_completion = task.t_accepted + duration
+
+        event = TaskCompletion(op, task)
+        self.timeline.push(t_completion, event)
 
 
 
     def _process_task_completion(self, op, task):
         '''performs some bookkeeping when a task completes'''
-
-        # t_step = time()
+        worker = self.workers[task.worker_id]
 
         job = self.jobs[op.job_id]
+        job.add_task_completion(op, task, worker, self.wall_time)
+        
+        if not op.saturated:
+            # reassign the worker to keep working on this operation.
+            self._work_on_op(worker, op)
+        else:
+            self._process_saturated_op(op, worker)
 
-        t = time()
-        job.add_task_completion(op, task, self.wall_time)
-        self.t_add_task_completion += time() - t
-        
-        
-        worker = self.workers[task.worker_id]
-        worker.task = None
 
-        needs_agent = False
-        
+
+
+    ## Helper functions
+
+    def _work_on_op(self, worker, op):
+        assert op is not None
+        assert not op.saturated
+        assert worker.is_at_job(op.job_id)
+        assert worker.available
+
+        job = self.jobs[op.job_id]
+        task = job.assign_worker(worker, op, self.wall_time)
+
+        # op may have just become saturated
+        # after this assignment
+        if op.saturated:
+            self.frontier_ops.remove(op)
+
+        self._push_task_completion_event(op, task)
+
+
+
+    def _send_worker(self, worker, op):
+        assert op is not None
+        assert worker.available
+
+        if worker.job_id is not None:
+            old_job = self.jobs[worker.job_id]
+            old_job.remove_local_worker(worker.id_)
+
+        self._push_worker_arrival_event(worker, op)
+            
+
+
+    def _process_saturated_op(self, op, worker):
+        frontier_changed = False
+
         if op.is_complete:
-            self._process_op_completion(op, worker)
-            needs_agent = True
-        elif not op.saturated:
-            t = time()
-            self._schedule_worker(worker, op)
-            self.t_schedule_worker += time() - t
+            # record whether or not the completion of this
+            # operation unlocked new operations within the job
+            frontier_changed = self._process_op_completion(op)
 
+        job = self.jobs[op.job_id]
         if job.is_complete:
             self._process_job_completion(job)
 
-        # self.t_step += time() - t_step
+        # see if the worker has somewhere to be moved
+        commitment = self.state.peek_commitment(op.job_id, op.id_)
+        if commitment is not None:
+            # op has at least one commitment, so fulfill it
+            job_id_committed, op_id_committed = commitment
+            op_committed = self.jobs[job_id_committed].ops[op_id_committed]
+            self._fulfill_commitment(worker, op_committed)
+        elif frontier_changed:
+            # no commitment, but frontier changed
+            self.state.move_worker_to_job_pool(worker.id_)
 
-        return needs_agent
-
-
+        # see if current worker source needs to be updated
+        if frontier_changed:
+            # if any new operations were unlocked within this 
+            # job, then give the agent a chance to assign
+            # them to free workers from this job's pool
+            # by starting a new commitment round at this
+            # job's pool
+            self.state.update_worker_source(job.id_)
+        elif commitment is None:
+            # if no new operations were unlocked and
+            # the worker has nowhere to go, then, necessarily,
+            # none of the workers at this operation have
+            # been committed anywhere. Then start a new
+            # commitment round at this operation
+            self.state.update_worker_source(op.job_id, op.id_)
         
-    def _process_op_completion(self, op, worker):
-        '''performs some bookkeeping when an operation completes'''
-        self.avail_worker_ids.add(worker.id_)
+        
 
+    def _process_op_completion(self, op):
+        '''performs some bookkeeping when an operation completes'''
         job = self.jobs[op.job_id]
         job.add_op_completion()
-        
-        self.saturated_ops.remove(op)
 
         # add stage's decendents to the frontier, if their
         # other dependencies are also satisfied
         new_ops = job.find_new_frontiers(op)
         self.frontier_ops |= new_ops
 
+        self.state.mark_op_completed(op.job_id, op.id_)
+        self.state.add_ops(job.id_, (op.id_ for op in iter(new_ops)))
 
+        frontier_changed = (len(new_ops) > 0)
+        return frontier_changed
+        
 
+        
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
+        
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids += [job.id_]
         job.t_completed = self.wall_time
 
-
-
-    def _take_action(self, op, prlvl):
-        '''updates the state of the environment based on the
-        provided action = (op, prlvl), where
-        - op is an Operation object which shall receive work next, and
-        - prlvl is the number of workers to allocate to `op`'s job.
-            this must be at least the number of workers already
-            local to the job, and if it's larger then more workers
-            are sent to the job.
-        returns a set of the Task objects which have been scheduled
-        for processing
-        '''
-        self._send_more_workers(op, prlvl)
-        tasks = self._schedule_workers(op)
-        if len(tasks) > 0:
-            self._push_task_completion_events(op, tasks)
+        self.state.mark_job_completed(job.id_)
 
 
 
-    def _send_more_workers(self, op, prlvl):
-        '''sends `min(n_workers_to_send, n_available_workers)` workers
-        to `op`'s job, where `n_workers_to_send` is the difference
-        between the requested `prlvl` and the number of workers already
-        at `op`'s job.
-        '''
-        # n_workers_to_send = prlvl - len(job.local_workers)
-        # assert n_workers_to_send >= 0
-        n_workers_to_send = prlvl
+    def _fulfill_commitment(self, worker, op):
+        assert op is not None
 
-        for worker_id in list(self.avail_worker_ids):
-            if n_workers_to_send == 0:
+        self.state.fulfill_commitment(worker.id_, op.job_id, op.id_)
+
+        if worker.is_at_job(op.job_id):
+            self._work_on_op(worker, op)
+        else:
+            self._send_worker(worker, op)
+
+
+
+    def _fulfill_source_commitments(self):
+        free_workers = set((
+            worker_id 
+            for worker_id in self.state.get_source_workers() 
+            if self.workers[worker_id].available
+        ))
+
+        commitments = self.state.get_source_commitments()
+
+        for job_id, op_id, n_workers in commitments:
+            assert n_workers > 0
+            while n_workers > 0 and len(free_workers) > 0:
+                worker = free_workers.pop()
+                op = self.jobs[job_id].ops[op_id]
+                self._fulfill_commitment(worker, op)
+                n_workers -= 1
+
+
+
+    def _try_backup_schedule(self, worker):
+        backup_op = self._find_backup_op(worker)
+        if backup_op is not None:
+            self._reroute_worker(worker, backup_op)
+        else:
+            self.state.move_worker_to_job_pool(worker.id_)
+
+
+
+    def _reroute_worker(self, worker, op):
+        self.state.reroute_worker(worker.id_, op.job_id, op.id_)
+
+        if worker.is_at_job(op.job_id):
+            self._work_on_op(worker, op)
+        else:
+            self._send_worker(worker, op)
+
+
+
+    def _find_backup_op(self, worker):
+        if len(self.frontier_ops) == 0:
+            return None
+
+        backup_op = None
+        for op in iter(self.frontier_ops):
+            backup_op = op
+            if op.job_id == worker.job_id:
                 break
-            worker = self.workers[worker_id]
-            if worker.can_assign(op):
-                self._send_worker(worker, op)    
-                n_workers_to_send -= 1
-            
 
-
-    def _send_worker(self, worker, op):
-        if worker.job_id is not None:
-            old_job = self.jobs[worker.job_id]
-            old_job.remove_local_worker(worker.id_)
-        worker.is_moving = True
-        self.avail_worker_ids.remove(worker.id_)
-        self._push_worker_arrival_event(worker, op)
-
-
-
-    def _schedule_workers(self, op):
-        '''assigns all of the available workers at `op`'s job
-        to start working on `op`. Returns the tasks in `op` which
-        are schedule to receive work.'''
-        tasks = set()
-        job = self.jobs[op.job_id]
-
-        for worker_id in job.local_workers:
-            if op.saturated:
-                break
-            worker = self.workers[worker_id]
-            if worker.can_assign(op):
-                task = job.assign_worker(
-                    worker, 
-                    op,
-                    self.wall_time)
-                tasks.add(task)
-
-        # check if stage is now saturated; if so, remove from frontier
-        if op.saturated and op in self.frontier_ops:
-            self.frontier_ops.remove(op)
-            self.saturated_ops.add(op)
-
-        return tasks
-
-
-    def _schedule_worker(self, worker, op):
-        # t = time()
-
-        job = self.jobs[op.job_id]
-        
-        task = job.assign_worker(
-                worker, 
-                op,
-                self.wall_time)
-
-        self._push_task_completion_event(op, task)
-
-        if op.saturated and op in self.frontier_ops:
-            self.frontier_ops.remove(op)
-            self.saturated_ops.add(op)
-
-        # self.t_step += time() - t
-
+        return backup_op
 
 
 
@@ -474,5 +503,38 @@ class DagSchedEnv:
         return reward * self.REWARD_SCALE
 
 
-    def n_ops_per_job(self):
-        return [len(self.jobs[j].ops) for j in self.active_job_ids]
+    
+    def _get_executor_interval_map(self):
+        executor_interval_map = {}
+
+        executor_data_point = [5, 10, 20, 40, 50, 60, 80, 100]
+        exec_cap = self.n_workers
+
+        # get the left most map
+        for e in range(executor_data_point[0] + 1):
+            executor_interval_map[e] = \
+                (executor_data_point[0],
+                 executor_data_point[0])
+
+        # get the center map
+        for i in range(len(executor_data_point) - 1):
+            for e in range(executor_data_point[i] + 1,
+                            executor_data_point[i + 1]):
+                executor_interval_map[e] = \
+                    (executor_data_point[i],
+                     executor_data_point[i + 1])
+            # at the data point
+            e = executor_data_point[i + 1]
+            executor_interval_map[e] = \
+                (executor_data_point[i + 1],
+                 executor_data_point[i + 1])
+
+        # get the residual map
+        if exec_cap > executor_data_point[-1]:
+            for e in range(executor_data_point[-1] + 1,
+                            exec_cap + 1):
+                executor_interval_map[e] = \
+                    (executor_data_point[-1],
+                     executor_data_point[-1])
+
+        return executor_interval_map

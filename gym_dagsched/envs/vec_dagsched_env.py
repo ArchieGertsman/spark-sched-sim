@@ -58,7 +58,7 @@ class VecDagSchedEnv:
         self.shared_obs_tensor_sizes = [ \
             1,                                      # participating
             self.n_job_arrivals * self.max_ops,       # op mask
-            self.n_job_arrivals * self.n_workers,     # prlvl pask
+            self.n_job_arrivals * (self.n_workers+1),     # prlvl pask
             self.n_job_arrivals,                      # active job mask
             1,  # num available workers
             1,  # reward
@@ -84,13 +84,24 @@ class VecDagSchedEnv:
 
             conn.send(('reset', (n_job_arrivals, n_init_jobs, mjit, n_workers, x_ptrs, shared_obs_tensor)))
             
-        [conn.recv() for conn in self.conns]
+        avg_job_duration_batch, n_completed_jobs_batch = \
+            list(zip(*[conn.recv() for conn in self.conns]))
         print('done resetting')
+
+        if avg_job_duration_batch[0] is not None:
+            avg_job_duration_mean = np.mean(avg_job_duration_batch)
+            n_completed_jobs_mean = np.mean(n_completed_jobs_batch)
+        else:
+            avg_job_duration_mean, n_completed_jobs_mean = None, None
 
         self.participating_msk = torch.ones(self.n, dtype=torch.bool)
 
         self.t_reset = time() - t_reset
         self.t_step = 0
+        self.t_parse = 0
+        self.t_subbatch = 0
+
+        return avg_job_duration_mean, n_completed_jobs_mean
 
         
 
@@ -109,16 +120,23 @@ class VecDagSchedEnv:
         [conn.recv() for conn in self.conns]
         self.t_step += time() - t
 
-        parsed = self._parse_observations()
+        t = time()
+        op_msk_batch, prlvl_msk_batch, rewards, dones = self._parse_observations()
+        self.t_parse += time() - t
         
-        if parsed is not None:
-            op_msk_batch, prlvl_msk_batch, rewards, dones = parsed
+        if op_msk_batch is not None:
+            t = time()
             subbatch = self._construct_subbatch()
+            self.t_subbatch += time() - t
+
             obs = (subbatch, op_msk_batch, prlvl_msk_batch)
-            return obs, rewards, dones
+            return obs, rewards, False
         else:
-            # recursively keep trying until we see a valid observation
-            return self.step(None, None)
+            if all(dones):
+                return None, None, True
+            else:
+                # recursively keep trying until at least one env has available actions
+                return self.step(None, None)
 
 
 
@@ -153,7 +171,7 @@ class VecDagSchedEnv:
                 op_msk = op_msk.reshape(self.n_job_arrivals, self.max_ops).bool()
                 op_msk_batch += [op_msk[active_job_msk]]
 
-                prlvl_msk = prlvl_msk.reshape(self.n_job_arrivals, self.n_workers).bool()
+                prlvl_msk = prlvl_msk.reshape(self.n_job_arrivals, self.n_workers+1).bool()
                 prlvl_msk_batch += [prlvl_msk[active_job_msk]]
 
                 active_job_ids_batch += [active_job_msk.nonzero().flatten()]
@@ -165,7 +183,7 @@ class VecDagSchedEnv:
 
         if not any_participating:
             print('--- HERE ---')
-            return None
+            return None, None, None, dones
 
         self.participating_msk = torch.tensor(participating_msk, dtype=torch.bool)
         self.active_job_ids_batch = active_job_ids_batch

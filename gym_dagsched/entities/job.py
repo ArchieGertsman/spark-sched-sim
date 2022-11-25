@@ -107,24 +107,24 @@ class Job:
         is defined recursively as its expected duration plus the 
         remaining times of each of its children.
         '''
-        def _populate_recursive(op):
-            op.remaining_time = \
-                op.task_duration[op.task_duration<np.inf].mean()
+        # def _populate_recursive(op):
+        #     op.remaining_time = \
+        #         op.task_duration[op.task_duration<np.inf].mean()
 
-            if self.dag.out_degree(op.id_) == 0:
-                return
+        #     if self.dag.out_degree(op.id_) == 0:
+        #         return
 
-            for child_op_id in self.dag.successors(op.id_):
-                child_op = self.ops[child_op_id]
-                _populate_recursive(child_op)
-                op.remaining_time += child_op.remaining_time
+        #     for child_op_id in self.dag.successors(op.id_):
+        #         child_op = self.ops[child_op_id]
+        #         _populate_recursive(child_op)
+        #         op.remaining_time += child_op.remaining_time
             
 
-        src_ops = self.find_src_ops()
-        # populate each connected component of the dag
-        while len(src_ops) > 0:
-            op = src_ops.pop()
-            _populate_recursive(op)
+        # src_ops = self.find_src_ops()
+        # # populate each connected component of the dag
+        # while len(src_ops) > 0:
+        #     op = src_ops.pop()
+        #     _populate_recursive(op)
 
 
 
@@ -140,7 +140,7 @@ class Job:
         '''returns a feature vector for a single node in the dag'''
         n_remaining_tasks = len(op.remaining_tasks)
         n_processing_tasks = len(op.processing_tasks)
-        mean_task_duration = op.task_duration.mean()
+        mean_task_duration = op.rough_duration
 
         return [
             n_remaining_tasks,
@@ -159,8 +159,9 @@ class Job:
 
 
 
-    def add_local_worker(self, worker_id):
-        self.local_workers.add(worker_id)
+    def add_local_worker(self, worker):
+        self.local_workers.add(worker.id_)
+        worker.job_id = self.id_
         self.update_n_avail_local(1)
 
 
@@ -173,7 +174,6 @@ class Job:
 
     def assign_worker(self, worker, op, wall_time):
         assert op.n_saturated_tasks < op.n_tasks
-        assert worker.can_assign(op)
 
         task = op.remaining_tasks.pop()
         op.processing_tasks.add(task)
@@ -185,7 +185,7 @@ class Job:
             n_remaining_tasks=-1, 
             n_processing_tasks=1, 
             n_avail_local_workers=-1)
-
+            
         worker.task = task
         task.worker_id = worker.id_
         task.t_accepted = wall_time
@@ -193,7 +193,7 @@ class Job:
 
 
 
-    def add_task_completion(self, op, task, wall_time):
+    def add_task_completion(self, op, task, worker, wall_time):
         assert not op.is_complete
         assert task in op.processing_tasks
 
@@ -207,6 +207,7 @@ class Job:
             n_processing_tasks=-1, 
             n_avail_local_workers=1)
 
+        worker.task = None
         task.t_completed = wall_time
 
 
