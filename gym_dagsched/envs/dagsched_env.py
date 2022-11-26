@@ -138,8 +138,6 @@ class DagSchedEnv:
 
         self.x_ptrs = x_ptrs
 
-        # self.avail_worker_ids = set([worker.id_ for worker in self.workers])
-
         self.max_ops = np.max([len(e.job.ops) for _,_,e in initial_timeline.pq])
 
         self.executor_interval_map = self._get_executor_interval_map()
@@ -238,18 +236,18 @@ class DagSchedEnv:
         job.x_ptr = self.x_ptrs[job.id_]
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
+        self.state.add_job(job.id_)
+
         src_ops = job.find_src_ops()
         self.frontier_ops |= src_ops
-
-        self.state.add_job(job.id_)
-        self.state.add_ops(job.id_, (op.id_ for op in iter(src_ops)))
+        [self.state.add_op(job.id_, op.id_) for op in iter(src_ops)]
 
         if self.state.null_pool_has_workers:
             # if there are any workers that don't
             # belong to any job, then give the 
             # agent a chance to assign them to this 
-            # job by starting a new commitment round
-            # at the 'null' pool
+            # new job by starting a new commitment 
+            # round at the 'null' pool
             self.state.update_worker_source()
      
 
@@ -280,7 +278,8 @@ class DagSchedEnv:
             self.state.move_worker_to_job_pool(worker.id_)
             return
 
-        self.state.update_worker_state(worker.id_, WorkerState.PRESENT)
+        # TODO: set false here but only set true in state class
+        self.state.set_worker_moving(worker.id_, False)
         self._work_on_op(worker, op)
 
 
@@ -365,7 +364,7 @@ class DagSchedEnv:
         if job.is_complete:
             self._process_job_completion(job)
 
-        # see if the worker has somewhere to be moved
+        # see if the worker is committed to some next operation
         commitment = self.state.peek_commitment(op.job_id, op.id_)
         if commitment is not None:
             # op has at least one commitment, so fulfill it
@@ -396,6 +395,8 @@ class DagSchedEnv:
 
     def _process_op_completion(self, op):
         '''performs some bookkeeping when an operation completes'''
+        self.state.mark_op_completed(op.job_id, op.id_)
+
         job = self.jobs[op.job_id]
         job.add_op_completion()
 
@@ -403,9 +404,7 @@ class DagSchedEnv:
         # other dependencies are also satisfied
         new_ops = job.find_new_frontiers(op)
         self.frontier_ops |= new_ops
-
-        self.state.mark_op_completed(op.job_id, op.id_)
-        self.state.add_ops(job.id_, (op.id_ for op in iter(new_ops)))
+        [self.state.add_op(job.id_, op.id_) for op in iter(new_ops)]
 
         frontier_changed = (len(new_ops) > 0)
         return frontier_changed
@@ -415,21 +414,22 @@ class DagSchedEnv:
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
+
+        self.state.mark_job_completed(job.id_)
         
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids += [job.id_]
         job.t_completed = self.wall_time
-
-        self.state.mark_job_completed(job.id_)
 
 
 
     def _fulfill_commitment(self, worker, op):
         assert op is not None
 
-        self.state.fulfill_commitment(worker.id_, op.job_id, op.id_)
+        worker_is_present = \
+            self.state.fulfill_commitment(worker.id_, op.job_id, op.id_)
 
-        if worker.is_at_job(op.job_id):
+        if worker_is_present:
             self._work_on_op(worker, op)
         else:
             self._send_worker(worker, op)
