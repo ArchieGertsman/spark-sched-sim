@@ -465,9 +465,10 @@ class DagSchedEnv:
 
 
     def _reroute_worker(self, worker, op):
-        self.state.reroute_worker(worker.id_, op.job_id, op.id_)
+        is_worker_present = \
+            self.state.reroute_worker(worker.id_, op.job_id, op.id_)
 
-        if worker.is_at_job(op.job_id):
+        if is_worker_present:
             self._work_on_op(worker, op)
         else:
             self._send_worker(worker, op)
