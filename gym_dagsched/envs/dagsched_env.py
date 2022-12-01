@@ -1,50 +1,14 @@
-from collections import defaultdict
-from copy import deepcopy as dcp
-from copy import copy as cp
-from time import time
-from sys import getsizeof as sizeof
-from enum import Enum, auto
+from bisect import bisect_left
 
 import numpy as np
 import torch
-import networkx as nx
 
-from .state import State, WorkerState
+from .state import State, OpNode
 from ..entities.timeline import JobArrival, TaskCompletion, WorkerArrival
-from ..utils.device import device
 
 
 
 class DagSchedEnv:
-    '''An OpenAI-Gym-style simulation environment for scheduling 
-    streaming jobs consisting of interdependent operations. 
-    
-    What?
-    "job": consists of "operations" that need to be completed by "workers"
-    "streaming": arriving stochastically and continuously over time
-    "scheduling": assigning workers to jobs
-    "operation": can be futher split into "tasks" which are identical 
-      and can be worked on in parallel. The number of tasks in a 
-      operation is equal to the number of workers that can work on 
-      the operation in parallel.
-    "interdependent": some operations may depend on the results of others, 
-      and therefore cannot begin execution until those dependencies are 
-      satisfied. These dependencies are encoded in directed acyclic graphs 
-      (dags) where an edge from operation (a) to operation (b) means that 
-      (a) must complete before (b) can begin.
-
-    Example: a cloud computing cluster is responsible for receiving workflows
-        (i.e. jobs) and executing them using its resources. A  machine learning 
-        workflow may consist of numerous operations, such as data prep, training/
-        validation, hyperparameter tuning, testing, etc. and these operations 
-        depend on each other, e.g. data prep comes before training. Data prep 
-        can further be broken into tasks, where each task entails prepping a 
-        subset of the data, and these tasks can easily be parallelized. 
-        
-    The process of assigning workers to jobs is crutial, as sophisticated 
-    scheduling algorithms can significantly increase the system's efficiency.
-    Yet, it turns out to be a very challenging problem.
-    '''
 
     # multiplied with reward to control its magnitude
     REWARD_SCALE = 1e-5
@@ -86,15 +50,6 @@ class DagSchedEnv:
 
 
 
-    # @property
-    # def are_actions_available(self):
-    #     '''checks if there are any valid actions that can be
-    #     taken by the scheduling agent.
-    #     '''
-    #     return self.n_avail_workers > 0 and len(self.frontier_ops) > 0
-
-
-
     def n_ops_per_job(self):
         return [len(self.jobs[j].ops) for j in self.active_job_ids]
 
@@ -103,7 +58,7 @@ class DagSchedEnv:
 
     ## OpenAI Gym style interface - reset & step
 
-    def reset(self, initial_timeline, workers, x_ptrs):
+    def reset(self, initial_timeline, workers, shared_obs):
         '''resets the simulation. should be called before
         each run (including first). all state data is found here.
         '''
@@ -136,9 +91,10 @@ class DagSchedEnv:
         # dependencies are satisfied
         self.frontier_ops = set()
 
-        self.x_ptrs = x_ptrs
+        # self.x_ptrs = x_ptrs
+        self.shared_obs = shared_obs
 
-        self.max_ops = np.max([len(e.job.ops) for _,_,e in initial_timeline.pq])
+        self.max_ops = max(len(e.job.ops) for _,_,e in initial_timeline.pq)
 
         self.executor_interval_map = self._get_executor_interval_map()
 
@@ -150,19 +106,51 @@ class DagSchedEnv:
 
         self.done = False
 
+        self.first_step = True
 
 
-    def step(self, job_id, op_id, n_workers):
+
+    def step(self, action):
+        reward, done = self._step(action)
+
+        self._update_node_features()
+        self._update_active_job_mask()
+        self._update_op_mask()
+        self._update_prlvl_mask()
+        self.shared_obs.reward.copy_(torch.tensor(reward))
+        self.shared_obs.done.copy_(torch.tensor(done))
+
+
+
+    def _step(self, action):
         if self.done:
             return 0, True
 
-        if job_id is not None:
-            op = self.jobs[job_id].ops[op_id]
-            assert op in (self.frontier_ops - self.selected_ops)
-            # mark op as selected so that it doesn't get
-            # selected again during this commitment round
-            self.selected_ops.add(op)
-            self.state.add_commitment(n_workers, job_id, op_id)
+        if action is None:
+            # this should only occur on the first step of the 
+            # episode. jumps to the first event in the timeline, 
+            # which is a job arrival
+            assert self.first_step
+            self.first_step = False
+
+            self.wall_time, event = self.timeline.pop()
+            self._process_scheduling_event(event)
+            return 0, False
+
+        # take action
+
+        job_id, op_id, n_workers = action
+
+        op = self.jobs[job_id].ops[op_id]
+        assert op in (self.frontier_ops - self.selected_ops)
+
+        # commit `n_workers` workers from the current worker
+        # source to the op with id (job_id, op_id)
+        self.state.add_commitment(n_workers, job_id, op_id)
+
+        # mark op as selected so that it doesn't get
+        # selected again during this commitment round
+        self.selected_ops.add(op)
         
         if not self.state.all_source_workers_committed:
             # current commitment round is not over yet,
@@ -177,7 +165,7 @@ class DagSchedEnv:
 
         t_prev = self.wall_time
 
-        while not self.timeline.empty and self.state.all_source_workers_committed:
+        while not (self.timeline.empty or self._should_start_new_commitment_round()):
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
@@ -192,24 +180,87 @@ class DagSchedEnv:
 
 
 
-    ## Action masks
+    ## Observations
 
-    def construct_op_msk(self):
-        op_msk = torch.zeros((self.n_job_arrivals, self.max_ops), dtype=torch.bool)
+    def _update_node_features(self):
+        n_source_workers = self.state.n_workers_at_source()
+        source_job_id = self.state.get_source_job()
+
+        for job_id in self.active_job_ids:
+            job = self.jobs[job_id]
+            worker_count = self.compute_worker_count(job_id)
+            is_source_job = (job_id == source_job_id)
+            job_feature_tensor = self.shared_obs.feature_tensor_chunks[job_id]
+            for op in job.ops:
+                job_feature_tensor[op.id_] = torch.tensor([
+                    n_source_workers,
+                    is_source_job,
+                    worker_count,
+                    op.n_remaining_tasks,
+                    op.approx_remaining_work
+                ])
+
+
+    def _update_active_job_mask(self):
+        active_job_msk = torch.zeros(self.n_job_arrivals, dtype=torch.bool)
+        active_job_msk[self.active_job_ids] = 1
+        self.shared_obs.active_job_msk.copy_(active_job_msk)
+
+
+    def _update_op_mask(self):
+        # op_msk = torch.zeros((self.n_job_arrivals, self.max_ops), dtype=torch.bool)
         for j in self.active_job_ids:
             job = self.jobs[j]
             for i,op in enumerate(job.ops):
                 if op in (self.frontier_ops - self.selected_ops):
-                    op_msk[j, i] = 1
-        return op_msk
+                    self.shared_obs.op_msk[j, i] = 1
 
 
 
-    def construct_prlvl_msk(self):
-        prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers+1), dtype=torch.bool)
+    def _update_prlvl_mask(self):
+        # prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers+1), dtype=torch.bool)
         # prlvl_msk[:, 1:len(self.avail_worker_ids)+1] = 1
-        prlvl_msk[:, 1:] = 1
-        return prlvl_msk
+        self.shared_obs.prlvl_msk[:, 1:] = 1
+
+
+
+    
+
+
+
+    def compute_worker_count(self, job_id):
+        '''for each active job, computes the total count
+        of workers associated with that job. Includes:
+        - workers sitting at the job's pool
+        - workers sitting or moving to operations within the job
+        - workers committed to operations within the job
+        '''
+        # counts = torch.zeros(len(self.active_job_ids))
+        # for job_id in self.active_job_ids:
+
+        job = self.jobs[job_id]
+        count = self.state.n_workers_at(job_id) + sum(
+            self.state.n_workers_at(job_id, op_id) +
+            self.state.n_commitments_to(job_id, op_id)
+            for op_id in range(len(job.ops))
+        )
+        return count
+
+        # counts[job_id] = count
+        # return counts
+
+
+
+
+    # def get_source_job_mask(self):
+    #     job_id = self.state.get_source_job()
+    #     if job_id is not None:
+    #         return torch.zeros(len(self.active_job_ids), dtype=torch.bool)
+
+    #     msk = torch.zeros(self.n_job_arrivals, dtype=torch.bool)
+    #     idx = bisect_left(self.active_job_ids, job_id)
+    #     msk[idx] = 1
+    #     return msk
 
 
 
@@ -224,8 +275,7 @@ class DagSchedEnv:
         elif isinstance(event, TaskCompletion):
             self._process_task_completion(event.op, event.task)
         else:
-            print('invalid event')
-            assert False
+            raise Exception('invalid event')
 
 
 
@@ -268,20 +318,18 @@ class DagSchedEnv:
         '''performs some bookkeeping when a worker arrives'''
         job = self.jobs[op.job_id]
 
-        if job.is_complete:
+        if job.completed or op.saturated:
+            # if the job has completed or the op has 
+            # become saturated by the time the worker 
+            # arrives, then try to greedily find 
+            # a backup operation for the worker
             self._try_backup_schedule(worker)
             return
         
-        job.add_local_worker(worker)
-
-        if op.saturated:
-            self.state.move_worker_to_job_pool(worker.id_)
-            return
-
-        # TODO: set false here but only set true in state class
         self.state.set_worker_moving(worker.id_, False)
+        job.add_local_worker(worker)
         self._work_on_op(worker, op)
-
+        
 
     
 
@@ -298,6 +346,7 @@ class DagSchedEnv:
             n_local_workers, 
             self.executor_interval_map)
         t_completion = task.t_accepted + duration
+        op.most_recent_duration = duration
 
         event = TaskCompletion(op, task)
         self.timeline.push(t_completion, event)
@@ -312,15 +361,52 @@ class DagSchedEnv:
         job.add_task_completion(op, task, worker, self.wall_time)
         
         if not op.saturated:
-            # reassign the worker to keep working on this operation.
+            # reassign the worker to keep working on this operation
+            # if there is more work to do
             self._work_on_op(worker, op)
         else:
-            self._process_saturated_op(op, worker)
+            self._process_op_saturation(op, worker)
 
 
 
 
     ## Helper functions
+
+    def _should_start_new_commitment_round(self):
+        uncommitted_source_workers = not self.state.all_source_workers_committed
+
+        if uncommitted_source_workers and len(self.frontier_ops) > 0:
+            # there are source workers that aren't
+            # committed anywhere, and there are frontier
+            # operations which need more workers,
+            # so start a new commitment round at
+            # this source.
+            return True
+
+        if uncommitted_source_workers:
+            # there are source workers that aren't
+            # committed anywhere, but there also aren't
+            # any frontier nodes they can be 
+            # committed to, so move them somewhere
+            # according to a fixed rule.
+            self._move_all_source_workers()
+
+        return False
+
+
+
+    def _move_all_source_workers(self):
+        '''current worker source must be an operation.
+        moves all the workers at the op to its job's pool
+        if the the job contains unsaturated ops, otherwise
+        moves them to the null pool
+        '''
+        job_id = self.state.get_source_job()
+        assert job_id is not None
+        job = self.jobs[job_id]
+        self.state.move_all_source_workers(job.saturated)
+
+
 
     def _work_on_op(self, worker, op):
         assert op is not None
@@ -343,6 +429,7 @@ class DagSchedEnv:
     def _send_worker(self, worker, op):
         assert op is not None
         assert worker.available
+        assert worker.job_id != op.job_id
 
         if worker.job_id is not None:
             old_job = self.jobs[worker.job_id]
@@ -352,19 +439,34 @@ class DagSchedEnv:
             
 
 
-    def _process_saturated_op(self, op, worker):
+    def _process_op_saturation(self, op, worker):
+        job = self.jobs[op.job_id]
+        job.add_op_saturation()
+
         frontier_changed = False
 
-        if op.is_complete:
+        if op.completed:
             # record whether or not the completion of this
             # operation unlocked new operations within the job
             frontier_changed = self._process_op_completion(op)
 
-        job = self.jobs[op.job_id]
-        if job.is_complete:
+        if job.completed:
             self._process_job_completion(job)
 
-        # see if the worker is committed to some next operation
+        # worker may have somewhere to be moved
+        commitment = self._move_worker(worker, op, frontier_changed)
+
+        # worker source may need to be updated
+        self._update_worker_source(op, frontier_changed, commitment)
+        
+
+
+    def _move_worker(self, worker, op, frontier_changed):
+        '''if the worker has a commitment, then fulfill it. Otherwise,
+        if `op` completed and unlocked new ops within the job dag, then 
+        move the worker to the job's worker pool so that it can be assigned 
+        to the new ops
+        '''
         commitment = self.state.peek_commitment(op.job_id, op.id_)
         if commitment is not None:
             # op has at least one commitment, so fulfill it
@@ -374,15 +476,18 @@ class DagSchedEnv:
         elif frontier_changed:
             # no commitment, but frontier changed
             self.state.move_worker_to_job_pool(worker.id_)
+        return commitment
 
-        # see if current worker source needs to be updated
+
+
+    def _update_worker_source(self, op, frontier_changed, commitment):
         if frontier_changed:
             # if any new operations were unlocked within this 
             # job, then give the agent a chance to assign
             # them to free workers from this job's pool
             # by starting a new commitment round at this
             # job's pool
-            self.state.update_worker_source(job.id_)
+            self.state.update_worker_source(op.job_id)
         elif commitment is None:
             # if no new operations were unlocked and
             # the worker has nowhere to go, then, necessarily,
@@ -390,8 +495,8 @@ class DagSchedEnv:
             # been committed anywhere. Then start a new
             # commitment round at this operation
             self.state.update_worker_source(op.job_id, op.id_)
-        
-        
+
+
 
     def _process_op_completion(self, op):
         '''performs some bookkeeping when an operation completes'''
@@ -402,7 +507,7 @@ class DagSchedEnv:
 
         # add stage's decendents to the frontier, if their
         # other dependencies are also satisfied
-        new_ops = job.find_new_frontiers(op)
+        new_ops = job.find_new_frontier_ops(op)
         self.frontier_ops |= new_ops
         [self.state.add_op(job.id_, op.id_) for op in iter(new_ops)]
 
@@ -425,6 +530,7 @@ class DagSchedEnv:
 
     def _fulfill_commitment(self, worker, op):
         assert op is not None
+        assert not op.saturated
 
         worker_is_present = \
             self.state.fulfill_commitment(worker.id_, op.job_id, op.id_)
@@ -437,6 +543,12 @@ class DagSchedEnv:
 
 
     def _fulfill_source_commitments(self):
+        '''called at the end of a commitment round
+        '''
+        assert self.state.all_source_workers_committed
+
+        # some of the source workers may not be
+        # free right now; find the ones that are.
         free_workers = set((
             worker_id 
             for worker_id in self.state.get_source_workers() 

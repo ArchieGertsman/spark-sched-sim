@@ -75,10 +75,10 @@ def test_remove_op():
 
 
 def test_parse_source():
-    assert State.parse_source() == NullNode()
-    assert State.parse_source(None, None, JobNode(0)) == JobNode(0)
-    assert State.parse_source(0) == JobNode(0)
-    assert State.parse_source(0, 0) == OpNode(0, 0, OpState.SRC)
+    assert State._parse_source() == NullNode()
+    assert State._parse_source(None, None, JobNode(0)) == JobNode(0)
+    assert State._parse_source(0) == JobNode(0)
+    assert State._parse_source(0, 0) == OpNode(0, 0, OpState.SRC)
 
 
 
@@ -105,7 +105,7 @@ def test_get_worker_location():
     state = State()
     state.reset(n_workers)
 
-    assert state.get_worker_location(0) == NullNode()
+    assert state._get_worker_location(0) == NullNode()
 
 
 
@@ -114,9 +114,9 @@ def test_remove_worker_from_pool():
     state = State()
     state.reset(n_workers)
 
-    node_old = state.remove_worker_from_pool(0)
+    node_old = state._remove_worker_from_pool(0)
     assert node_old == NullNode()
-    assert state.n_source_workers(NullNode()) == (n_workers - 1)
+    assert state._n_workers_at(NullNode()) == (n_workers - 1)
 
 
 
@@ -127,17 +127,17 @@ def test_assign_worker_1():
 
     state.add_op(0, 0)
 
-    state.remove_worker_from_pool(0)
-    state.assign_worker(0, 0, 0, NullNode())
+    state._remove_worker_from_pool(0)
+    state._assign_worker(0, 0, 0, NullNode())
 
     op_node = OpNode(0, 0, OpState.SRC)
 
     # make sure the worker is at the new operation
-    assert state.get_worker_location(0) == op_node
+    assert state._get_worker_location(0) == op_node
 
     # make sure that operation just has this one 
     # worker assigned to it
-    assert state.n_source_workers(op_node) == 1
+    assert state._n_workers_at(op_node) == 1
 
     # worker should be moving to the job since it
     # started out at the null pool
@@ -165,12 +165,12 @@ def test_fulfill_commitment_1():
     op_node = OpNode(0, 0, OpState.SRC)
 
     # make sure the worker is at the new operation
-    assert state.get_worker_location(0) == op_node
+    assert state._get_worker_location(0) == op_node
 
     # make sure that operation just has this one 
     # worker assigned to it
-    assert state.n_source_workers(op_node) == 1
-    assert state.n_source_workers(NullNode()) == (n_workers - 1)
+    assert state._n_workers_at(op_node) == 1
+    assert state._n_workers_at(NullNode()) == (n_workers - 1)
 
     # worker should be moving to the job since it
     # started out at the null pool
@@ -188,8 +188,8 @@ def test_fulfill_commitment_2():
     state.add_op(0, 0)
     state.add_op(0, 1)
 
-    state.remove_worker_from_pool(0)
-    state.assign_worker(0, 0, 0, NullNode())
+    state._remove_worker_from_pool(0)
+    state._assign_worker(0, 0, 0, NullNode())
 
     # add one commitment from op 0 to op 1
     state.add_commitment(1, 0, 1, 0, 0)
@@ -206,12 +206,12 @@ def test_fulfill_commitment_2():
     op_node_dst = OpNode(0, 1, OpState.SRC)
 
     # make sure the worker is at the new operation
-    assert state.get_worker_location(0) == op_node_dst
+    assert state._get_worker_location(0) == op_node_dst
 
     # make sure that operation just has this one 
     # worker assigned to it
-    assert state.n_source_workers(op_node_dst) == 1
-    assert state.n_source_workers(op_node_src) == 0
+    assert state._n_workers_at(op_node_dst) == 1
+    assert state._n_workers_at(op_node_src) == 0
 
     # worker should not be moving since the two
     # operations are within the same job
@@ -235,9 +235,9 @@ def test_move_worker_to_job_pool():
     # move worker 0 from op to job pool
     state.move_worker_to_job_pool(0)
 
-    assert state.get_worker_location(0) == JobNode(0)
-    assert state.n_source_workers(JobNode(0)) == 1
-    assert state.n_source_workers(OpNode(0, 0, OpState.SRC)) == 0
+    assert state._get_worker_location(0) == JobNode(0)
+    assert state._n_workers_at(JobNode(0)) == 1
+    assert state._n_workers_at(OpNode(0, 0, OpState.SRC)) == 0
 
 
 
@@ -255,14 +255,14 @@ def test_move_worker_to_null_pool():
 
     # number of workers at null pool should have
     # decreased by 1
-    assert state.n_source_workers(NullNode()) == (n_workers - 1)
+    assert state._n_workers_at(NullNode()) == (n_workers - 1)
 
     # move worker 0 from op to null pool
     state.move_worker_to_null_pool(0)
 
-    assert state.get_worker_location(0) == NullNode()
-    assert state.n_source_workers(NullNode()) == n_workers
-    assert state.n_source_workers(OpNode(0, 0, OpState.SRC)) == 0
+    assert state._get_worker_location(0) == NullNode()
+    assert state._n_workers_at(NullNode()) == n_workers
+    assert state._n_workers_at(OpNode(0, 0, OpState.SRC)) == 0
 
 
 
@@ -279,7 +279,7 @@ def test_clean_up_nodes_1():
     state.mark_job_completed(0)
     state.mark_op_completed(0, 0)
 
-    state.clean_up_nodes(OpNode(0, 0, OpState.SRC))
+    state._clean_up_nodes(OpNode(0, 0, OpState.SRC))
 
     assert OpNode(0, 0, OpState.SRC) not in state.G
     assert OpNode(0, 0, OpState.DST) not in state.G
@@ -300,7 +300,7 @@ def test_clean_up_nodes_2():
     # state.mark_job_completed(0)
     state.mark_op_completed(0, 0)
 
-    state.clean_up_nodes(OpNode(0, 0, OpState.SRC))
+    state._clean_up_nodes(OpNode(0, 0, OpState.SRC))
 
     assert OpNode(0, 0, OpState.SRC) not in state.G
     assert OpNode(0, 0, OpState.DST) not in state.G
@@ -321,7 +321,7 @@ def test_clean_up_nodes_3():
     # state.mark_job_completed(0)
     # state.mark_op_completed(0, 0)
 
-    state.clean_up_nodes(OpNode(0, 0, OpState.SRC))
+    state._clean_up_nodes(OpNode(0, 0, OpState.SRC))
 
     # test for no-op
     assert OpNode(0, 0, OpState.SRC) in state.G
@@ -345,10 +345,10 @@ def test_reroute_worker():
     # reroute worker from op 0 to op 1
     state.reroute_worker(0, 0, 1)
 
-    assert state.get_worker_location(0) == OpNode(0, 1, OpState.SRC)
-    assert state.n_source_workers(OpNode(0, 1, OpState.SRC)) == 1
-    assert state.n_source_workers(OpNode(0, 0, OpState.SRC)) == 0
-    assert state.n_source_workers(NullNode()) == (n_workers - 1)
+    assert state._get_worker_location(0) == OpNode(0, 1, OpState.SRC)
+    assert state._n_workers_at(OpNode(0, 1, OpState.SRC)) == 1
+    assert state._n_workers_at(OpNode(0, 0, OpState.SRC)) == 0
+    assert state._n_workers_at(NullNode()) == (n_workers - 1)
 
 
 
@@ -410,3 +410,47 @@ def test_get_source_commitments():
     assert len(commitments) == 2
     assert commitments[0] == (0, 0, 1)
     assert commitments[1] == (0, 1, 1)
+
+
+
+def test_move_all_source_workers_1():
+    '''job is not saturated'''
+    n_workers = 5
+    state = State()
+    state.reset(n_workers)
+
+    state.add_job(0)
+    state.add_op(0, 0)
+
+    state._remove_worker_from_pool(0)
+    state._assign_worker(0, 0, 0, NullNode())
+    state.update_worker_source(0, 0)
+
+    state.move_all_source_workers(False)
+
+    assert state._get_worker_location(0) == JobNode(0)
+    assert state._n_workers_at(OpNode(0, 0, OpState.SRC)) == 0
+    assert state._n_workers_at(JobNode(0)) == 1
+    assert state._n_workers_at(NullNode()) == (n_workers - 1)
+
+
+
+def test_move_all_source_workers_2():
+    '''job is saturated'''
+    n_workers = 5
+    state = State()
+    state.reset(n_workers)
+
+    state.add_job(0)
+    state.add_op(0, 0)
+
+    state._remove_worker_from_pool(0)
+    state._assign_worker(0, 0, 0, NullNode())
+    state.update_worker_source(0, 0)
+
+    state.move_all_source_workers(True)
+
+    assert state._get_worker_location(0) == NullNode()
+    assert state._n_workers_at(OpNode(0, 0, OpState.SRC)) == 0
+    assert state._n_workers_at(JobNode(0)) == 0
+    assert state._n_workers_at(NullNode()) == n_workers

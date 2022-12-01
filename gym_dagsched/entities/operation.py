@@ -1,18 +1,14 @@
-from enum import Enum, auto
-from time import time
-
 import numpy as np
 
 from .task import Task
 
 
-class FeatureIdx:
-    N_REMAINING_TASKS = 0
-    N_PROCESSING_TASKS = 1
-    MEAN_TASK_DURATION = 2
-    N_AVAIL_WORKERS = 3
-    N_AVAIL_LOCAL_WORKERS = 4
-    N_FEATURES = 5
+class Features:
+    IS_SOURCE = 0
+    N_SOURCE_WORKERS = 1
+    N_LOCAL_WORKERS = 2
+    N_REMAINING_TASKS = 3
+    RAMINING_WORK = 4
 
 
 
@@ -23,7 +19,7 @@ class Operation:
         self.job_id = job_id
         self.task_duration = task_duration
         self.rough_duration = rough_duration
-        # self.compatible_worker_types = self.find_compatible_worker_types()
+        self.most_recent_duration = rough_duration
 
         self.n_tasks = n_tasks
         tasks = [
@@ -52,7 +48,7 @@ class Operation:
         return (self.job_id, self.id_)
 
     @property
-    def is_complete(self):
+    def completed(self):
         return len(self.completed_tasks) == self.n_tasks
 
     @property
@@ -72,15 +68,10 @@ class Operation:
     def n_remaining_tasks(self):
         return self.n_tasks - self.n_saturated_tasks
 
-
-
-    # def find_compatible_worker_types(self):
-    #     types = set()
-    #     for worker_type in range(len(self.task_duration)):
-    #         if self.task_duration[worker_type] < np.inf:
-    #             types.add(worker_type)
-    #     return types
-
+    @property
+    def approx_remaining_work(self):
+        return self.most_recent_duration * self.n_remaining_tasks
+        
 
 
     def sample_executor_key(self, num_executors, executor_interval_map):

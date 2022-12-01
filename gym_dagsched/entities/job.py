@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch_geometric.utils.convert import from_networkx
 
-from .operation import FeatureIdx
+from .operation import Features
 
 
 
@@ -32,6 +32,8 @@ class Job:
     # number of operations that have completed executing
     completed_ops_count = 0
 
+    saturated_ops_count = 0
+
     # time that this job completed, i.e. when the last
     # operation completed executing
     t_completed = np.inf
@@ -45,9 +47,15 @@ class Job:
 
 
     @property
-    def is_complete(self):
+    def completed(self):
         '''whether or not this job has completed'''
         return self.completed_ops_count == len(self.ops)
+
+
+
+    @property
+    def saturated(self):
+        return self.saturated_ops_count == len(self.ops)
 
 
 
@@ -55,6 +63,12 @@ class Job:
         '''increments the count of completed operations'''
         assert self.completed_ops_count < len(self.ops)
         self.completed_ops_count += 1
+
+
+    
+    def add_op_saturation(self):
+        assert self.saturated_ops_count < len(self.ops)
+        self.saturated_ops_count += 1
 
 
 
@@ -69,23 +83,26 @@ class Job:
 
 
 
-    def find_new_frontiers(self, op):
+    def find_new_frontier_ops(self, op):
         '''if `op` is completed, returns all of its
         successors whose other dependencies are also 
         completed, if any exist.
         '''
-        if not op.is_complete:
+        if not op.completed:
             return set()
 
-        new_frontiers = set()
+        new_ops = set()
         # search through successors of `stage`
         for suc_op_id in self.dag.successors(op.id_):
             # if all dependencies are completed, then
             # add this successor to the frontiers
             if self._check_dependencies(suc_op_id):
-                new_frontiers.add(self.ops[suc_op_id])
+                new_op = self.ops[suc_op_id]
+                # self.x_ptr[suc_op_id, Features.REMAINING_WORK] = \
+                #     new_op.n_tasks * new_op.rough_duration
+                new_ops.add(new_op)
         
-        return new_frontiers
+        return new_ops
 
 
 
@@ -94,7 +111,7 @@ class Job:
         with id `op_id` are satisfied.
         '''
         for dep_id in self.dag.predecessors(op_id):
-            if not self.ops[dep_id].is_complete:
+            if not self.ops[dep_id].completed:
                 return False
 
         return True
@@ -125,50 +142,52 @@ class Job:
         # while len(src_ops) > 0:
         #     op = src_ops.pop()
         #     _populate_recursive(op)
+        pass
 
 
 
     def init_pyg_data(self):
-        feature_vectors = [self.init_feature_vector(op) for op in self.ops]
+        # feature_vectors = [self.init_feature_vector(op) for op in self.ops]
         pyg_data = from_networkx(self.dag)
-        pyg_data.x = torch.tensor(feature_vectors, dtype=torch.float32)
+        # pyg_data.x = torch.tensor(feature_vectors, dtype=torch.float32)
+        pyg_data.x = torch.zeros((len(self.ops), 5))
         return pyg_data
 
 
 
-    def init_feature_vector(self, op):
-        '''returns a feature vector for a single node in the dag'''
-        n_remaining_tasks = len(op.remaining_tasks)
-        n_processing_tasks = len(op.processing_tasks)
-        mean_task_duration = op.rough_duration
+    # def init_feature_vector(self, op):
+    #     '''returns a feature vector for a single node in the dag'''
+    #     n_remaining_tasks = len(op.remaining_tasks)
+    #     n_processing_tasks = len(op.processing_tasks)
+    #     mean_task_duration = op.rough_duration
 
-        return [
-            n_remaining_tasks,
-            n_processing_tasks,
-            mean_task_duration,
-            0, 0
-        ] 
+    #     return [
+    #         n_remaining_tasks,
+    #         n_processing_tasks,
+    #         mean_task_duration,
+    #         0, 0
+    #     ] 
 
 
 
-    def update_n_avail_local(self, n):
-        self.n_avail_local += n
-        self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] += n
-        # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] >= 0).all()
-        # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] <= len(self.local_workers)).all()
+    # def update_n_avail_local(self, n):
+    #     self.n_avail_local += n
+    #     self.x_ptr[:, Features.N_LOCAL_WORKERS] += n
+    #     # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] >= 0).all()
+    #     # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] <= len(self.local_workers)).all()
 
 
 
     def add_local_worker(self, worker):
         self.local_workers.add(worker.id_)
         worker.job_id = self.id_
-        self.update_n_avail_local(1)
+        # self.update_n_avail_local(1)
 
 
 
     def remove_local_worker(self, worker_id):
         self.local_workers.remove(worker_id)
-        self.update_n_avail_local(-1)
+        # self.update_n_avail_local(-1)
 
 
 
@@ -178,13 +197,16 @@ class Job:
         task = op.remaining_tasks.pop()
         op.processing_tasks.add(task)
 
-        self.n_avail_local -= 1
+        # self.n_avail_local -= 1
 
-        self.update_x_ptr(
-            op.id_, 
-            n_remaining_tasks=-1, 
-            n_processing_tasks=1, 
-            n_avail_local_workers=-1)
+        # self.x_ptr[op.id_, Features.N_REMAINING_TASKS] -= 1
+        # self.x_ptr[op.id_, Features.REMAINING_WORK] -= op.rough_duration
+
+        # self.update_x_ptr(
+        #     op.id_, 
+        #     n_remaining_tasks=-1, 
+        #     n_processing_tasks=1, 
+        #     n_avail_local_workers=-1)
             
         worker.task = task
         task.worker_id = worker.id_
@@ -194,37 +216,37 @@ class Job:
 
 
     def add_task_completion(self, op, task, worker, wall_time):
-        assert not op.is_complete
+        assert not op.completed
         assert task in op.processing_tasks
 
         op.processing_tasks.remove(task)
         op.completed_tasks.add(task)
 
-        self.n_avail_local += 1
+        # self.n_avail_local += 1
 
-        self.update_x_ptr(
-            op.id_, 
-            n_processing_tasks=-1, 
-            n_avail_local_workers=1)
+        # self.update_x_ptr(
+        #     op.id_, 
+        #     n_processing_tasks=-1, 
+        #     n_avail_local_workers=1)
 
         worker.task = None
         task.t_completed = wall_time
 
 
 
-    def update_x_ptr(
-        self,
-        op_id,
-        n_remaining_tasks=0,
-        n_processing_tasks=0,
-        mean_task_duration=0,
-        n_avail_workers=0,
-        n_avail_local_workers=0
-    ):
-        self.x_ptr[op_id] += torch.tensor([
-            n_remaining_tasks,
-            n_processing_tasks,
-            mean_task_duration,
-            n_avail_workers,
-            n_avail_local_workers
-        ])
+    # def update_x_ptr(
+    #     self,
+    #     op_id,
+    #     n_remaining_tasks=0,
+    #     n_processing_tasks=0,
+    #     mean_task_duration=0,
+    #     n_avail_workers=0,
+    #     n_avail_local_workers=0
+    # ):
+    #     self.x_ptr[op_id] += torch.tensor([
+    #         n_remaining_tasks,
+    #         n_processing_tasks,
+    #         mean_task_duration,
+    #         n_avail_workers,
+    #         n_avail_local_workers
+    #     ])
