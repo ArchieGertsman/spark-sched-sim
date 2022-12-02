@@ -25,6 +25,18 @@ class VecDagSchedEnv:
 
     ## API methods
 
+    @property
+    def num_jobs_per_env(self):
+        return self.active_job_msk_batch.sum(-1)
+
+
+
+    @property
+    def num_ops_per_job(self):
+        return self.op_counts.masked_select(self.active_job_msk_batch)
+
+
+
     def run(self):
         '''starts `self.n` subprocesses and creates
         pipes for communicting with them
@@ -64,7 +76,7 @@ class VecDagSchedEnv:
 
         self._reset_shared_obs_data()
 
-        avg_job_duration_batch, n_completed_jobs_batch = \
+        self.prev_episode_stats = \
             self._reset_envs(n_init_jobs, mjit, n_workers)
 
         print('done resetting')
@@ -74,11 +86,24 @@ class VecDagSchedEnv:
         self.t_parse = 0
         self.t_subbatch = 0
 
-        return self._parse_prev_episode_stats(avg_job_duration_batch, n_completed_jobs_batch)
+        return self._observe()
+
+
+
+    def get_prev_episode_stats(self):
+        if self.prev_episode_stats is None:
+            return None
+        
+        avg_job_duration_batch, n_completed_jobs_batch = self.prev_episode_stats
+
+        avg_job_duration_mean = np.mean(avg_job_duration_batch)
+        n_completed_jobs_mean = np.mean(n_completed_jobs_batch)
+        return avg_job_duration_mean, n_completed_jobs_mean
 
         
 
-    def step(self, op_id_batch=None, prlvl_batch=None):
+    def step(self, action_batch):
+        op_id_batch, prlvl_batch = action_batch
         self._step_envs(op_id_batch, prlvl_batch)
         return self._observe(), self.reward_batch, self.done_batch
 
@@ -199,30 +224,19 @@ class VecDagSchedEnv:
 
 
 
-    @classmethod
-    def _parse_prev_episode_stats(cls, avg_job_duration_batch, n_completed_jobs_batch):
-        if avg_job_duration_batch[0] is not None:
-            avg_job_duration_mean = np.mean(avg_job_duration_batch)
-            n_completed_jobs_mean = np.mean(n_completed_jobs_batch)
-        else:
-            avg_job_duration_mean, n_completed_jobs_mean = None, None
-        return avg_job_duration_mean, n_completed_jobs_mean
-
-
-
 
     ## step helpers
 
     def _step_envs(self, op_id_batch, prlvl_batch):
         i = 0
         for done, conn in zip(self.done_batch, self.conns):
-            if not done.item() and prlvl_batch is not None:
-                op_id, prlvl = op_id_batch[i], prlvl_batch[i].item()
+            if not done.item():
+                action = (op_id_batch[i], prlvl_batch[i].item())
                 i += 1
             else:
-                op_id, prlvl = (None, None), None
+                action = None
 
-            conn.send(('step', (op_id, prlvl)))
+            conn.send(('step', action))
 
         t = time()
         [conn.recv() for conn in self.conns]

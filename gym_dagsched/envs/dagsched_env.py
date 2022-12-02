@@ -108,11 +108,22 @@ class DagSchedEnv:
 
         self.first_step = True
 
+        # take a step in the timeline so that
+        # we can observe the environment
+        self.wall_time, event = self.timeline.pop()
+        self._process_scheduling_event(event)
+
+        self._update_shared_obs(0, False)
+
 
 
     def step(self, action):
         reward, done = self._step(action)
+        self._update_shared_obs(reward, done)
 
+
+
+    def _update_shared_obs(self, reward, done):
         self._update_node_features()
         self._update_active_job_mask()
         self._update_op_mask()
@@ -126,20 +137,8 @@ class DagSchedEnv:
         if self.done:
             return 0, True
 
-        if action is None:
-            # this should only occur on the first step of the 
-            # episode. jumps to the first event in the timeline, 
-            # which is a job arrival
-            assert self.first_step
-            self.first_step = False
-
-            self.wall_time, event = self.timeline.pop()
-            self._process_scheduling_event(event)
-            return 0, False
-
         # take action
-
-        job_id, op_id, n_workers = action
+        (job_id, op_id), n_workers = action
 
         op = self.jobs[job_id].ops[op_id]
         assert op in (self.frontier_ops - self.selected_ops)
