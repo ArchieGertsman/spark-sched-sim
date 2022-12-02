@@ -183,61 +183,72 @@ class DagSchedEnv:
     ## Observations
 
     def _update_node_features(self):
-        n_source_workers = self.state.n_workers_at_source()
-        source_job_id = self.state.get_source_job()
+        n_source_workers = self.state.num_uncommitted_source_workers
+        source_job_id = self.state.source_job
 
         for job_id in self.active_job_ids:
             job = self.jobs[job_id]
-            worker_count = self.compute_worker_count(job_id)
+            worker_count = self._count_workers(job_id)
             is_source_job = (job_id == source_job_id)
+
             job_feature_tensor = self.shared_obs.feature_tensor_chunks[job_id]
-            for op in job.ops:
-                job_feature_tensor[op.id_] = torch.tensor([
-                    n_source_workers,
-                    is_source_job,
-                    worker_count,
+
+            # update job-level features
+            job_feature_tensor[:, :3] = torch.tensor([
+                n_source_workers,
+                is_source_job,
+                worker_count
+            ])
+
+            # update node-level features
+            job_feature_tensor[:, 3:] = torch.stack([
+                torch.tensor([
                     op.n_remaining_tasks,
                     op.approx_remaining_work
                 ])
+                for op in job.ops
+            ])
+
 
 
     def _update_active_job_mask(self):
-        active_job_msk = torch.zeros(self.n_job_arrivals, dtype=torch.bool)
-        active_job_msk[self.active_job_ids] = 1
-        self.shared_obs.active_job_msk.copy_(active_job_msk)
+        self.shared_obs.active_job_msk.zero_()
+        self.shared_obs.active_job_msk[self.active_job_ids] = 1
+
 
 
     def _update_op_mask(self):
-        # op_msk = torch.zeros((self.n_job_arrivals, self.max_ops), dtype=torch.bool)
-        for j in self.active_job_ids:
-            job = self.jobs[j]
-            for i,op in enumerate(job.ops):
-                if op in (self.frontier_ops - self.selected_ops):
-                    self.shared_obs.op_msk[j, i] = 1
+        self.shared_obs.op_msk.zero_()
+
+        # get (job_id, op_id) pairs for each operation
+        # that is in the frontier but hasn't been selected
+        # yet during this committment round
+        id_pairs = (
+            (op.job_id, op.id_) 
+            for op in iter(self.frontier_ops - self.selected_ops)
+        )
+
+        # split pairs into two lists
+        job_ids, op_ids = list(zip(*id_pairs))
+
+        self.shared_obs.op_msk[job_ids, op_ids] = 1
 
 
 
     def _update_prlvl_mask(self):
-        # prlvl_msk = torch.zeros((self.n_job_arrivals, self.n_workers+1), dtype=torch.bool)
-        # prlvl_msk[:, 1:len(self.avail_worker_ids)+1] = 1
-        self.shared_obs.prlvl_msk[:, 1:] = 1
+        self.shared_obs.prlvl_msk.zero_()
+        n_source_workers = self.state.num_uncommitted_source_workers
+        self.shared_obs.prlvl_msk[:, :n_source_workers] = 1
 
 
 
-    
-
-
-
-    def compute_worker_count(self, job_id):
+    def _count_workers(self, job_id):
         '''for each active job, computes the total count
         of workers associated with that job. Includes:
         - workers sitting at the job's pool
         - workers sitting or moving to operations within the job
         - workers committed to operations within the job
         '''
-        # counts = torch.zeros(len(self.active_job_ids))
-        # for job_id in self.active_job_ids:
-
         job = self.jobs[job_id]
         count = self.state.n_workers_at(job_id) + sum(
             self.state.n_workers_at(job_id, op_id) +
@@ -245,22 +256,6 @@ class DagSchedEnv:
             for op_id in range(len(job.ops))
         )
         return count
-
-        # counts[job_id] = count
-        # return counts
-
-
-
-
-    # def get_source_job_mask(self):
-    #     job_id = self.state.get_source_job()
-    #     if job_id is not None:
-    #         return torch.zeros(len(self.active_job_ids), dtype=torch.bool)
-
-    #     msk = torch.zeros(self.n_job_arrivals, dtype=torch.bool)
-    #     idx = bisect_left(self.active_job_ids, job_id)
-    #     msk[idx] = 1
-    #     return msk
 
 
 
@@ -401,7 +396,7 @@ class DagSchedEnv:
         if the the job contains unsaturated ops, otherwise
         moves them to the null pool
         '''
-        job_id = self.state.get_source_job()
+        job_id = self.state.source_job
         assert job_id is not None
         job = self.jobs[job_id]
         self.state.move_all_source_workers(job.saturated)
@@ -442,6 +437,7 @@ class DagSchedEnv:
     def _process_op_saturation(self, op, worker):
         job = self.jobs[op.job_id]
         job.add_op_saturation()
+        self.frontier_ops.remove(op)
 
         frontier_changed = False
 

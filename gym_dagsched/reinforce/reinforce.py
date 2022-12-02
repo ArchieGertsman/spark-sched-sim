@@ -27,6 +27,8 @@ def learn_from_trajectories(
     that were repeated on a fixed job arrival sequence, update the model 
     parameters using the REINFORCE algorithm as in the Decima paper.
     '''
+
+    # TODO: try normalizing advantages by std
     baselines = returns_batch.mean(axis=0)
     advantages_batch = returns_batch - baselines
 
@@ -48,7 +50,7 @@ def learn_from_trajectories(
 
 
 
-def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers):
+def invoke_agent(agent, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers):
     dag_batch, op_msk_batch, prlvl_msk_batch = obs_batch 
     num_jobs_per_env = torch.tensor(num_jobs_per_env, dtype=int, device=device)
 
@@ -59,8 +61,8 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job, n_worker
     ts[0] = time() - t
 
     t = time()
-    op_scores_batch, prlvl_scores_batch, num_ops_per_env, job_indptr = \
-        policy(
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env, env_indptr = \
+        agent(
             dag_batch,
             num_jobs_per_env,
             n_workers
@@ -68,8 +70,8 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job, n_worker
     ts[1] = time() - t
 
     t = time()
-    op_scores_batch, prlvl_scores_batch, num_ops_per_env, job_indptr = \
-        op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu(), job_indptr.cpu()
+    op_scores_batch, prlvl_scores_batch, num_ops_per_env, env_indptr = \
+        op_scores_batch.cpu(), prlvl_scores_batch.cpu(), num_ops_per_env.cpu(), env_indptr.cpu()
     ts[2] = time() - t
 
     t = time()
@@ -82,11 +84,11 @@ def invoke_policy(policy, obs_batch, num_jobs_per_env, num_ops_per_job, n_worker
     prlvl_scores_batch[idx[:,0], idx[:,1]] = torch.finfo(torch.float).min
     ts[3] = time() - t
 
-    return op_scores_batch, prlvl_scores_batch, job_indptr, ts
+    return op_scores_batch, prlvl_scores_batch, env_indptr, ts
 
 
 
-def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, job_indptr):
+def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, env_indptr):
     c_op = Categorical(logits=op_scores_batch)
     op_idx_batch = c_op.sample()
     op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
@@ -101,7 +103,7 @@ def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, job_indptr
     action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
 
     prlvl_entropy = Categorical(logits=prlvl_scores_batch).entropy()
-    prlvl_entropy_per_env = segment_add_csr(prlvl_entropy, job_indptr)
+    prlvl_entropy_per_env = segment_add_csr(prlvl_entropy, env_indptr)
     entropy_batch = c_op.entropy() + prlvl_entropy_per_env
 
     return op_id_batch, prlvl_batch, action_lgp_batch, entropy_batch
@@ -119,7 +121,7 @@ def compute_returns_batch(rewards_batch, discount):
 
 
 def train(
-    policy,
+    agent,
     optim,
     n_sequences,
     n_ep_per_seq,
@@ -142,7 +144,7 @@ def train(
 
     vec_env = VecDagSchedEnv(n=n_ep_per_seq)
 
-    policy.to(device)
+    agent.to(device)
 
     mean_ep_len = initial_mean_ep_len
     entropy_weight = entropy_weight_init
@@ -197,9 +199,9 @@ def train(
             rewards_batch[:, i] = reward_batch
 
             t = time()
-            op_scores_batch, prlvl_scores_batch, job_indptr, ts = \
-                invoke_policy(
-                    policy, 
+            op_scores_batch, prlvl_scores_batch, env_indptr, ts = \
+                invoke_agent(
+                    agent, 
                     obs_batch, 
                     vec_env.n_active_jobs_batch,
                     vec_env.n_ops_per_job_batch,
@@ -214,7 +216,7 @@ def train(
                     vec_env, 
                     op_scores_batch, 
                     prlvl_scores_batch,
-                    job_indptr
+                    env_indptr
                 )
             t_sample += time() - t
 

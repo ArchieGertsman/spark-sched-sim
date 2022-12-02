@@ -69,13 +69,25 @@ class OpNode:
 
 class State:
 
+
     @property
     def all_source_workers_committed(self):
-        return self._n_commitments_from(self._curr_source) == self._n_workers_at(self._curr_source)
+        return self.num_uncommitted_source_workers == 0
+
+    @property
+    def num_uncommitted_source_workers(self):
+        return self._n_workers_at(self._curr_source) - self._n_commitments_from(self._curr_source)
 
     @property
     def null_pool_has_workers(self):
         return self.G.in_degree(NullNode()) > 0
+
+    @property
+    def source_job(self):
+        if isinstance(self._curr_source, NullNode):
+            return None
+        else:
+            return self._curr_source.job_id
 
 
 
@@ -305,14 +317,6 @@ class State:
 
         for worker_id in source_workers:
             move_func(worker_id)
-
-
-
-    def get_source_job(self):
-        if isinstance(self._curr_source, NullNode):
-            return None
-        else:
-            return self._curr_source.job_id
 
 
 

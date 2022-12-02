@@ -1,70 +1,34 @@
-from dataclasses import dataclass
-from typing import List
 from time import time
-from torch.multiprocessing import Process, Pipe
-
 
 import torch
+from torch.multiprocessing import Process, Pipe
 import numpy as np
 from torch_geometric.data import Batch
 
 from gym_dagsched.data_generation.tpch_datagen import TPCHDataGen
 
 from .env_run import env_run
+from .shared_obs import SharedObs
 from ..utils.misc import construct_subbatch
 
 
 
-@dataclass
-class SharedObs:
-    '''contains all of the shared memory tensors
-    that each environment needs to communicate
-    its observations with the main process,
-    without having to send data through pipes. 
-    Each environment gets its own instance of 
-    this dataclass.
-    '''
-
-    # list of feature tensors for each job
-    # in the environment. Rows correspond
-    # to operations within the job, and columns
-    # are the features.
-    # shape[i]: torch.Size([num_ops_per_job[i], num_features])
-    feature_tensor_chunks: List[torch.Tensor]
-
-    # mask that indicated which jobs are
-    # currently active
-    # shape: torch.Size([num_job_arrivals])
-    active_job_msk: torch.BoolTensor
-
-    # mask that indicates which operations
-    # are valid selections in each job.
-    # shape: torch.Size([num_job_arrivals, max_ops_in_a_job])
-    op_msk: torch.BoolTensor
-
-    # mask that indicates which parallelism
-    # limits are valid for each job
-    # shape: torch.Size([num_job_arrivals, num_workers])
-    prlvl_msk: torch.BoolTensor
-
-    # reward signal
-    # shape: torch.Size([])
-    reward: torch.Tensor
-
-    # whether or not the episode is done
-    # shape: torch.Size([])
-    done: torch.BoolTensor
-
-
 
 class VecDagSchedEnv:
+
     def __init__(self, n):
         self.n = n
         self.datagen = TPCHDataGen(np.random.RandomState())
 
 
 
+
+    ## API methods
+
     def run(self):
+        '''starts `self.n` subprocesses and creates
+        pipes for communicting with them
+        '''
         self.procs = []
         self.conns = []
         for rank in range(self.n):
@@ -77,6 +41,7 @@ class VecDagSchedEnv:
 
 
     def terminate(self):
+        '''closes pipes and joins subprocesses'''
         [conn.send(None) for conn in self.conns]
         [proc.join() for proc in self.procs]
 
@@ -90,43 +55,17 @@ class VecDagSchedEnv:
         workers = self.datagen.workers(n_workers)
 
         self.n_job_arrivals = n_job_arrivals
-        self._init_dag_batch(initial_timeline)
-
         self.n_workers = len(workers)
         self.op_counts = \
             torch.tensor([len(e.job.ops) for _,_,e in initial_timeline.pq])
         self.max_ops = self.op_counts.max()
 
+        self._reset_dag_batch(initial_timeline)
+
         self._reset_shared_obs_data()
 
-        it = zip(
-            self.conns,
-            self.active_job_msk_chunks,
-            self.op_msk_chunks,
-            self.prlvl_msk_chunks,
-            self.reward_chunks,
-            self.done_chunks
-        )
-
-        for i, conn, active_job_msk, op_msk, prlvl_msk, reward, done in enumerate(it):
-            # get feature tensor chunks that correspond with 
-            # this environment only
-            start = i * self.n_job_arrivals
-            end = start + self.n_job_arrivals
-            feature_tensor_chunks = self.feature_tensor_chunks[start : end]
-
-            shared_obs = SharedObs(
-                feature_tensor_chunks,
-                active_job_msk,
-                op_msk,
-                prlvl_msk,
-                reward,
-                done)
-
-            conn.send(('reset', (n_job_arrivals, n_init_jobs, mjit, n_workers, shared_obs)))
-            
         avg_job_duration_batch, n_completed_jobs_batch = \
-            list(zip(*[conn.recv() for conn in self.conns]))
+            self._reset_envs(n_init_jobs, mjit, n_workers)
 
         print('done resetting')
 
@@ -137,36 +76,72 @@ class VecDagSchedEnv:
 
         return self._parse_prev_episode_stats(avg_job_duration_batch, n_completed_jobs_batch)
 
+        
 
-    
+    def step(self, op_id_batch=None, prlvl_batch=None):
+        self._step_envs(op_id_batch, prlvl_batch)
+        return self._observe(), self.reward_batch, self.done_batch
+
+
+
+    def find_job_indices(self, op_idx_batch):
+        job_idx_batch = torch.zeros_like(op_idx_batch)
+        op_id_batch = [None] * len(op_idx_batch)
+
+        it = enumerate(zip(
+            op_idx_batch, 
+            self.active_job_msk_batch
+        ))
+
+        n_jobs_traversed = 0
+        for i, (op_idx, active_job_msk) in it:
+            op_idx = op_idx.item()
+            active_job_ids = active_job_msk.nonzero().flatten()
+
+            op_counts = self.op_counts[active_job_ids]
+            cum = torch.cumsum(op_counts, 0)
+            j = (op_idx >= cum).sum()
+
+            job_idx_batch[i] = n_jobs_traversed + j
+
+            job_id = active_job_ids[j]
+            op_id = op_idx - (cum[j-1] if j>0 else 0)
+            op_id_batch[i] = (job_id, op_id)
+
+            n_jobs_traversed += len(active_job_ids)
+
+        return job_idx_batch, op_id_batch
+
+
+
+
+    ## reset helpers
+
+    def _reset_dag_batch(self, initial_timeline):
+        data_list = [e.job.init_pyg_data() for _,_,e in initial_timeline.pq]
+        self.dag_batch = Batch.from_data_list(data_list * self.n)
+
+
+
     def _reset_shared_obs_data(self):
-        self.feature_tensor_chunks = self._get_feature_tensor_chunks()
+        self.feature_tensor_chunks = self._chunk_feature_tensor()
 
-        self.active_job_msk_batch, self.active_job_msk_chunks = \
-            self._zeros_batch((self.n_job_arrivals,))
+        self.active_job_msk_batch = \
+            torch.zeros((self.n, self.n_job_arrivals), dtype=torch.bool)
 
-        self.op_msk_batch, self.op_msk_chunks = \
-            self._zeros_batch((self.n_job_arrivals, self.max_ops))
+        self.op_msk_batch = \
+            torch.zeros((self.n, self.n_job_arrivals, self.max_ops), dtype=torch.bool)
 
-        self.prlvl_msk_batch, self.prlvl_msk_chunks = \
-            self._zeros_batch((self.n_job_arrivals, self.n_workers))
+        self.prlvl_msk_batch = \
+            torch.zeros((self.n, self.n_job_arrivals, self.n_workers), dtype=torch.bool)
 
-        self.reward_batch, self.reward_chunks = self._zeros_batch((1,))
+        self.reward_batch = torch.zeros(self.n)
 
-        self.done_batch, self.done_chunks = self._zeros_batch((1,))
-
-
-
-    def _zeros_batch(self, shape):
-        shape = list(shape)
-        shape[0] *= self.n
-        batch = torch.zeros(shape)
-        chunks = torch.chunk(batch, self.n)
-        return batch, chunks
+        self.done_batch = torch.zeros(self.n, dtype=torch.bool)
 
 
 
-    def _get_feature_tensor_chunks(self):
+    def _chunk_feature_tensor(self):
         '''returns a list of chunks of the feature tensor,
         where there is one chunk per job, per environment,
         i.e. the list has length `self.n * self.n_job_arrivals`.
@@ -180,6 +155,50 @@ class VecDagSchedEnv:
 
 
 
+    def _reset_envs(self, n_init_jobs, mjit, n_workers):
+        it = zip(
+            self.conns,
+            self.active_job_msk_batch,
+            self.op_msk_batch,
+            self.prlvl_msk_batch,
+            self.reward_batch,
+            self.done_batch
+        )
+
+        for env_idx, conn, active_job_msk, op_msk, prlvl_msk, reward, done in enumerate(it):
+            shared_obs = SharedObs(
+                self._get_env_feature_tensor_chunks(env_idx),
+                active_job_msk,
+                op_msk,
+                prlvl_msk,
+                reward,
+                done)
+
+            conn.send(('reset', (
+                self.n_job_arrivals, 
+                n_init_jobs, 
+                mjit, 
+                n_workers, 
+                shared_obs
+            )))
+            
+        avg_job_duration_batch, n_completed_jobs_batch = \
+            list(zip(*[conn.recv() for conn in self.conns]))
+
+        return avg_job_duration_batch, n_completed_jobs_batch
+
+
+
+    def _get_env_feature_tensor_chunks(self, env_idx):
+        '''get feature tensor chunks that correspond with 
+        this environment only
+        '''
+        start = env_idx * self.n_job_arrivals
+        end = start + self.n_job_arrivals
+        return self.feature_tensor_chunks[start : end]
+
+
+
     @classmethod
     def _parse_prev_episode_stats(cls, avg_job_duration_batch, n_completed_jobs_batch):
         if avg_job_duration_batch[0] is not None:
@@ -189,12 +208,15 @@ class VecDagSchedEnv:
             avg_job_duration_mean, n_completed_jobs_mean = None, None
         return avg_job_duration_mean, n_completed_jobs_mean
 
-        
 
-    def step(self, op_id_batch=None, prlvl_batch=None):
+
+
+    ## step helpers
+
+    def _step_envs(self, op_id_batch, prlvl_batch):
         i = 0
         for done, conn in zip(self.done_batch, self.conns):
-            if not done and prlvl_batch is not None:
+            if not done.item() and prlvl_batch is not None:
                 op_id, prlvl = op_id_batch[i], prlvl_batch[i].item()
                 i += 1
             else:
@@ -206,8 +228,6 @@ class VecDagSchedEnv:
         [conn.recv() for conn in self.conns]
         self.t_step += time() - t
 
-        return self._observe(), self.reward_batch, self.done_batch
-
 
 
     def _observe(self):
@@ -215,17 +235,11 @@ class VecDagSchedEnv:
             return None
 
         dag_batch = self._construct_dag_batch()
-        op_msk_batch = self.op_msk_batch[self.active_job_msk_batch]
-        prlvl_msk_batch = self.prlvl_msk_batch[self.active_job_msk_batch]
+        op_msk_batch = self.op_msk_batch[self.active_job_msk_batch].flatten(end_dim=1)
+        prlvl_msk_batch = self.prlvl_msk_batch[self.active_job_msk_batch].flatten(end_dim=1)
         
         obs = (dag_batch, op_msk_batch, prlvl_msk_batch)
         return obs
-
-    
-
-    def _init_dag_batch(self, initial_timeline):
-        data_list = [e.job.init_pyg_data() for _,_,e in initial_timeline.pq]
-        self.dag_batch = Batch.from_data_list(data_list * self.n)
 
 
 
@@ -233,37 +247,8 @@ class VecDagSchedEnv:
         done = torch.repeat_interleave(self.done_batch, self.n_job_arrivals)
 
         # include job dags that are currently active and whose env is not done and 
-        mask = ~done & self.active_job_msk_batch
+        mask = ~done & self.active_job_msk_batch.flatten()
 
         subbatch = construct_subbatch(self.dag_batch, mask)
         return subbatch
-
-
-
-    def find_job_indices(self, op_idx_batch):
-        job_idx_batch = torch.zeros_like(op_idx_batch)
-        op_id_batch = [None] * len(op_idx_batch)
-
-        it = enumerate(zip(
-            op_idx_batch, 
-            self.active_job_msk_chunks
-        ))
-
-        n_jobs_traversed = 0
-        for i, (op_idx, active_job_msk) in it:
-            active_job_ids = active_job_msk.nonzero().flatten()
-
-            op_counts = self.op_counts[active_job_ids]
-            cum = torch.cumsum(op_counts, 0)
-            j = (op_idx >= cum).sum()
-
-            job_idx_batch[i] = n_jobs_traversed + j
-
-            job_id = active_job_ids[j]
-            op_id = op_idx - (cum[j-1] if j>0 else 0)
-            op_id_batch[i] = (job_id.item(), op_id.item())
-
-            n_jobs_traversed += len(active_job_ids)
-
-        return job_idx_batch, op_id_batch
 

@@ -6,13 +6,13 @@ from gym_dagsched.reinforce import reinforce
 
 
 if __name__ == '__main__':
-    policy = ActorNetwork()
-    optim = torch.optim.Adam(policy.parameters(), lr=.005)
+    agent = ActorNetwork(5, 3)
+    optim = torch.optim.Adam(agent.parameters(), lr=.005)
 
     writer = SummaryWriter('tensorboard')
 
     reinforce.train(
-        policy,
+        agent,
         optim,
         n_sequences=2,
         n_ep_per_seq=16,
@@ -30,4 +30,4 @@ if __name__ == '__main__':
         writer=writer
     )
 
-    torch.save(policy.state_dict(), 'policy.pt')
+    torch.save(agent.state_dict(), 'agent.pt')
