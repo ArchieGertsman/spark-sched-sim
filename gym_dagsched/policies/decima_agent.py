@@ -55,31 +55,41 @@ class GraphEncoderNetwork(nn.Module):
     def __init__(self, num_node_features, dim_embed):
         super().__init__()
         self.conv1 = GCNConv(num_node_features, dim_embed)
-        self.mlp_dag = make_mlp(num_node_features + dim_embed, dim_embed)
-        self.mlp_global = make_mlp(dim_embed, dim_embed)
+        self.mlp_node = make_mlp(num_node_features + dim_embed, dim_embed)
+        self.mlp_dag = make_mlp(dim_embed, dim_embed)
 
 
     def forward(self, dag_batch, env_indptr):
-        x = self._compute_node_level_embeddings(dag_batch)
-        y = self._compute_dag_level_embeddings(x, dag_batch)
-        z = self._compute_global_embeddings(y, env_indptr)
-        return x, y, z
+        node_embeddings = self._compute_node_level_embeddings(dag_batch)
+        dag_embeddings = self._compute_dag_level_embeddings(dag_batch, node_embeddings)
+        global_embeddings = self._compute_global_embeddings(dag_embeddings, env_indptr)
+        return node_embeddings, dag_embeddings, global_embeddings
 
     
     def _compute_node_level_embeddings(self, dag_batch):
         return self.conv1(dag_batch.x, dag_batch.edge_index)
     
 
-    def _compute_dag_level_embeddings(self, x, dag_batch):
-        x_combined = torch.cat([dag_batch.x, x], dim=1)
-        y = gnn.global_add_pool(x_combined, dag_batch.batch)
-        y = self.mlp_dag(y)
+    def _compute_dag_level_embeddings(self, dag_batch, node_embeddings):
+        # merge original node features with new node embeddings
+        nodes_merged = torch.cat([dag_batch.x, node_embeddings], dim=1)
+
+        # pass combined node features through mlp
+        nodes_merged = self.mlp_node(nodes_merged)
+
+        # for each dag, add together its nodes
+        # to obtain the dag embeding
+        y = gnn.global_add_pool(nodes_merged, dag_batch.batch)
         return y
     
 
-    def _compute_global_embeddings(self, y, env_indptr):
-        z = segment_add_csr(y, env_indptr)
-        z = self.mlp_global(z)
+    def _compute_global_embeddings(self, dag_embeddings, env_indptr):
+        # pass dag embeddings through mlp
+        dag_embeddings = self.mlp_dag(dag_embeddings)
+
+        # for each env, add together its dags
+        # to obtain the global embedding
+        z = segment_add_csr(dag_embeddings, env_indptr)
         return z
         
         
@@ -88,37 +98,37 @@ class PolicyNetwork(nn.Module):
     def __init__(self, num_node_features, num_dag_features, dim_embed):
         super().__init__()
         self.num_dag_features = num_dag_features
-        self.mlp_op_score = make_mlp(num_node_features + 3*dim_embed, 1)
-        self.mlp_prlvl_score = make_mlp(num_dag_features + 2*dim_embed + 1, 1)
+        self.mlp_node_score = make_mlp(num_node_features + 3*dim_embed, 1)
+        self.mlp_dag_score = make_mlp(num_dag_features + 2*dim_embed + 1, 1)
         
-    
+
+
     def forward(self,   
-        node_x, # node features
-        x,      # node embeddings
-        y,      # dag embeddings
-        z,      # global embeddings
-        n_workers,
+        node_features, 
+        node_embeddings,
+        dag_embeddings, 
+        global_embeddings,
         num_ops_per_job,
         num_ops_per_env,
         num_jobs_per_env,
+        n_workers,
         batch_ptr
     ):
         op_scores = self._compute_op_scores(
-            node_x, 
-            x, 
-            y, 
-            z, 
+            node_features, 
+            node_embeddings, 
+            dag_embeddings, 
+            global_embeddings, 
             num_ops_per_job, 
             num_ops_per_env)
 
-        # extract dag-level features from
-        # node feature tensor
-        dag_x = node_x[batch_ptr, :self.num_dag_features]
-        
+        # extract dag-level features from node features
+        dag_features = node_features[batch_ptr[:-1], :self.num_dag_features]
+
         prlvl_scores = self._compute_prlvl_scores(
-            dag_x, 
-            y, 
-            z, 
+            dag_features, 
+            dag_embeddings, 
+            global_embeddings, 
             n_workers, 
             num_jobs_per_env)
 
@@ -126,45 +136,78 @@ class PolicyNetwork(nn.Module):
     
     
     def _compute_op_scores(self, 
-        node_x, 
-        x, 
-        y, 
-        z,      
+        node_features, 
+        node_embeddings, 
+        dag_embeddings, 
+        global_embeddings,      
         num_ops_per_job, 
         num_ops_per_env
     ):
-        y_repeat = torch.repeat_interleave(y, num_ops_per_job, dim=0)
+        dag_embeddings_repeat = \
+            torch.repeat_interleave(
+                dag_embeddings, 
+                num_ops_per_job, 
+                dim=0)
         
-        z_repeat = torch.repeat_interleave(z, num_ops_per_env, dim=0)
-        
-        op_scores = torch.cat([node_x, x, y_repeat, z_repeat], dim=1)
+        global_embeddings_repeat = \
+            torch.repeat_interleave(
+                global_embeddings, 
+                num_ops_per_env, 
+                dim=0)
 
-        op_scores = self.mlp_op_score(op_scores).squeeze(-1)
+        nodes_merged = torch.cat([
+            node_features, 
+            node_embeddings, 
+            dag_embeddings_repeat, 
+            global_embeddings_repeat], dim=1)
 
-        return op_scores
+        node_scores = self.mlp_node_score(nodes_merged).squeeze(-1)
+        return node_scores
     
     
     def _compute_prlvl_scores(self, 
-        dag_x, 
-        y, 
-        z, 
+        dag_features, 
+        dag_embeddings, 
+        global_embeddings, 
         n_workers, 
         num_jobs_per_env
     ):
-        num_total_jobs = num_jobs_per_env.sum()
+        num_total_jobs = num_jobs_per_env.sum().item()
 
-        limits = torch.arange(n_workers, device=device)
-        limits = limits.repeat(num_total_jobs).unsqueeze(1)
-        
-        y_repeat = torch.repeat_interleave(y, n_workers, dim=0)
-        z_repeat = torch.repeat_interleave(z, num_jobs_per_env * n_workers, dim=0)
-        
-        prlvl_scores = torch.cat([dag_x, limits, y_repeat, z_repeat], dim=1)
-        prlvl_scores = prlvl_scores.reshape(num_total_jobs, n_workers, prlvl_scores.shape[1])
-        
-        prlvl_scores = self.mlp_prlvl_score(prlvl_scores).squeeze(-1)
+        worker_actions = torch.arange(n_workers, device=device)
+        worker_actions = worker_actions.repeat(num_total_jobs).unsqueeze(1)
 
-        return prlvl_scores
+        dag_features_repeat = \
+            torch.repeat_interleave(
+                dag_features, 
+                n_workers, 
+                dim=0)
+        
+        dag_embeddings_repeat = \
+            torch.repeat_interleave(
+                dag_embeddings, 
+                n_workers, 
+                dim=0)
+
+        global_embeddings_repeat = \
+            torch.repeat_interleave(
+                global_embeddings, 
+                num_jobs_per_env * n_workers, 
+                dim=0)
+        
+        dags_merged = torch.cat([
+            dag_features_repeat,  
+            dag_embeddings_repeat, 
+            global_embeddings_repeat,
+            worker_actions], dim=1)
+
+        dags_merged = dags_merged.reshape(
+            num_total_jobs, 
+            n_workers, 
+            dags_merged.shape[1])
+        
+        dag_scores = self.mlp_dag_score(dags_merged).squeeze(-1)
+        return dag_scores
 
     
     
@@ -185,13 +228,14 @@ class ActorNetwork(nn.Module):
         env_indptr, num_ops_per_job, num_ops_per_env = \
             self._bookkeep(num_jobs_per_env, dag_batch)
 
-        x, y, z = self.encoder(dag_batch, env_indptr)
+        node_embeddings, dag_embeddings, global_embeddings = \
+            self.encoder(dag_batch, env_indptr)
 
         op_scores, prlvl_scores = self.policy_network(
             dag_batch.x,
-            x, 
-            y, 
-            z,
+            node_embeddings, 
+            dag_embeddings, 
+            global_embeddings,
             num_ops_per_job,
             num_ops_per_env,
             num_jobs_per_env,

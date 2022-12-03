@@ -40,7 +40,7 @@ class Job:
 
     local_workers = set()
 
-    x_ptr = None
+    # x_ptr = None
 
     n_avail_local = 0
 

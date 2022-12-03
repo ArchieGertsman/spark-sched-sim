@@ -100,7 +100,7 @@ class DagSchedEnv:
 
         self.t_step = 0
 
-        self.state.reset()
+        self.state.reset(self.n_workers)
 
         self.selected_ops = set()
 
@@ -140,7 +140,14 @@ class DagSchedEnv:
         # take action
         (job_id, op_id), n_workers = action
 
-        op = self.jobs[job_id].ops[op_id]
+        assert job_id in self.active_job_ids
+        job = self.jobs[job_id]
+
+        assert op_id < len(job.ops)
+        op = job.ops[op_id]
+
+        # TODO: set of valid nodes becomes zero
+        print(len(self.frontier_ops - self.selected_ops))
         assert op in (self.frontier_ops - self.selected_ops)
 
         # commit `n_workers` workers from the current worker
@@ -219,13 +226,17 @@ class DagSchedEnv:
     def _update_op_mask(self):
         self.shared_obs.op_msk.zero_()
 
+        valid_ops = self.frontier_ops - self.selected_ops
+        if len(valid_ops) == 0:
+            return
+
         # get (job_id, op_id) pairs for each operation
         # that is in the frontier but hasn't been selected
         # yet during this committment round
-        id_pairs = (
+        id_pairs = [
             (op.job_id, op.id_) 
-            for op in iter(self.frontier_ops - self.selected_ops)
-        )
+            for op in iter(valid_ops)
+        ]
 
         # split pairs into two lists
         job_ids, op_ids = list(zip(*id_pairs))
@@ -277,7 +288,7 @@ class DagSchedEnv:
     ## Job arrivals
 
     def _process_job_arrival(self, job):
-        job.x_ptr = self.x_ptrs[job.id_]
+        # job.x_ptr = self.x_ptrs[job.id_]
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         self.state.add_job(job.id_)

@@ -208,6 +208,8 @@ class State:
 
     def n_workers_at(self, job_id=None, op_id=None):
         node = self._parse_source(job_id, op_id)
+        if node not in self.G:
+            return 0
         return self._n_workers_at(node)
 
 
@@ -219,12 +221,16 @@ class State:
 
     def n_commitments_from(self, job_id=None, op_id=None):
         node = self._parse_source(job_id, op_id)
+        if node not in self.G:
+            return 0
         return self._n_commitments_from(node)
 
 
 
     def n_commitments_to(self, job_id=None, op_id=None):
         node = self._parse_source(job_id, op_id)
+        if node not in self.G:
+            return 0
         return self._n_commitments_to(node)
 
 

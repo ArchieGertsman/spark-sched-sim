@@ -76,7 +76,7 @@ class VecDagSchedEnv:
 
         self._reset_shared_obs_data()
 
-        self.prev_episode_stats = \
+        self.prev_episode_stats_batch = \
             self._reset_envs(n_init_jobs, mjit, n_workers)
 
         print('done resetting')
@@ -91,10 +91,11 @@ class VecDagSchedEnv:
 
 
     def get_prev_episode_stats(self):
-        if self.prev_episode_stats is None:
+        if self.prev_episode_stats_batch[0] is None:
             return None
-        
-        avg_job_duration_batch, n_completed_jobs_batch = self.prev_episode_stats
+
+        avg_job_duration_batch, n_completed_jobs_batch = \
+            list(zip(*self.prev_episode_stats_batch))
 
         avg_job_duration_mean = np.mean(avg_job_duration_batch)
         n_completed_jobs_mean = np.mean(n_completed_jobs_batch)
@@ -109,7 +110,7 @@ class VecDagSchedEnv:
 
 
 
-    def find_job_indices(self, op_idx_batch):
+    def translate_op_selections(self, op_idx_batch):
         job_idx_batch = torch.zeros_like(op_idx_batch)
         op_id_batch = [None] * len(op_idx_batch)
 
@@ -129,7 +130,7 @@ class VecDagSchedEnv:
 
             job_idx_batch[i] = n_jobs_traversed + j
 
-            job_id = active_job_ids[j]
+            job_id = active_job_ids[j].item()
             op_id = op_idx - (cum[j-1] if j>0 else 0)
             op_id_batch[i] = (job_id, op_id)
 
@@ -190,7 +191,7 @@ class VecDagSchedEnv:
             self.done_batch
         )
 
-        for env_idx, conn, active_job_msk, op_msk, prlvl_msk, reward, done in enumerate(it):
+        for env_idx, (conn, active_job_msk, op_msk, prlvl_msk, reward, done) in enumerate(it):
             shared_obs = SharedObs(
                 self._get_env_feature_tensor_chunks(env_idx),
                 active_job_msk,
@@ -206,11 +207,9 @@ class VecDagSchedEnv:
                 n_workers, 
                 shared_obs
             )))
-            
-        avg_job_duration_batch, n_completed_jobs_batch = \
-            list(zip(*[conn.recv() for conn in self.conns]))
 
-        return avg_job_duration_batch, n_completed_jobs_batch
+        prev_episode_stats_batch = [conn.recv() for conn in self.conns]
+        return prev_episode_stats_batch
 
 
 
@@ -249,8 +248,8 @@ class VecDagSchedEnv:
             return None
 
         dag_batch = self._construct_dag_batch()
-        op_msk_batch = self.op_msk_batch[self.active_job_msk_batch].flatten(end_dim=1)
-        prlvl_msk_batch = self.prlvl_msk_batch[self.active_job_msk_batch].flatten(end_dim=1)
+        op_msk_batch = self.op_msk_batch[self.active_job_msk_batch]
+        prlvl_msk_batch = self.prlvl_msk_batch[self.active_job_msk_batch]
         
         obs = (dag_batch, op_msk_batch, prlvl_msk_batch)
         return obs

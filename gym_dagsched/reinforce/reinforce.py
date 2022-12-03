@@ -52,11 +52,11 @@ def learn_from_trajectories(
 
 def invoke_agent(agent, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers):
     dag_batch, op_msk_batch, prlvl_msk_batch = obs_batch 
-    num_jobs_per_env = torch.tensor(num_jobs_per_env, dtype=int, device=device)
 
     ts = np.zeros(4)
 
     t = time()
+    num_jobs_per_env = num_jobs_per_env.to(device=device)
     dag_batch = dag_batch.to(device=device)
     ts[0] = time() - t
 
@@ -75,6 +75,7 @@ def invoke_agent(agent, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers)
     ts[2] = time() - t
 
     t = time()
+
     op_msk_batch = op_msk_batch[num_ops_per_job[:,None] > torch.arange(op_msk_batch.shape[1])]
     op_scores_batch[(~op_msk_batch).nonzero()] = torch.finfo(torch.float).min
     op_scores_list = torch.split(op_scores_batch, num_ops_per_env.tolist())
@@ -89,26 +90,56 @@ def invoke_agent(agent, obs_batch, num_jobs_per_env, num_ops_per_job, n_workers)
 
 
 def sample_action_batch(vec_env, op_scores_batch, prlvl_scores_batch, env_indptr):
-    c_op = Categorical(logits=op_scores_batch)
-    op_idx_batch = c_op.sample()
-    op_idx_lgp_batch = c_op.log_prob(op_idx_batch)
+    # batched operation selection
+    op_idx_batch, op_idx_lgp_batch, op_entropy_batch = \
+        sample_op_idx_batch(op_scores_batch)
 
-    job_idx_batch, op_id_batch = vec_env.find_job_indices(op_idx_batch)
+    job_idx_batch, op_id_batch = vec_env.translate_op_selections(op_idx_batch)
 
-    prlvl_scores_batch_selected = prlvl_scores_batch[job_idx_batch]
-    c_prlvl = Categorical(logits=prlvl_scores_batch_selected)
-    prlvl_batch = c_prlvl.sample()
-    prlvl_lgp_batch = c_prlvl.log_prob(prlvl_batch)
-
-    action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
-
-    prlvl_entropy = Categorical(logits=prlvl_scores_batch).entropy()
-    prlvl_entropy_per_env = segment_add_csr(prlvl_entropy, env_indptr)
-    entropy_batch = c_op.entropy() + prlvl_entropy_per_env
+    # batched parallelism level selection
+    prlvl_batch, prlvl_lgp_batch, prlvl_entropy_batch = \
+        sample_prlvl_batch(prlvl_scores_batch, job_idx_batch, env_indptr)
 
     action_batch = (op_id_batch, prlvl_batch)
+    action_lgp_batch = op_idx_lgp_batch + prlvl_lgp_batch
+    entropy_batch = op_entropy_batch + prlvl_entropy_batch
 
     return action_batch, action_lgp_batch, entropy_batch
+
+
+
+def sample_op_idx_batch(op_scores_batch):
+    '''sample index of next operation for each env.
+    Returns the operation selections, the log-probability 
+    of each selection, and the entropy of policy distribution
+    '''
+    c = Categorical(logits=op_scores_batch)
+    op_idx_batch = c.sample()
+    lgp_batch = c.log_prob(op_idx_batch)
+    entropy_batch = c.entropy()
+    return op_idx_batch, lgp_batch, entropy_batch
+
+
+
+def sample_prlvl_batch(prlvl_scores_batch, job_idx_batch, env_indptr):
+    '''sample parallelism level for the job of each selected 
+    operation for each env.
+    Returns the parallelism level selections, the log-probability
+    of each selection, and the 
+    '''
+    prlvl_scores_batch_selected = prlvl_scores_batch[job_idx_batch]
+    c = Categorical(logits=prlvl_scores_batch_selected)
+    prlvl_batch = c.sample()
+    lgp_batch = c.log_prob(prlvl_batch)
+    entropy_batch = compute_prlvl_entropy_batch(prlvl_scores_batch, env_indptr)
+    return prlvl_batch, lgp_batch, entropy_batch
+
+
+
+def compute_prlvl_entropy_batch(prlvl_scores_batch, env_indptr):
+    entropy = Categorical(logits=prlvl_scores_batch).entropy()
+    entropy_batch = segment_add_csr(entropy, env_indptr)
+    return entropy_batch
 
 
 
@@ -186,6 +217,8 @@ def train(
                 prev_episode_stats
             )
 
+        done_batch = torch.zeros(n_ep_per_seq, dtype=torch.bool)
+
         action_lgps_batch = torch.zeros((vec_env.n, ep_len))
         rewards_batch = torch.zeros((vec_env.n, ep_len))
         entropies_batch = torch.zeros((vec_env.n, ep_len))
@@ -196,7 +229,6 @@ def train(
 
         i = 0
         while i < ep_len and not done_batch.all():
-            rewards_batch[:, i] = reward_batch
 
             t = time()
             op_scores_batch, prlvl_scores_batch, env_indptr, ts = \
@@ -220,13 +252,14 @@ def train(
                 )
             t_sample += time() - t
 
-            action_lgps_batch[participating_idxs, i] = action_lgp_batch
-            entropies_batch[participating_idxs, i] = entropy_batch
-
             t = time()
             obs_batch, reward_batch, done_batch = \
                 vec_env.step(action_batch)
             t_env += time() - t
+
+            rewards_batch[:, i] = reward_batch
+            action_lgps_batch[participating_idxs, i] = action_lgp_batch
+            entropies_batch[participating_idxs, i] = entropy_batch
             
             participating_idxs = (~done_batch).nonzero().flatten()
             
