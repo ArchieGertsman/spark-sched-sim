@@ -60,6 +60,7 @@ class TPCHDataGen(DataGen):
             d.clear()
         job = Job(id_=id, ops=ops, dag=dag, t_arrival=t_arrival)
         job.local_workers = set()
+        job.frontier_ops = set()
         
         return job
 

@@ -31,6 +31,8 @@ class Operation:
         self.completed_tasks = set()
         self.remaining_time = np.inf
 
+        self.saturated = False
+
 
     def __hash__(self):
         return hash(self.__unique_id)
@@ -59,10 +61,10 @@ class Operation:
     def next_task_id(self):
         return self.n_saturated_tasks
 
-    @property
-    def saturated(self):
-        assert self.n_saturated_tasks <= self.n_tasks
-        return self.n_saturated_tasks == self.n_tasks
+    # @property
+    # def saturated(self):
+    #     assert self.n_saturated_tasks <= self.n_tasks
+    #     return self.n_saturated_tasks == self.n_tasks
 
     @property
     def n_remaining_tasks(self):
@@ -72,6 +74,16 @@ class Operation:
     def approx_remaining_work(self):
         return self.most_recent_duration * self.n_remaining_tasks
         
+
+
+    def check_criterion(self, criterion):
+        if criterion == 'saturated':
+            return self.saturated
+        elif criterion == 'completed':
+            return self.completed
+        else:
+            raise Exception('Operation.check_criterion: invalid criterion')
+
 
 
     def sample_executor_key(self, num_executors, executor_interval_map):

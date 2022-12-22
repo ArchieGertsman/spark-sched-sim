@@ -131,7 +131,7 @@ class VecDagSchedEnv:
             job_idx_batch[i] = n_jobs_traversed + j
 
             job_id = active_job_ids[j].item()
-            op_id = op_idx - (cum[j-1] if j>0 else 0)
+            op_id = op_idx - (cum[j-1].item() if j>0 else 0)
             op_id_batch[i] = (job_id, op_id)
 
             n_jobs_traversed += len(active_job_ids)
@@ -230,7 +230,11 @@ class VecDagSchedEnv:
         i = 0
         for done, conn in zip(self.done_batch, self.conns):
             if not done.item():
-                action = (op_id_batch[i], prlvl_batch[i].item())
+                op_id = op_id_batch[i]
+                # shift selection from {0,...,max-1} to {1,...,max}
+                # by adding 1
+                prlvl = 1 + prlvl_batch[i].item()
+                action = (op_id, prlvl)
                 i += 1
             else:
                 action = None
@@ -259,7 +263,7 @@ class VecDagSchedEnv:
     def _construct_dag_batch(self):
         done = torch.repeat_interleave(self.done_batch, self.n_job_arrivals)
 
-        # include job dags that are currently active and whose env is not done and 
+        # include job dags whose env is not done and that are currently active
         mask = ~done & self.active_job_msk_batch.flatten()
 
         subbatch = construct_subbatch(self.dag_batch, mask)

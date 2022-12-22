@@ -20,11 +20,17 @@ class OpState(Enum):
         - outgoing edges: none
     '''
 
-    # source
-    SRC = auto()
+    # # source
+    # SRC = auto()
 
-    # destination
-    DST = auto()
+    # # destination
+    # DST = auto()
+
+    COMMITTED = auto()
+
+    MOVING = auto()
+
+    PRESENT = auto()
 
 
 
@@ -34,11 +40,11 @@ class Attr(Enum):
     # edge attr: number of commitments from src to dst
     N_COMMITMENTS = auto()
 
-    # node attr: is operation completed?
+    # node attr: is the operation or job completed?
     COMPLETED = auto()
 
     # node attr: is the worker en route to some operation?
-    MOVING = auto()
+    # MOVING = auto()
 
 
 
@@ -76,7 +82,16 @@ class State:
 
     @property
     def num_uncommitted_source_workers(self):
-        return self._n_workers_at(self._curr_source) - self._n_commitments_from(self._curr_source)
+        n_uncommitted = self._n_workers_at(self._curr_source) - \
+            self._n_commitments_from(self._curr_source)
+        assert n_uncommitted >= 0
+        return n_uncommitted
+
+    def _num_uncommitted_workers(self, source):
+        n_uncommitted = self._n_workers_at(source) - \
+            self._n_commitments_from(source)
+        assert n_uncommitted >= 0
+        return n_uncommitted
 
     @property
     def null_pool_has_workers(self):
@@ -88,6 +103,16 @@ class State:
             return None
         else:
             return self._curr_source.job_id
+
+
+    def get_source(self):
+        if isinstance(self._curr_source, NullNode):
+            return None, None
+        elif isinstance(self._curr_source, JobNode):
+            return self._curr_source.job_id, None
+        else:
+            return self._curr_source.job_id, \
+                self._curr_source.op_id
 
 
 
@@ -115,7 +140,7 @@ class State:
 
     def add_worker_nodes(self, n_workers):
         self.G.add_nodes_from((
-            (WorkerNode(worker_id), {Attr.MOVING: False})
+            WorkerNode(worker_id)
             for worker_id in range(n_workers)
         ))
 
@@ -162,20 +187,15 @@ class State:
     
     # set / get node and edge attributes
 
-    def set_worker_moving(self, worker_id, flag):
-        worker_node = WorkerNode(worker_id)
-        self.G.nodes[worker_node][Attr.MOVING] = flag
-
-
 
     def is_worker_moving(self, worker_id):
-        worker_node = WorkerNode(worker_id)
-        return self.G.nodes[worker_node][Attr.MOVING]
+        node = self._get_worker_location(worker_id)
+        return isinstance(node, OpNode) and node.state == OpState.MOVING
 
 
 
     def mark_op_completed(self, job_id, op_id):
-        op_node = OpNode(job_id, op_id, OpState.SRC)
+        op_node = OpNode(job_id, op_id, OpState.PRESENT)
         self.G.nodes[op_node][Attr.COMPLETED] = True
 
 
@@ -197,12 +217,24 @@ class State:
 
 
 
-    def n_commitments(self, node_src, op_node_dst):
-        assert isinstance(op_node_dst, OpNode)
-        if op_node_dst in self.G[node_src]:
-            return self.G[node_src][op_node_dst][Attr.N_COMMITMENTS]
-        else:
+    def n_workers_moving_to_op(self, job_id, op_id):
+        op_node = OpNode(job_id, op_id, OpState.MOVING)
+        if op_node not in self.G:
             return 0
+        return self.G.in_degree(op_node)
+
+
+
+    def n_commitments_to_op(self, job_id, op_id):
+        op_node = OpNode(job_id, op_id, OpState.COMMITTED)
+        if op_node not in self.G:
+            return 0
+        return self._n_commitments_to_op(op_node)
+
+
+
+    def n_workers_at_source(self):
+        return self.G.in_degree(self._curr_source)
 
 
 
@@ -210,12 +242,7 @@ class State:
         node = self._parse_source(job_id, op_id)
         if node not in self.G:
             return 0
-        return self._n_workers_at(node)
-
-
-
-    def n_workers_at_source(self):
-        return self.G.in_degree(self._curr_source)
+        return self.G.in_degree(node)
 
 
 
@@ -227,17 +254,9 @@ class State:
 
 
 
-    def n_commitments_to(self, job_id=None, op_id=None):
-        node = self._parse_source(job_id, op_id)
-        if node not in self.G:
-            return 0
-        return self._n_commitments_to(node)
-
-
-
     def _decrement_commitments(self, node_src, op_node_dst, n=1):
         assert isinstance(op_node_dst, OpNode)
-        assert self.n_commitments(node_src, op_node_dst) > 0
+        assert self._n_commitments(node_src, op_node_dst) > 0
         assert op_node_dst in self.G[node_src]
         self.G[node_src][op_node_dst][Attr.N_COMMITMENTS] -= n
 
@@ -256,14 +275,31 @@ class State:
 
 
 
-    def _n_commitments_to(self, source):
-        return self.G.in_degree(source, weight=Attr.N_COMMITMENTS)
+    def _n_commitments_to_op(self, op_node):
+        assert isinstance(op_node, OpNode) and op_node.state == OpState.COMMITTED
+        return self.G.in_degree(op_node, weight=Attr.N_COMMITMENTS)
 
 
 
     def _n_workers_at(self, source):
+        if isinstance(source, OpNode):
+            assert source.state == OpState.PRESENT
         return self.G.in_degree(source)
-        
+
+
+
+    def _n_workers_moving_to_op(self, op_node):
+        assert isinstance(op_node, OpNode) and op_node.state == OpState.MOVING
+        return self.G.in_degree(op_node)
+
+
+
+    def _n_commitments(self, node_src, op_node_dst):
+        assert isinstance(op_node_dst, OpNode)
+        if op_node_dst in self.G[node_src]:
+            return self.G[node_src][op_node_dst][Attr.N_COMMITMENTS]
+        else:
+            return 0
 
 
 
@@ -284,22 +320,24 @@ class State:
         - n_commitments is the number of commitments from
             the source to that operation
         '''
-        return (
+        return [
             (
                 op_node_dst.job_id, 
                 op_node_dst.op_id, 
-                self.n_commitments(self._curr_source, op_node_dst)
+                self._n_commitments(self._curr_source, op_node_dst)
             ) 
             for op_node_dst in self.G.successors(self._curr_source)
-        )
+        ]
 
 
 
     def move_worker_to_job_pool(self, worker_id):
-        op_node_old = self._remove_worker_from_pool(worker_id)
+        op_node_old = self.remove_worker_from_pool(worker_id)
+        print('moving worker to job pool:', worker_id, op_node_old)
         assert isinstance(op_node_old, OpNode)
         job_node = JobNode(op_node_old.job_id)
         self.G.add_edge(WorkerNode(worker_id), job_node)
+
 
         # the worker's previous operation may need to be 
         # removed from the graph
@@ -308,21 +346,28 @@ class State:
 
 
     def move_worker_to_null_pool(self, worker_id):
-        _ = self._remove_worker_from_pool(worker_id)
+        _ = self.remove_worker_from_pool(worker_id)
         self.G.add_edge(WorkerNode(worker_id), NullNode())
 
 
 
-    def move_all_source_workers(self, is_job_saturated):
-        move_func = self.move_worker_to_job_pool if not is_job_saturated \
-                else self.move_worker_to_null_pool
+    # def _move_uncommitted_source_workers(self, is_job_saturated):
+    #     if isinstance(self._curr_source, JobNode) and not is_job_saturated:
+    #         return
 
-        # need to create a frozen list because source 
-        # workers change as we iterate
-        source_workers = list(self.get_source_workers())
+    #     move_func = self.move_worker_to_job_pool if not is_job_saturated \
+    #             else self.move_worker_to_null_pool
 
-        for worker_id in source_workers:
-            move_func(worker_id)
+    #     source_workers = set(self.get_source_workers())
+    #     num_move = self.num_uncommitted_source_workers
+    #     assert len(source_workers) > 0
+    #     assert num_move > 0
+    #     assert len(source_workers) >= num_move
+
+    #     while num_move > 0:
+    #         num_move -= 1
+    #         worker_id = source_workers.pop()
+    #         move_func(worker_id)
 
 
 
@@ -345,47 +390,46 @@ class State:
 
         source = State._parse_source(job_id_src, op_id_src, default=self._curr_source)
 
-        op_node_dst = OpNode(job_id_dst, op_id_dst, OpState.DST)
-        if self.n_commitments(source, op_node_dst) == 0:
+        op_node_dst = OpNode(job_id_dst, op_id_dst, OpState.COMMITTED)
+        if self._n_commitments(source, op_node_dst) == 0:
             self._add_commitment_edge(source, op_node_dst)
 
         self._increment_commitments(source, op_node_dst, n=n_workers)
 
 
 
-    def fulfill_commitment(self, worker_id, job_id_dst, op_id_dst):
-        worker_node = WorkerNode(worker_id)
-        op_node_dst = OpNode(job_id_dst, op_id_dst, OpState.DST)
-        assert nx.has_path(self.G, worker_node, op_node_dst)
-
-        # remove connection from worker to source
-        node_src = self._remove_worker_from_pool(worker_id)
-
-        # update commitment from source to dest op
-        self._decrement_commitments(node_src, op_node_dst)
-        if self.n_commitments(node_src, op_node_dst) == 0:
-            # all commitments are fulfilled from source to dest op
-            # so remove their connection
-            self.G.remove_edge(node_src, op_node_dst)
+    def fulfill_commitment(self, worker_id, job_id_dst, op_id_dst, move):
+        node_src = self.remove_commitment(worker_id, job_id_dst, op_id_dst)
+        self.remove_worker_from_pool(worker_id)
 
         # add new connection from worker to dest operation
-        is_worker_present = self._assign_worker(worker_id, job_id_dst, op_id_dst, node_src)
+        self.assign_worker(worker_id, job_id_dst, op_id_dst, move)
 
         # nodes may be need to be removed from the graph
         self._clean_up_nodes(node_src)
 
-        return is_worker_present
 
 
+    def remove_commitment(self, worker_id, job_id_dst, op_id_dst):
+        assert not self.is_worker_moving(worker_id)
 
-    def reroute_worker(self, worker_id, job_id_new, op_id_new):
-        op_node_old = self._remove_worker_from_pool(worker_id)
-        assert isinstance(op_node_old, OpNode)
-        assert self.is_worker_moving(worker_id)
+        worker_node = WorkerNode(worker_id)
+        op_node_dst = OpNode(job_id_dst, op_id_dst, OpState.COMMITTED)
+        assert nx.has_path(self.G, worker_node, op_node_dst)
 
-        is_worker_present = \
-            self._assign_worker(worker_id, job_id_new, op_id_new, op_node_old)
-        return is_worker_present
+        node_src = self._get_worker_location(worker_id)
+
+        # update commitment from source to dest op
+        self._decrement_commitments(node_src, op_node_dst)
+        if self._n_commitments(node_src, op_node_dst) == 0:
+            # all commitments are fulfilled from source to dest op
+            # so remove their connection
+            self.G.remove_edge(node_src, op_node_dst)
+
+        # remove connection from worker to source
+        # self.remove_worker_from_pool(worker_id)
+
+        return node_src
 
 
 
@@ -399,16 +443,11 @@ class State:
 
 
 
-    def _assign_worker(self, worker_id, job_id_dst, op_id_dst, node_old):
-        if isinstance(node_old, JobNode) or isinstance(node_old, OpNode):
-            job_id_old = node_old.job_id
-        else:
-            job_id_old = None
-        is_worker_present = (job_id_old == job_id_dst)
-        self.set_worker_moving(worker_id, not is_worker_present)
-        op_node_new = OpNode(job_id_dst, op_id_dst, OpState.SRC)
+    def assign_worker(self, worker_id, job_id_dst, op_id_dst, move):
+        assert self.G.out_degree(WorkerNode(worker_id)) == 0
+        state = OpState.MOVING if move else OpState.PRESENT
+        op_node_new = OpNode(job_id_dst, op_id_dst, state)
         self.G.add_edge(WorkerNode(worker_id), op_node_new)
-        return is_worker_present
 
 
 
@@ -424,9 +463,11 @@ class State:
 
 
 
-    def _remove_worker_from_pool(self, worker_id):
+    def remove_worker_from_pool(self, worker_id):
         node_old = self._get_worker_location(worker_id)
         self.G.remove_edge(WorkerNode(worker_id), node_old)
+        if not isinstance(node_old, OpNode) or node_old.state == OpState.PRESENT:
+            assert self._num_uncommitted_workers(node_old) >= 0
         return node_old
 
 
@@ -434,7 +475,7 @@ class State:
     @classmethod
     def _parse_source(cls, job_id=None, op_id=None, default=None):
         if op_id is not None:
-            return OpNode(job_id, op_id, OpState.SRC)
+            return OpNode(job_id, op_id, OpState.PRESENT)
         elif job_id is not None:
             return JobNode(job_id)
         else:
@@ -451,13 +492,22 @@ class State:
         the last operation within its job, then
         its job's node should be removed too.
         '''
-        if isinstance(node, OpNode) and \
-            self.is_op_completed(node) and \
-            self.G.in_degree(node) == 0 and \
-            self.G.out_degree(node) == 0:
+        # if isinstance(node, OpNode) and \
+        #     self.is_op_completed(node) and \
+        #     self.G.in_degree(node) == 0 and \
+        #     self.G.out_degree(node) == 0:
 
-            self.remove_op(node.job_id, node.op_id)
+        #     print('remove op:', node)
+        #     self.remove_op(node.job_id, node.op_id)
 
-            job_node = JobNode(node.job_id)
-            if self.is_job_completed(job_node):
-                self.remove_job(node.job_id)
+        #     job_node = JobNode(node.job_id)
+        #     if self.is_job_completed(job_node):
+        #         self.remove_job(node.job_id)
+        pass
+
+
+
+    def mark_worker_present(self, worker_id):
+        op_node = self.remove_worker_from_pool(worker_id)
+        assert isinstance(op_node, OpNode) and op_node.state == OpState.MOVING
+        self.assign_worker(worker_id, op_node.job_id, op_node.op_id, move=False)

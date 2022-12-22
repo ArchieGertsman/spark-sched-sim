@@ -38,12 +38,6 @@ class Job:
     # operation completed executing
     t_completed = np.inf
 
-    local_workers = set()
-
-    # x_ptr = None
-
-    n_avail_local = 0
-
 
 
     @property
@@ -59,59 +53,75 @@ class Job:
 
 
 
-    def add_op_completion(self):
+    def add_op_completion(self, op):
         '''increments the count of completed operations'''
         assert self.completed_ops_count < len(self.ops)
         self.completed_ops_count += 1
 
+        new_ops = self.find_new_frontier_ops(op, 'completed')
+        self.frontier_ops |= new_ops
 
-    
-    def add_op_saturation(self):
+        return len(new_ops) > 0
+
+
+
+    def mark_op_saturated(self, op):
+        # assert op in self.frontier_ops
         assert self.saturated_ops_count < len(self.ops)
+        op.saturated = True
         self.saturated_ops_count += 1
 
+        # self.frontier_ops.remove(op)
 
 
-    def find_src_ops(self):
+
+    def initialize_frontier(self):
         '''returns a set containing all the operations which are
         source nodes in the dag, i.e. which have no dependencies
         '''
-        sources = [self.ops[node] \
-            for node,in_deg in self.dag.in_degree() \
-                if in_deg==0]
-        return set(sources)
+        assert len(self.frontier_ops) == 0
+        
+        sources = set(
+            self.ops[node]
+            for node, in_deg in self.dag.in_degree()
+            if in_deg == 0
+        )
+
+        self.frontier_ops |= sources
+
+        return sources
 
 
 
-    def find_new_frontier_ops(self, op):
+    def find_new_frontier_ops(self, op, criterion):
         '''if `op` is completed, returns all of its
         successors whose other dependencies are also 
         completed, if any exist.
         '''
-        if not op.completed:
+        assert criterion in ['saturated', 'completed']
+
+        if not op.check_criterion(criterion):
             return set()
 
         new_ops = set()
-        # search through successors of `stage`
+        # search through op's children
         for suc_op_id in self.dag.successors(op.id_):
-            # if all dependencies are completed, then
-            # add this successor to the frontiers
-            if self._check_dependencies(suc_op_id):
+            # if all dependencies are satisfied, then
+            # add this child to the frontiers
+            if self._check_dependencies(suc_op_id, criterion):
                 new_op = self.ops[suc_op_id]
-                # self.x_ptr[suc_op_id, Features.REMAINING_WORK] = \
-                #     new_op.n_tasks * new_op.rough_duration
                 new_ops.add(new_op)
         
         return new_ops
 
 
 
-    def _check_dependencies(self, op_id):
+    def _check_dependencies(self, op_id, criterion):
         '''searches to see if all the dependencies of operation 
         with id `op_id` are satisfied.
         '''
         for dep_id in self.dag.predecessors(op_id):
-            if not self.ops[dep_id].completed:
+            if not self.ops[dep_id].check_criterion(criterion):
                 return False
 
         return True
@@ -155,39 +165,15 @@ class Job:
 
 
 
-    # def init_feature_vector(self, op):
-    #     '''returns a feature vector for a single node in the dag'''
-    #     n_remaining_tasks = len(op.remaining_tasks)
-    #     n_processing_tasks = len(op.processing_tasks)
-    #     mean_task_duration = op.rough_duration
-
-    #     return [
-    #         n_remaining_tasks,
-    #         n_processing_tasks,
-    #         mean_task_duration,
-    #         0, 0
-    #     ] 
-
-
-
-    # def update_n_avail_local(self, n):
-    #     self.n_avail_local += n
-    #     self.x_ptr[:, Features.N_LOCAL_WORKERS] += n
-    #     # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] >= 0).all()
-    #     # assert (self.x_ptr[:, FeatureIdx.N_AVAIL_LOCAL_WORKERS] <= len(self.local_workers)).all()
-
-
-
     def add_local_worker(self, worker):
         self.local_workers.add(worker.id_)
         worker.job_id = self.id_
-        # self.update_n_avail_local(1)
 
 
 
-    def remove_local_worker(self, worker_id):
-        self.local_workers.remove(worker_id)
-        # self.update_n_avail_local(-1)
+    def remove_local_worker(self, worker):
+        self.local_workers.remove(worker.id_)
+        worker.job_id = None
 
 
 
@@ -196,17 +182,6 @@ class Job:
 
         task = op.remaining_tasks.pop()
         op.processing_tasks.add(task)
-
-        # self.n_avail_local -= 1
-
-        # self.x_ptr[op.id_, Features.N_REMAINING_TASKS] -= 1
-        # self.x_ptr[op.id_, Features.REMAINING_WORK] -= op.rough_duration
-
-        # self.update_x_ptr(
-        #     op.id_, 
-        #     n_remaining_tasks=-1, 
-        #     n_processing_tasks=1, 
-        #     n_avail_local_workers=-1)
             
         worker.task = task
         task.worker_id = worker.id_
@@ -222,31 +197,5 @@ class Job:
         op.processing_tasks.remove(task)
         op.completed_tasks.add(task)
 
-        # self.n_avail_local += 1
-
-        # self.update_x_ptr(
-        #     op.id_, 
-        #     n_processing_tasks=-1, 
-        #     n_avail_local_workers=1)
-
         worker.task = None
         task.t_completed = wall_time
-
-
-
-    # def update_x_ptr(
-    #     self,
-    #     op_id,
-    #     n_remaining_tasks=0,
-    #     n_processing_tasks=0,
-    #     mean_task_duration=0,
-    #     n_avail_workers=0,
-    #     n_avail_local_workers=0
-    # ):
-    #     self.x_ptr[op_id] += torch.tensor([
-    #         n_remaining_tasks,
-    #         n_processing_tasks,
-    #         mean_task_duration,
-    #         n_avail_workers,
-    #         n_avail_local_workers
-    #     ])

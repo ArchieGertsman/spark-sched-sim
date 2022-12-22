@@ -11,16 +11,18 @@ if __name__ == '__main__':
 
     writer = SummaryWriter('tensorboard')
 
+    torch.autograd.set_detect_anomaly(True)
+
     reinforce.train(
         agent,
         optim,
-        n_sequences=2,
-        n_ep_per_seq=16,
+        n_sequences=1,
+        n_ep_per_seq=1,
         discount=.99,
         entropy_weight_init=1.,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
-        n_job_arrivals=200, 
+        n_job_arrivals=50, 
         n_init_jobs=1, 
         mjit=25000,
         n_workers=50,
