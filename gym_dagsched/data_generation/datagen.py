@@ -25,7 +25,7 @@ class DataGen:
 
         t = 0.      # time of current arrival
 
-        for id in range(n_job_arrivals):
+        for id in range(n_init_jobs + n_job_arrivals):
             # generate a job and add its arrival to the timeline
             if id < n_init_jobs:
                 job = self._job(id, t)

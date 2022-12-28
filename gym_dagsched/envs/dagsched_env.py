@@ -21,7 +21,6 @@ class DagSchedEnv:
     def __init__(self, rank):
         self.rank = rank
         self.state = State()
-        self.t_step = 0
 
 
     @property
@@ -58,7 +57,7 @@ class DagSchedEnv:
 
     ## OpenAI Gym style interface - reset & step
 
-    def reset(self, initial_timeline, workers, shared_obs):
+    def reset(self, initial_timeline, workers):
         '''resets the simulation. should be called before
         each run (including first). all state data is found here.
         '''
@@ -91,14 +90,7 @@ class DagSchedEnv:
         # dependencies are satisfied
         self.schedulable_ops = set()
 
-        # self.x_ptrs = x_ptrs
-        self.shared_obs = shared_obs
-
-        self.max_ops = max(len(e.job.ops) for _,_,e in initial_timeline.pq)
-
         self.executor_interval_map = self._get_executor_interval_map()
-
-        self.t_step = 0
 
         self.state.reset(self.n_workers)
 
@@ -106,40 +98,24 @@ class DagSchedEnv:
 
         self.done = False
 
-        self.first_step = True
+        # load all initial jobs into the system
+        # by stepping through the timeline
+        while self.wall_time == 0:
+            self.wall_time, event = self.timeline.pop()
+            self._process_scheduling_event(event)
 
-        # take a step in the timeline so that
-        # we can observe the environment
-        self.wall_time, event = self.timeline.pop()
-        self._process_scheduling_event(event)
-
-        self._update_shared_obs(0, False)
+        return self._observe()
 
 
 
     def step(self, action):
-        reward, done = self._step(action)
-        self._update_shared_obs(reward, done)
-
-
-
-    def _update_shared_obs(self, reward, done):
-        self._update_node_features()
-        self._update_active_job_mask()
-        self._update_op_mask()
-        self._update_prlvl_mask()
-        self.shared_obs.reward.copy_(torch.tensor(reward))
-        self.shared_obs.done.copy_(torch.tensor(done))
-
-
-
-    def _step(self, action):
-        print('step', self.state._curr_source, self.state.num_uncommitted_source_workers)
+        print('step', self.state.get_source(), self.state.num_uncommitted_source_workers)
         if self.done:
-            return 0, True
+            return None, 0, True
 
         # take action
         (job_id, op_id), n_workers = action
+        print('action:', (job_id, op_id), n_workers)
 
         assert job_id in self.active_job_ids
         job = self.jobs[job_id]
@@ -154,7 +130,7 @@ class DagSchedEnv:
 
         # commit `n_workers` workers from the current worker
         # source to the op with id (job_id, op_id)
-        print('add commitment', n_workers_adjusted, job_id, op_id)
+        print('add commitment', (job_id, op_id), n_workers_adjusted)
         self.state.add_commitment(n_workers_adjusted, job_id, op_id)
         if self.is_op_saturated(op):
             self._process_op_saturation(op)
@@ -166,7 +142,7 @@ class DagSchedEnv:
         if not self._is_commitment_round_complete:
             # current commitment round is not over yet,
             # so consult the agent again
-            return 0, False
+            return self._observe(), 0, False
             
         # commitment round has completed, i.e.
         # all the workers at the current source
@@ -177,28 +153,54 @@ class DagSchedEnv:
 
         t_prev = self.wall_time
 
-        while not (self.timeline.empty or self._should_start_new_commitment_round):
+        while not (self.timeline.empty or \
+            self._should_start_new_commitment_round
+        ):
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
         reward = self._calculate_reward(t_prev)
-        self.done = self.timeline.empty and not self._should_start_new_commitment_round
+        self.done = self.timeline.empty and \
+            not self._should_start_new_commitment_round
 
         if self.done:
+            if not self.all_jobs_complete:
+                job_id = self.active_job_ids[0]
+                job = self.jobs[job_id]
+                print('incomplete job:', job_id)
+                print(job.frontier_ops)
+                print(list(job.dag.edges))
+                print('ops:')
+                for op in job.ops:
+                    print(op.id_, op.saturated, op.completed)
             assert len(self.schedulable_ops) == 0
             assert self.all_jobs_complete
+        else:
+            assert len(self.schedulable_ops) > 0
 
         # if the episode isn't done, then start a new commitment 
         # round at the current worker source
 
-        return reward, self.done
+        return self._observe(), reward, self.done
 
 
 
 
     ## Observations
 
-    def _update_node_features(self):
+    def _observe(self):
+        job_feature_tensors = self._construct_job_feature_tensors()
+        op_masks = self._construct_op_masks()
+        prlvl_mask = self._construct_prlvl_mask()
+
+        return job_feature_tensors, op_masks, prlvl_mask
+
+
+
+
+    def _construct_job_feature_tensors(self):
+        job_feature_tensors = {}
+
         n_source_workers = self.state.num_uncommitted_source_workers
         source_job_id = self.state.source_job
 
@@ -207,17 +209,16 @@ class DagSchedEnv:
             worker_count = self._count_workers(job_id)
             is_source_job = (job_id == source_job_id)
 
-            job_feature_tensor = \
-                self.shared_obs.feature_tensor_chunks[job_id]
+            job_feature_tensor = torch.empty((len(job.ops), 5))
 
-            # update job-level features
+            # job-level features
             job_feature_tensor[:, :3] = torch.tensor([
                 n_source_workers,
                 is_source_job,
                 worker_count
             ])
 
-            # update node-level features
+            # node-level features
             job_feature_tensor[:, 3:] = torch.stack([
                 torch.tensor([
                     op.n_remaining_tasks,
@@ -226,40 +227,32 @@ class DagSchedEnv:
                 for op in job.ops
             ])
 
-
-
-    def _update_active_job_mask(self):
-        self.shared_obs.active_job_msk.zero_()
-        self.shared_obs.active_job_msk[self.active_job_ids] = 1
+            job_feature_tensors[job_id] = job_feature_tensor
+        
+        return job_feature_tensors
 
 
 
-    def _update_op_mask(self):
-        self.shared_obs.op_msk.zero_()
+    def _construct_op_masks(self):
+        op_masks = {}
+        for job_id in self.active_job_ids:
+            job = self.jobs[job_id]
+            op_masks[job_id] = torch.zeros(job.num_ops, dtype=torch.bool)
 
         valid_ops = self.schedulable_ops - self.selected_ops
-        if len(valid_ops) == 0:
-            return
 
-        # get (job_id, op_id) pairs for each operation
-        # that is in the frontier but hasn't been selected
-        # yet during this committment round
-        id_pairs = [
-            (op.job_id, op.id_) 
-            for op in iter(valid_ops)
-        ]
+        for op in iter(valid_ops):
+            op_masks[op.job_id][op.id_] = 1
 
-        # split pairs into two lists
-        job_ids, op_ids = list(zip(*id_pairs))
-
-        self.shared_obs.op_msk[job_ids, op_ids] = 1
+        return op_masks
 
 
 
-    def _update_prlvl_mask(self):
-        self.shared_obs.prlvl_msk.zero_()
+    def _construct_prlvl_mask(self):
+        prlvl_msk = torch.zeros(self.n_workers, dtype=torch.bool)
         n_source_workers = self.state.num_uncommitted_source_workers
-        self.shared_obs.prlvl_msk[:, :n_source_workers] = 1
+        prlvl_msk[:n_source_workers] = 1
+        return prlvl_msk
 
 
 
@@ -286,13 +279,10 @@ class DagSchedEnv:
 
     def _process_scheduling_event(self, event):
         if isinstance(event, JobArrival):
-            print('job arrival', event.job.id_, len(event.job.ops))
             self._process_job_arrival(event.job)
         elif isinstance(event, WorkerArrival):
-            print('worker arrival')
             self._process_worker_arrival(event.worker, event.op)
         elif isinstance(event, TaskCompletion):
-            print('task completion', event.op.job_id, event.op.id_)
             self._process_task_completion(event.op, event.task)
         else:
             raise Exception('invalid event')
@@ -303,6 +293,8 @@ class DagSchedEnv:
     ## Job arrivals
 
     def _process_job_arrival(self, job):
+        print('job arrival', job.id_, len(job.ops))
+
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         self.state.add_job(job.id_)
@@ -335,6 +327,7 @@ class DagSchedEnv:
 
     def _process_worker_arrival(self, worker, op):
         '''performs some bookkeeping when a worker arrives'''
+        print('worker arrived to', (op.job_id, op.id_))
         job = self.jobs[op.job_id]
 
         job.add_local_worker(worker)
@@ -345,6 +338,13 @@ class DagSchedEnv:
             # on the op. Move the worker to the
             # job pool instead.
             self.state.move_worker_to_job_pool(worker.id_)
+            if not self.is_op_saturated(op) and \
+                op not in self.schedulable_ops:
+                # we may need to start scheduling 
+                # this op again
+                print('op is schedulable again', (op.job_id, op.id_))
+                job.set_op_saturated(op, False)
+                self.schedulable_ops.add(op)
         elif job.completed or op.n_remaining_tasks == 0:
             # if the job has completed or the op has 
             # become saturated by the time the worker 
@@ -381,6 +381,8 @@ class DagSchedEnv:
 
     def _process_task_completion(self, op, task):
         '''performs some bookkeeping when a task completes'''
+        print('task completion', (op.job_id, op.id_))
+
         worker = self.workers[task.worker_id]
 
         job = self.jobs[op.job_id]
@@ -452,7 +454,7 @@ class DagSchedEnv:
         - there are schedulable operations in the system
         '''
         return not self.state.all_source_workers_committed and \
-            len(self.schedulable_ops - self.selected_ops) > 0
+            len(self.schedulable_ops) > 0
             
 
 
@@ -489,14 +491,14 @@ class DagSchedEnv:
 
 
     def _process_op_saturation(self, op):
-        print('op saturation')
+        print('op saturation', (op.job_id, op.id_))
         assert self.is_op_saturated(op)
         assert op in self.schedulable_ops
 
         self.schedulable_ops.remove(op)
 
         job = self.jobs[op.job_id]
-        job.mark_op_saturated(op)
+        job.set_op_saturated(op, True)
 
         # this saturation may have unlocked new operations
         # within the job dag
@@ -511,6 +513,9 @@ class DagSchedEnv:
         not any of such decendents were found.
         '''
         new_ops = job.find_new_frontier_ops(op, criterion='saturated')
+        for op in iter(new_ops):
+            assert not op.saturated
+            assert not op.completed
         self.schedulable_ops |= new_ops
         [self.state.add_op(job.id_, op.id_) for op in iter(new_ops)]
         
@@ -559,6 +564,7 @@ class DagSchedEnv:
 
     def _process_op_completion(self, op):
         '''performs some bookkeeping when an operation completes'''
+        assert op not in self.schedulable_ops
         self.state.mark_op_completed(op.job_id, op.id_)
         job = self.jobs[op.job_id]
         frontier_changed = job.add_op_completion(op)
@@ -580,11 +586,28 @@ class DagSchedEnv:
 
     def _fulfill_commitment(self, worker, op):
         assert op.n_remaining_tasks > 0
+        print('fulfilling commitment to', (op.job_id, op.id_))
 
         if worker.is_at_job(op.job_id):
             self.state.fulfill_commitment(
                 worker.id_, op.job_id, op.id_, move=False)
-            self._work_on_op(worker, op)
+
+            job = self.jobs[op.job_id]
+            if op not in job.frontier_ops:
+                # this op's parents are saturated but have not
+                # completed, so we can't actually start working
+                # on the op. Move the worker to the
+                # job pool instead.
+                self.state.move_worker_to_job_pool(worker.id_)
+                if not self.is_op_saturated(op) and \
+                    op not in self.schedulable_ops:
+                    # we may need to start scheduling 
+                    # this op again
+                    print('op is schedulable again', (op.job_id, op.id_))
+                    job.set_op_saturated(op, False)
+                    self.schedulable_ops.add(op)
+            else:
+                self._work_on_op(worker, op)
         else:
             self.state.fulfill_commitment(
                 worker.id_, op.job_id, op.id_, move=True)
@@ -651,6 +674,7 @@ class DagSchedEnv:
 
 
     def _reroute_worker(self, worker, op_new):
+        print('rerouting worker to', (op_new.job_id, op_new.id_))
         assert op_new.n_remaining_tasks > 0
 
         self.state.remove_worker_from_pool(worker.id_)

@@ -52,6 +52,11 @@ class Job:
         return self.saturated_ops_count == len(self.ops)
 
 
+    @property
+    def num_ops(self):
+        return len(self.ops)
+
+
 
     def add_op_completion(self, op):
         '''increments the count of completed operations'''
@@ -65,14 +70,15 @@ class Job:
 
 
 
-    def mark_op_saturated(self, op):
-        # assert op in self.frontier_ops
-        assert self.saturated_ops_count < len(self.ops)
-        op.saturated = True
-        self.saturated_ops_count += 1
-
-        # self.frontier_ops.remove(op)
-
+    def set_op_saturated(self, op, flag):
+        op.saturated = flag
+        if flag:
+            assert self.saturated_ops_count < len(self.ops)
+            self.saturated_ops_count += 1
+        else:
+            assert self.saturated_ops_count > 0
+            self.saturated_ops_count -= 1
+            
 
 
     def initialize_frontier(self):
@@ -108,8 +114,10 @@ class Job:
         for suc_op_id in self.dag.successors(op.id_):
             # if all dependencies are satisfied, then
             # add this child to the frontiers
-            if self._check_dependencies(suc_op_id, criterion):
-                new_op = self.ops[suc_op_id]
+            new_op = self.ops[suc_op_id]
+            if not new_op.check_criterion(criterion) and \
+                self._check_dependencies(suc_op_id, criterion) \
+                :
                 new_ops.add(new_op)
         
         return new_ops
