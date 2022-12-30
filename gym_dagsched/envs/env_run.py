@@ -73,6 +73,8 @@ def env_run(rank, datagen_state, conn):
             obs, reward, done = env.step(action)
             _update_shared_obs(shared_obs, obs, reward, done)
 
+            print('step done', flush=True)
+
             # notify main process
             conn.send(None)
 

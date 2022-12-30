@@ -63,6 +63,8 @@ class Job:
         assert self.completed_ops_count < len(self.ops)
         self.completed_ops_count += 1
 
+        self.frontier_ops.remove(op)
+
         new_ops = self.find_new_frontier_ops(op, 'completed')
         self.frontier_ops |= new_ops
 
@@ -72,6 +74,7 @@ class Job:
 
     def set_op_saturated(self, op, flag):
         op.saturated = flag
+
         if flag:
             assert self.saturated_ops_count < len(self.ops)
             self.saturated_ops_count += 1
@@ -87,15 +90,34 @@ class Job:
         '''
         assert len(self.frontier_ops) == 0
         
-        sources = set(
+        sources = self.source_ops()
+
+        self.frontier_ops |= sources
+
+        return sources
+
+
+    def source_ops(self):
+        return set(
             self.ops[node]
             for node, in_deg in self.dag.in_degree()
             if in_deg == 0
         )
 
-        self.frontier_ops |= sources
 
-        return sources
+
+    def children_ops(self, op):
+        return set([
+            self.ops[op_id] 
+            for op_id in self.dag.successors(op.id_)
+        ])
+
+
+    def parent_ops(self, op):
+        return set([
+            self.ops[op_id] 
+            for op_id in self.dag.predecessors(op.id_)
+        ])  
 
 
 
@@ -116,7 +138,7 @@ class Job:
             # add this child to the frontiers
             new_op = self.ops[suc_op_id]
             if not new_op.check_criterion(criterion) and \
-                self._check_dependencies(suc_op_id, criterion) \
+                self.check_dependencies(suc_op_id, criterion) \
                 :
                 new_ops.add(new_op)
         
@@ -124,7 +146,7 @@ class Job:
 
 
 
-    def _check_dependencies(self, op_id, criterion):
+    def check_dependencies(self, op_id, criterion):
         '''searches to see if all the dependencies of operation 
         with id `op_id` are satisfied.
         '''

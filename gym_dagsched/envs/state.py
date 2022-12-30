@@ -346,6 +346,7 @@ class State:
 
 
     def move_worker_to_null_pool(self, worker_id):
+        print('moving worker to null pool:', worker_id)
         _ = self.remove_worker_from_pool(worker_id)
         self.G.add_edge(WorkerNode(worker_id), NullNode())
 

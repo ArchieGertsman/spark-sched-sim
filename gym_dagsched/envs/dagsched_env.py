@@ -28,7 +28,7 @@ class DagSchedEnv:
         '''whether or not all the jobs in the system
         have been completed
         '''
-        return len(self.active_job_ids) == 0
+        return self.n_completed_jobs == self.n_job_arrivals
 
 
     @property
@@ -88,7 +88,7 @@ class DagSchedEnv:
         # operations in the system which are ready
         # to be executed by a worker because their
         # dependencies are satisfied
-        self.schedulable_ops = set()
+        # self.schedulable_ops = set()
 
         self.executor_interval_map = self._get_executor_interval_map()
 
@@ -104,16 +104,40 @@ class DagSchedEnv:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
+        self.schedulable_ops = self._find_schedulable_ops()
+
         return self._observe()
 
 
 
     def step(self, action):
         print('step', self.state.get_source(), self.state.num_uncommitted_source_workers)
+        
         if self.done:
             return None, 0, True
 
-        # take action
+        self._take_action(action)
+        
+        if not self._is_commitment_round_complete:
+            # current commitment round is not over yet,
+            # so consult the agent again
+            return self._observe(), 0, False
+            
+        # commitment round has completed, i.e.
+        # all the workers at the current source
+        # have somewhere to go
+        self.selected_ops.clear()
+        self._fulfill_source_commitments()
+
+        reward, self.done = self._step_through_timeline()
+
+        # if the episode isn't done, then start a new commitment 
+        # round at the current worker source
+        return self._observe(), reward, self.done
+
+
+
+    def _take_action(self, action):
         (job_id, op_id), n_workers = action
         print('action:', (job_id, op_id), n_workers)
 
@@ -126,63 +150,71 @@ class DagSchedEnv:
         assert op in (self.schedulable_ops - self.selected_ops)
 
         n_workers_adjusted = self.adjust_n_workers(n_workers, op)
-        print('n_workers', n_workers, n_workers_adjusted)
+        print(f'n_workers adjustment: {n_workers} -> {n_workers_adjusted}')
 
         # commit `n_workers` workers from the current worker
         # source to the op with id (job_id, op_id)
         print('add commitment', (job_id, op_id), n_workers_adjusted)
         self.state.add_commitment(n_workers_adjusted, job_id, op_id)
-        if self.is_op_saturated(op):
-            self._process_op_saturation(op)
+
+        if self.check_op_saturated(op):
+            self.schedulable_ops |= set(
+                child_op
+                for child_op in job.children_ops(op) 
+                if self._check_op_schedulable(child_op)
+            )
 
         # mark op as selected so that it doesn't get
         # selected again during this commitment round
         self.selected_ops.add(op)
-        
-        if not self._is_commitment_round_complete:
-            # current commitment round is not over yet,
-            # so consult the agent again
-            return self._observe(), 0, False
-            
-        # commitment round has completed, i.e.
-        # all the workers at the current source
-        # have somewhere to go
-        print('fulfilling source commitments')
-        self.selected_ops.clear()
-        self._fulfill_source_commitments()
 
+
+
+
+    def _step_through_timeline(self):
         t_prev = self.wall_time
 
-        while not (self.timeline.empty or \
-            self._should_start_new_commitment_round
-        ):
+        while not self.timeline.empty:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
+            if not self.state.all_source_workers_committed:
+                self.schedulable_ops = self._find_schedulable_ops()
+                if len(self.schedulable_ops) > 0:
+                    break
+
         reward = self._calculate_reward(t_prev)
-        self.done = self.timeline.empty and \
-            not self._should_start_new_commitment_round
 
-        if self.done:
-            if not self.all_jobs_complete:
-                job_id = self.active_job_ids[0]
-                job = self.jobs[job_id]
-                print('incomplete job:', job_id)
-                print(job.frontier_ops)
-                print(list(job.dag.edges))
-                print('ops:')
-                for op in job.ops:
-                    print(op.id_, op.saturated, op.completed)
-            assert len(self.schedulable_ops) == 0
-            assert self.all_jobs_complete
+        # done = self.timeline.empty and self.state.all_source_workers_committed
+        done = self.all_jobs_complete
+
+        if not done:
+            # self.schedulable_ops = self._find_schedulable_ops()
+            assert len(self.schedulable_ops) > 0 and not self.state.all_source_workers_committed
+            print('starting new commitment round')
         else:
-            assert len(self.schedulable_ops) > 0
+            print('DONE!')
+        # else:
+        #     if not self.all_jobs_complete:
+        #         job_id = self.active_job_ids[0]
+        #         job = self.jobs[job_id]
+        #         print('incomplete job')
+        #         self._print_job(job)
 
-        # if the episode isn't done, then start a new commitment 
-        # round at the current worker source
+        #         assert False
 
-        return self._observe(), reward, self.done
+        return reward, done
 
+
+
+    def _print_job(self, job):
+        print('job id:', job.id_)
+        print('frontier ops:', [op.id_ for op in iter(job.frontier_ops)])
+        print('edges:', list(job.dag.edges))
+        print('[op_id] [saturated] [completed]:')
+        for op in job.ops:
+            print(op.id_, op.saturated, op.completed)
+        print()
 
 
 
@@ -274,6 +306,34 @@ class DagSchedEnv:
 
 
 
+    def _find_schedulable_ops(self, job_ids=None):
+        if not job_ids:
+            job_ids = self.active_job_ids
+
+        schedulable_ops = set(
+            op
+            for job_id in job_ids 
+            for op in self.jobs[job_id].ops
+            if self._check_op_schedulable(op)
+        )
+
+        return schedulable_ops
+
+
+    def _check_op_schedulable(self, op):
+        if self.check_op_saturated(op):
+            return False
+
+        job = self.jobs[op.job_id]
+        for parent_op in job.parent_ops(op):
+            if not self.check_op_saturated(parent_op):
+                return False
+
+        return True
+
+
+
+
 
     ## Scheduling events
 
@@ -293,14 +353,15 @@ class DagSchedEnv:
     ## Job arrivals
 
     def _process_job_arrival(self, job):
-        print('job arrival', job.id_, len(job.ops))
+        print('job arrival')
+        self._print_job(job)
 
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         self.state.add_job(job.id_)
 
         src_ops = job.initialize_frontier()
-        self.schedulable_ops |= src_ops
+        # self.schedulable_ops |= src_ops
         [self.state.add_op(job.id_, op.id_) for op in iter(src_ops)]
 
         if self.state.null_pool_has_workers:
@@ -333,23 +394,14 @@ class DagSchedEnv:
         job.add_local_worker(worker)
 
         if op not in job.frontier_ops:
-            # this op's parents are saturated but have not
-            # completed, so we can't actually start working
-            # on the op. Move the worker to the
-            # job pool instead.
+            # op's dependencies are not satisfied
+            # self._process_worker_at_unready_op(worker, op)
             self.state.move_worker_to_job_pool(worker.id_)
-            if not self.is_op_saturated(op) and \
-                op not in self.schedulable_ops:
-                # we may need to start scheduling 
-                # this op again
-                print('op is schedulable again', (op.job_id, op.id_))
-                job.set_op_saturated(op, False)
-                self.schedulable_ops.add(op)
         elif job.completed or op.n_remaining_tasks == 0:
-            # if the job has completed or the op has 
-            # become saturated by the time the worker 
-            # arrives, then try to greedily find 
-            # a backup operation for the worker
+            # either the job has completed or the op has 
+            # become saturated by the time of this arrival, 
+            # so try to greedily find a backup operation 
+            # for the worker
             self._try_backup_schedule(worker)
         else:
             # the op is runnable, as anticipated.
@@ -397,11 +449,9 @@ class DagSchedEnv:
         job_frontier_changed = False
 
         if op.completed:
-            print('op completion', op.job_id, op.id_)
             job_frontier_changed = self._process_op_completion(op)
 
         if job.completed:
-            print('job completion', op.job_id)
             self._process_job_completion(job)
 
         # worker may have somewhere to be moved
@@ -434,7 +484,7 @@ class DagSchedEnv:
 
 
 
-    def is_op_saturated(self, op):
+    def check_op_saturated(self, op):
         return self.get_worker_demand(op) <= 0
 
 
@@ -453,8 +503,8 @@ class DagSchedEnv:
         - it contains uncommitted workers, and 
         - there are schedulable operations in the system
         '''
-        return not self.state.all_source_workers_committed and \
-            len(self.schedulable_ops) > 0
+        return not self.state.all_source_workers_committed #and \
+            # len(self.schedulable_ops) > 0
             
 
 
@@ -467,8 +517,8 @@ class DagSchedEnv:
         job = self.jobs[op.job_id]
         task = job.assign_worker(worker, op, self.wall_time)
 
-        if op in self.schedulable_ops and self.is_op_saturated(op):
-            self._process_op_saturation(op)
+        # if op in self.schedulable_ops and self.check_op_saturated(op):
+        #     self._process_op_saturation(op)
 
         self._push_task_completion_event(op, task)
 
@@ -483,41 +533,61 @@ class DagSchedEnv:
             old_job = self.jobs[worker.job_id]
             old_job.remove_local_worker(worker)
 
-        if op in self.schedulable_ops and self.is_op_saturated(op):
-            self._process_op_saturation(op)
+        # if op in self.schedulable_ops and self.check_op_saturated(op):
+        #     self._process_op_saturation(op)
 
         self._push_worker_arrival_event(worker, op)
             
 
 
-    def _process_op_saturation(self, op):
-        print('op saturation', (op.job_id, op.id_))
-        assert self.is_op_saturated(op)
-        assert op in self.schedulable_ops
+    # def _process_op_saturation(self, op):
+    #     print('op saturation', (op.job_id, op.id_))
+    #     assert self.check_op_saturated(op)
+    #     assert op in self.schedulable_ops
 
-        self.schedulable_ops.remove(op)
+    #     self.schedulable_ops.remove(op)
 
-        job = self.jobs[op.job_id]
-        job.set_op_saturated(op, True)
+    #     job = self.jobs[op.job_id]
+    #     job.set_op_saturated(op, True)
 
-        # this saturation may have unlocked new operations
-        # within the job dag
-        self._expand_frontier(job, op)
+    #     # this saturation may have unlocked new 
+    #     # operations within the job dag
+    #     self._expand_frontier(job, op)
 
 
 
-    def _expand_frontier(self, job, op):
-        '''if this saturated op has decendents whose
-        parents are all saturated, then its decendents
-        are added to the frontier. Returns whether or
-        not any of such decendents were found.
-        '''
-        new_ops = job.find_new_frontier_ops(op, criterion='saturated')
-        for op in iter(new_ops):
-            assert not op.saturated
-            assert not op.completed
-        self.schedulable_ops |= new_ops
-        [self.state.add_op(job.id_, op.id_) for op in iter(new_ops)]
+    # def _process_op_unsaturation(self, op):
+    #     print('op unsaturation', (op.job_id, op.id_))
+    #     assert not self.check_op_saturated(op)
+    #     assert op not in self.schedulable_ops
+
+    #     job = self.jobs[op.job_id]
+    #     job.set_op_saturated(op, False)
+        
+    #     if job.check_dependencies(op.id_, 'saturated'):
+    #         # op's parents may or may not still be saturated
+    #         self.schedulable_ops.add(op)
+
+    #     # this op's children are no longer schedulable
+    #     self.schedulable_ops -= job.children_ops(op)
+
+
+
+    # def _expand_frontier(self, job, op):
+    #     '''if this saturated op has decendents whose
+    #     parents are all saturated, then its decendents
+    #     are added to the frontier. Returns whether or
+    #     not any of such decendents were found.
+    #     '''
+    #     new_ops = job.find_new_frontier_ops(op, criterion='saturated')
+    #     if len(new_ops) > 0:
+    #         print('expanding frontier:', [(op.job_id, op.id_) for op in iter(new_ops)])
+
+    #     for op in iter(new_ops):
+    #         assert not op.saturated
+    #         assert not op.completed
+    #     self.schedulable_ops |= new_ops
+    #     [self.state.add_op(job.id_, op.id_) for op in iter(new_ops)]
         
 
 
@@ -535,7 +605,6 @@ class DagSchedEnv:
             if op_committed.n_remaining_tasks > 0:
                 self._fulfill_commitment(worker, op_committed)
             else:
-                print('op saturated, trying backup', commitment)
                 self._try_backup_schedule(worker, commitment)
         elif job_frontier_changed:
             # no commitment, but frontier changed
@@ -564,10 +633,12 @@ class DagSchedEnv:
 
     def _process_op_completion(self, op):
         '''performs some bookkeeping when an operation completes'''
-        assert op not in self.schedulable_ops
+        print('op completion', (op.job_id, op.id_))
+        # assert op not in self.schedulable_ops
         self.state.mark_op_completed(op.job_id, op.id_)
         job = self.jobs[op.job_id]
         frontier_changed = job.add_op_completion(op)
+        print('frontier_changed:', frontier_changed)
         return frontier_changed
         
 
@@ -575,6 +646,7 @@ class DagSchedEnv:
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
+        print('job completion', job.id_)
 
         self.state.mark_job_completed(job.id_)
         
@@ -588,36 +660,54 @@ class DagSchedEnv:
         assert op.n_remaining_tasks > 0
         print('fulfilling commitment to', (op.job_id, op.id_))
 
-        if worker.is_at_job(op.job_id):
-            self.state.fulfill_commitment(
-                worker.id_, op.job_id, op.id_, move=False)
-
-            job = self.jobs[op.job_id]
-            if op not in job.frontier_ops:
-                # this op's parents are saturated but have not
-                # completed, so we can't actually start working
-                # on the op. Move the worker to the
-                # job pool instead.
-                self.state.move_worker_to_job_pool(worker.id_)
-                if not self.is_op_saturated(op) and \
-                    op not in self.schedulable_ops:
-                    # we may need to start scheduling 
-                    # this op again
-                    print('op is schedulable again', (op.job_id, op.id_))
-                    job.set_op_saturated(op, False)
-                    self.schedulable_ops.add(op)
-            else:
-                self._work_on_op(worker, op)
-        else:
+        if not worker.is_at_job(op.job_id):
+            # worker isn't local to the job, 
+            # so send it over.
             self.state.fulfill_commitment(
                 worker.id_, op.job_id, op.id_, move=True)
             self._send_worker(worker, op)
+            return
+
+        # worker is at the job
+
+        self.state.fulfill_commitment(
+            worker.id_, op.job_id, op.id_, move=False)
+
+        if op in self.jobs[op.job_id].frontier_ops:
+            # op's dependencies are satisfied, so 
+            # start working on it.
+            self._work_on_op(worker, op)
+        else:
+            # dependencies not satisfied; op not ready.
+            # self._process_worker_at_unready_op(worker, op)
+            self.state.move_worker_to_job_pool(worker.id_)
+
+
+
+    # def _process_worker_at_unready_op(self, worker, op):
+    #     # this op's parents are saturated but have not
+    #     # completed, so we can't actually start working
+    #     # on the op. Move the worker to the
+    #     # job pool instead.
+    #     self.state.move_worker_to_job_pool(worker.id_)
+
+    #     if not self.check_op_saturated(op) and \
+    #         not op.saturated and \
+    #         op not in self.schedulable_ops:
+    #         # we may have stopped scheduling this
+    #         # op because it became saturated,
+    #         # but it is no longer saturated
+    #         # so we need to start scheduling it
+    #         # again
+    #         self._process_op_unsaturation(op)
 
 
 
     def _fulfill_source_commitments(self):
         '''called at the end of a commitment round
         '''
+        print('fulfilling source commitments')
+
         # some of the source workers may not be
         # free right now; find the ones that are.
         free_worker_ids = set((
@@ -660,6 +750,8 @@ class DagSchedEnv:
 
 
     def _try_backup_schedule(self, worker, commitment=None):
+        print('trying backup; old commitment =', commitment)
+
         if commitment:
             self.state.remove_commitment(worker.id_, *commitment)
 
@@ -667,40 +759,60 @@ class DagSchedEnv:
 
         if backup_op:
             self._reroute_worker(worker, backup_op)
-        else:
-            self.state.move_worker_to_job_pool(worker.id_)
-            
+            return
+
+        # no backup op found, so move worker to job or null
+        # pool depending on whether or not the worker's job 
+        # is completed
+        job = self.jobs[worker.job_id]
+        move_fun = self.state.move_worker_to_null_pool if job.completed \
+            else self.state.move_worker_to_job_pool
+
+        move_fun(worker.id_)
 
 
 
-    def _reroute_worker(self, worker, op_new):
-        print('rerouting worker to', (op_new.job_id, op_new.id_))
-        assert op_new.n_remaining_tasks > 0
+    def _reroute_worker(self, worker, op):
+        print('rerouting worker to', (op.job_id, op.id_))
+        assert op.n_remaining_tasks > 0
 
         self.state.remove_worker_from_pool(worker.id_)
 
-        if worker.is_at_job(op_new.job_id):
+        if not worker.is_at_job(op.job_id):
             self.state.assign_worker(
-                worker.id_, op_new.job_id, op_new.id_, move=False)
-            self._work_on_op(worker, op_new)
+                worker.id_, op.job_id, op.id_, move=True)
+            self._send_worker(worker, op)
+            return
+
+        self.state.assign_worker(
+            worker.id_, op.job_id, op.id_, move=False)
+
+        if op in self.jobs[op.job_id].frontier_ops:
+            # op's dependencies are satisfied, so 
+            # start working on it.
+            self._work_on_op(worker, op)
         else:
-            self.state.assign_worker(
-                worker.id_, op_new.job_id, op_new.id_, move=True)
-            self._send_worker(worker, op_new)
+            # dependencies not satisfied; op not ready.
+            # self._process_worker_at_unready_op(worker, op)
+            self.state.move_worker_to_job_pool(worker.id_)
 
 
 
     def _find_backup_op(self, worker):
-        if len(self.schedulable_ops) == 0:
-            return None
+        local_ops = self._find_schedulable_ops([worker.job_id])
 
-        backup_op = None
-        for op in iter(self.schedulable_ops):
-            backup_op = op
-            if op.job_id == worker.job_id:
-                break
+        if len(local_ops) > 0:
+            return local_ops.pop()
 
-        return backup_op
+        other_ops = self._find_schedulable_ops((
+            job_id for job_id in self.active_job_ids 
+            if job_id != worker.job_id
+        ))
+
+        if len(other_ops) > 0:
+            return other_ops.pop()
+
+        return None
 
 
 

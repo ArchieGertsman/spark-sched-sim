@@ -50,10 +50,15 @@ def train(
     using multiprocessing'''
 
     # set up torch.distributed for IPC
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
+    # os.environ['MASTER_ADDR'] = '127.0.0.1'
+    # os.environ['MASTER_PORT'] = '29500'
 
     datagen_state = np.random.RandomState()
+
+    model.share_memory()
+    model.to(device)
+
+    optim = optim_type(model.parameters(), lr=optim_lr)
 
     procs, conns = \
         launch_subprocesses(
@@ -88,9 +93,18 @@ def train(
                 ep_len, 
                 entropy_weight))
 
+        returns_list = [conn.recv() for conn in conns]
+        baselines = torch.stack(returns_list).mean(dim=0)
+
+        optim.zero_grad()
+
+        [conn.send(baselines) for conn in conns]
+
         # wait for each of the subprocesses to finish parameter updates
         losses, avg_job_durations, n_completed_jobs_list = \
             list(zip(*[conn.recv() for conn in conns]))
+
+        optim.step()
 
         t = time() - t
         print('episode wall duration:', t, flush=True)
@@ -146,16 +160,10 @@ def terminate_subprocesses(conns, procs):
 
 
 
-# streams = [
-#     torch.cuda.Stream(device=device),
-#     torch.cuda.Stream(device=device)
-# ]
-
-
 def run_episodes(
     rank, 
     num_envs, 
-    model, 
+    shared_model, 
     datagen_state, 
     discount, 
     optim_type,
@@ -164,11 +172,10 @@ def run_episodes(
 ):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
-    # global streams
 
     sys.stdout = open(f'log/proc/{rank}.out', 'a')
 
-    dist.init_process_group('gloo', rank=rank, world_size=num_envs)
+    # dist.init_process_group('gloo', rank=rank, world_size=num_envs)
 
     # IMPORTANT! ensures that the different child processes
     # don't all generate the same random numbers. Otherwise,
@@ -177,17 +184,16 @@ def run_episodes(
     np.random.seed(rank)
 
     # set up local model and optimizer
-    agent = DDP(model.to(device), device_ids=[device])
-    optim = optim_type(agent.parameters(), lr=optim_lr)
-
-    # stream = torch.cuda.Stream(device=device) #streams[rank]
-    stream = None
+    local_model = deepcopy(shared_model)
+    # optim = optim_type(local_model.parameters(), lr=optim_lr)
 
     # this subprocess's copy of the environment
     env = DagSchedEnvAsyncWrapper(rank, datagen_state)
     while data := conn.recv():
         # receive episode data from parent process
         n_job_arrivals, n_init_jobs, mjit, n_workers, ep_len, entropy_weight = data
+
+        local_model.load_state_dict(shared_model.state_dict())
 
         action_lgprobs, rewards, entropies = \
             run_episode(
@@ -197,23 +203,15 @@ def run_episodes(
                 mjit, 
                 n_workers,
                 ep_len,
-                agent,
-                stream
+                local_model
             )
 
-        # dist.barrier()
-        # print('HEEEER', time())
-
         returns = compute_returns(rewards.detach(), discount)
+        conn.send(returns)
 
-        # print('RETURNS', time(), returns)
-
-        print('HEEER', flush=True)
+        baselines = conn.recv()
             
         # compute advantages
-        baselines = returns.clone()
-        dist.all_reduce(baselines)
-        baselines /= num_envs
         advantages = returns - baselines
 
         # compute loss
@@ -221,12 +219,30 @@ def run_episodes(
         entropy_loss = entropy_weight * entropies.sum()
         loss = (policy_loss + entropy_loss) / ep_len
 
-        optim.zero_grad()
+        # optim.zero_grad()
         loss.backward()
-        optim.step()
 
-        # update_model(agent, optim, loss)
+        gen = zip(local_model.parameters(), shared_model.parameters())
+        for local_param, shared_param in gen:
+            if not shared_param.grad:
+                shared_param.grad = local_param.grad
+            else:
+                shared_param.grad.add_(local_param.grad)
+
+        # ensure_shared_grads(local_model, shared_model)
+        # optim.step()
+
         send_ep_stats(conn, loss, env)
+
+
+
+
+def ensure_shared_grads(local_model, shared_model):
+    gen = zip(local_model.parameters(), shared_model.parameters())
+    for local_param, shared_param in gen:
+        if shared_param.grad is not None:
+            return
+        shared_param._grad = local_param.grad
 
 
 
@@ -251,8 +267,7 @@ def run_episode(
     mjit,
     n_workers,
     ep_len,
-    agent,
-    stream
+    agent
 ):
     obs = env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
     done = False
@@ -269,8 +284,7 @@ def run_episode(
             invoke_agent(
                 agent, 
                 obs,
-                n_workers,
-                stream
+                n_workers
             )
 
         action, action_lgp, entropy = \
@@ -295,21 +309,18 @@ def run_episode(
 
 
 
-def invoke_agent(agent, obs, n_workers, stream):
+def invoke_agent(agent, obs, n_workers):
     dag_batch, op_msk, prlvl_msk = obs
 
     num_jobs = torch.tensor([dag_batch.num_graphs], dtype=int, device=device)
     dag_batch = dag_batch.to(device=device)
 
-    # with torch.cuda.stream(stream):
     op_scores, prlvl_scores, _, _ = \
         agent(
             dag_batch,
             num_jobs,
             n_workers
         )
-
-    # stream.synchronize()
 
     op_scores, prlvl_scores = op_scores.cpu(), prlvl_scores.cpu()
 
