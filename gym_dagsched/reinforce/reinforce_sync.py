@@ -1,7 +1,6 @@
 import sys
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from time import time
-from pprint import pprint
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -15,6 +14,7 @@ import torch.profiler
 from ..envs.vec_dagsched_env import VecDagSchedEnv
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
+from ..utils.profiler import Profiler
 
 
 
@@ -48,6 +48,8 @@ def train(
     #     profile_memory=True)
     # prof.start()
 
+    prof = Profiler()
+
     vec_env = VecDagSchedEnv(num_envs, np.random.RandomState())
     vec_env.run()
 
@@ -65,17 +67,31 @@ def train(
         ep_len = mean_ep_len
 
         print(f'beginning training on sequence {epoch+1} with ep_len={ep_len}', flush=True)
-        t = time()
+
+        prof.enable()
+
+        obs_batch = vec_env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
+        
+        # stats of previous episode become available after
+        # resetting the environment
+        stats = vec_env.get_prev_episode_stats()
+        if stats:
+            write_tensorboard(
+                writer, 
+                epoch, 
+                ep_len,
+                loss,
+                *stats
+            )
 
         action_lgps_batch, rewards_batch, entropies_batch = \
             run_episode(
                 vec_env,
-                n_job_arrivals,
-                n_init_jobs,
-                mjit,
+                obs_batch,
                 n_workers,
                 ep_len,
-                model)
+                model
+            )
 
         returns_batch = compute_returns_batch(
             rewards_batch.detach(), discount)
@@ -87,8 +103,7 @@ def train(
             returns_batch, 
             entropies_batch)
 
-        t = time() - t
-        print('episode wall duration:', t, flush=True)
+        prof.disable()
 
         mean_ep_len += ep_len_growth
 
@@ -105,16 +120,15 @@ def train(
 def write_tensorboard(
     writer, 
     epoch, 
-    loss, 
     ep_len, 
-    prev_episode_stats
+    loss,
+    avg_job_duration,
+    n_completed_jobs
 ):
-    avg_job_duration_mean, n_completed_jobs_mean = prev_episode_stats
-    print(n_completed_jobs_mean)
     writer.add_scalar('episode length', ep_len, epoch)
     writer.add_scalar('loss', loss, epoch)
-    writer.add_scalar('avg job duration', avg_job_duration_mean, epoch)
-    writer.add_scalar('n completed jobs', n_completed_jobs_mean, epoch)
+    writer.add_scalar('avg job duration', avg_job_duration, epoch)
+    writer.add_scalar('n completed jobs', n_completed_jobs, epoch)
 
 
 
@@ -122,14 +136,11 @@ def write_tensorboard(
 
 def run_episode(
     vec_env,
-    n_job_arrivals,
-    n_init_jobs,
-    mjit,
+    obs_batch,
     n_workers,
     ep_len,
     agent
 ):
-    obs_batch = vec_env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
     done_batch = torch.zeros(vec_env.n, dtype=torch.bool)
 
     action_lgps_batch = torch.zeros((vec_env.n, ep_len))
@@ -140,7 +151,8 @@ def run_episode(
         if done_batch.all():
             break
 
-        print(f'step {i}, num jobs = {vec_env.num_jobs_per_env.sum().item()}', flush=True)
+        if (i+1) % 100 == 0:
+            print(f'step {i+1}, num jobs = {vec_env.num_jobs_per_env.sum().item()}', flush=True)
 
         obs_batch, done_batch = step(
             i,
@@ -226,11 +238,8 @@ def learn_from_trajectories(
     policy_loss  = -action_lgprobs @ advantages
     entropy_loss = entropy_weight * entropies_batch.sum()
 
-    ep_len = baselines.numel()
-    # num_envs = baselines.shape[0]
-
     optim.zero_grad()
-    loss = (policy_loss + entropy_loss) / ep_len
+    loss = (policy_loss + entropy_loss) / 1e4
     loss.backward()
     optim.step()
 

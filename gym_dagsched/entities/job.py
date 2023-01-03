@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import List
 import time
 
@@ -11,32 +10,38 @@ from .operation import Features
 
 
 
-@dataclass
 class Job:
     '''An object representing a job in the system, containing
     a set of operations with interdependencies, stored as a dag.
     '''
 
-    # unique identifier of this job
-    id_: int
+    def __init__(self, id_, ops, dag, t_arrival):
+        # unique identifier of this job
+        self.id_ = id_
 
-    # list of `Operation` objects
-    ops: List
+        # list of `Operation` objects
+        self.ops = ops
 
-    # networkx dag storing the operations' interdependencies
-    dag: nx.DiGraph
+        # networkx dag storing the operations' interdependencies
+        self.dag = dag
 
-    # time that this job arrived into the system
-    t_arrival: float
+        # time that this job arrived into the system
+        self.t_arrival = t_arrival
 
-    # number of operations that have completed executing
-    completed_ops_count = 0
+        # number of operations that have completed executing
+        self.completed_ops_count = 0
 
-    saturated_ops_count = 0
+        self.saturated_ops_count = 0
 
-    # time that this job completed, i.e. when the last
-    # operation completed executing
-    t_completed = np.inf
+        # time that this job completed, i.e. when the last
+        # operation completed executing
+        self.t_completed = np.inf
+
+        self.local_workers = set()
+        self.frontier_ops = set()
+
+        self.num_commitments = 0
+        self.num_moving_workers = 0
 
 
 
@@ -55,6 +60,14 @@ class Job:
     @property
     def num_ops(self):
         return len(self.ops)
+
+
+
+    @property
+    def total_worker_count(self):
+        return len(self.local_workers) + \
+            self.num_commitments + \
+            self.num_moving_workers
 
 
 
@@ -107,17 +120,17 @@ class Job:
 
 
     def children_ops(self, op):
-        return set([
+        return (
             self.ops[op_id] 
             for op_id in self.dag.successors(op.id_)
-        ])
+        )
 
 
     def parent_ops(self, op):
-        return set([
+        return (
             self.ops[op_id] 
             for op_id in self.dag.predecessors(op.id_)
-        ])  
+        )
 
 
 
@@ -192,6 +205,23 @@ class Job:
         # pyg_data.x = torch.tensor(feature_vectors, dtype=torch.float32)
         pyg_data.x = torch.zeros((len(self.ops), 5))
         return pyg_data
+
+
+
+    def add_commitments(self, n):
+        self.num_commitments += n
+
+    def remove_commitment(self):
+        self.num_commitments -= 1
+        assert self.num_commitments >= 0
+
+
+    def add_moving_worker(self):
+        self.num_moving_workers += 1
+
+    def remove_moving_worker(self):
+        self.num_moving_workers -= 1
+        assert self.num_moving_workers >= 0
 
 
 

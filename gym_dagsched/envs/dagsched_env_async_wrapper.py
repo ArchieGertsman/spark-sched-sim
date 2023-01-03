@@ -33,6 +33,10 @@ class DagSchedEnvAsyncWrapper:
     def jobs(self):
         return self.env.jobs
 
+    @property
+    def wall_time(self):
+        return self.env.wall_time
+
 
 
     def reset(self, n_job_arrivals, n_init_jobs, mjit, n_workers):

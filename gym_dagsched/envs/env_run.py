@@ -1,6 +1,4 @@
 import sys
-import os
-from time import time
 
 import torch
 import numpy as np
@@ -8,18 +6,25 @@ import numpy as np
 from ..data_generation.tpch_datagen import TPCHDataGen
 from .dagsched_env import DagSchedEnv
 from ..utils import metrics
+from ..utils.profiler import Profiler
 
 
 
 def env_run(rank, datagen_state, conn):
     torch.manual_seed(rank)
     np.random.seed(rank)
+
     sys.stdout = open(f'log/proc/{rank}.out', 'a')
+    
+    torch.set_num_threads(1)
 
     datagen = TPCHDataGen(datagen_state)
     env = DagSchedEnv(rank)
     shared_obs = None
     first_episode = True
+
+    prof = Profiler()
+    prof.enable()
 
     while header_data := conn.recv():
         header, data = header_data
@@ -73,13 +78,13 @@ def env_run(rank, datagen_state, conn):
             obs, reward, done = env.step(action)
             _update_shared_obs(shared_obs, obs, reward, done)
 
-            print('step done', flush=True)
-
             # notify main process
             conn.send(None)
 
         else:
             raise Exception(f'proc {rank} received invalid data')
+
+    prof.disable()
 
 
 

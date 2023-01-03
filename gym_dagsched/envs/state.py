@@ -271,17 +271,23 @@ class State:
 
 
     def _n_commitments_from(self, source):
+        if source not in self.G:
+            return 0
         return self.G.out_degree(source, weight=Attr.N_COMMITMENTS)
 
 
 
     def _n_commitments_to_op(self, op_node):
+        if op_node not in self.G:
+            return 0
         assert isinstance(op_node, OpNode) and op_node.state == OpState.COMMITTED
         return self.G.in_degree(op_node, weight=Attr.N_COMMITMENTS)
 
 
 
     def _n_workers_at(self, source):
+        if source not in self.G:
+            return 0
         if isinstance(source, OpNode):
             assert source.state == OpState.PRESENT
         return self.G.in_degree(source)
@@ -289,12 +295,16 @@ class State:
 
 
     def _n_workers_moving_to_op(self, op_node):
+        if op_node not in self.G:
+            return 0
         assert isinstance(op_node, OpNode) and op_node.state == OpState.MOVING
         return self.G.in_degree(op_node)
 
 
 
     def _n_commitments(self, node_src, op_node_dst):
+        if node_src not in self.G:
+            return 0
         assert isinstance(op_node_dst, OpNode)
         if op_node_dst in self.G[node_src]:
             return self.G[node_src][op_node_dst][Attr.N_COMMITMENTS]

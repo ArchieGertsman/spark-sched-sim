@@ -13,3 +13,4 @@ log
 *.png
 *.npy
 *.csv
+*.out
