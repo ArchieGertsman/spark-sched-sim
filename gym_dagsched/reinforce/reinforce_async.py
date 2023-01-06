@@ -225,7 +225,7 @@ def run_episodes(
 
         torch.cuda.synchronize()
 
-        returns = compute_returns(rewards.detach(), discount)
+        returns = compute_returns(rewards, discount)
 
         # compute baselines
         baselines = returns.clone()
@@ -243,7 +243,15 @@ def run_episodes(
         # update model
         optim.zero_grad()
         # with torch.cuda.stream(s):
+
+        torch.cuda.synchronize()
+        start = time()
         loss.backward()
+        torch.cuda.synchronize()
+        end = time()
+        print('BACKWARD TIME:', end-start, flush=True )
+
+
         # for param in local_model.parameters():
         #     dist.all_reduce(param.grad)
         optim.step()
@@ -357,7 +365,6 @@ def run_episode(
 def invoke_agent(agent, obs, n_workers):
     dag_batch, op_msk, prlvl_msk = obs
 
-    # num_jobs = torch.tensor([dag_batch.num_graphs], dtype=int, device=device)
     num_jobs = dag_batch.num_graphs
     dag_batch = dag_batch.to(device=device, non_blocking=True)
 

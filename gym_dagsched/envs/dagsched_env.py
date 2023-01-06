@@ -100,20 +100,30 @@ class DagSchedEnv:
 
         self.done = False
 
-        op_counts = (len(e.job.ops) for _,_,e in initial_timeline.pq)
+        op_counts = [
+            len(e.job.ops) 
+            for _,_,e in initial_timeline.pq
+        ]
 
+        feature_tensor = torch.empty((sum(op_counts), 5))
+
+        # self.job_feature_tensors = {
+        #     job_id : torch.empty((op_count, 5))
+        #     for job_id, op_count in enumerate(op_counts)
+        # }
+        self.job_feature_tensors = torch.split(
+            feature_tensor,
+            op_counts
+        )
         self.job_feature_tensors = {
-            job_id : torch.empty((op_count, 5))
-            for job_id, op_count in enumerate(op_counts)
-        }
+            i: t 
+            for i, t in enumerate(self.job_feature_tensors)}
 
         # load all initial jobs into the system
         # by stepping through the timeline
         while self.wall_time == 0:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
-
-        # self.schedulable_ops = self._find_schedulable_ops()
 
         return self._observe()
 
@@ -131,7 +141,7 @@ class DagSchedEnv:
 
         self._take_action(action)
         
-        if not self._is_commitment_round_complete:
+        if not self._is_commitment_round_complete():
             # current commitment round is not over yet,
             # so consult the agent again
             return self._observe(), 0, False
@@ -187,17 +197,16 @@ class DagSchedEnv:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
-            if not self.state.all_source_workers_committed:
-                # self.schedulable_ops = self._find_schedulable_ops()
-                if len(self.schedulable_ops) > 0:
-                    break
+            if self._should_start_new_commitment_round():
+                break
 
         reward = self._calculate_reward(t_prev)
 
         done = self.all_jobs_complete
 
         if not done:
-            assert len(self.schedulable_ops) > 0 and not self.state.all_source_workers_committed
+            assert len(self.schedulable_ops) > 0 and \
+                not self.state.all_source_workers_committed
             print('starting new commitment round')
         else:
             print('DONE!')
@@ -283,53 +292,6 @@ class DagSchedEnv:
         n_source_workers = self.state.num_uncommitted_source_workers
         prlvl_msk[:n_source_workers] = 1
         return prlvl_msk
-
-
-
-    # def _count_workers(self, job_id):
-    #     '''for each active job, computes the total count
-    #     of workers associated with that job. Includes:
-    #     - workers sitting at the job's pool
-    #     - workers sitting or moving to operations within the job
-    #     - workers committed to operations within the job
-    #     '''
-    #     job = self.jobs[job_id]
-    #     count = self.state.n_workers_at(job_id) + sum(
-    #         self.state.n_workers_at(job_id, op_id) +
-    #         self.state.n_workers_moving_to_op(job_id, op_id) +
-    #         self.state.n_commitments_to_op(job_id, op_id)
-    #         for op_id in range(len(job.ops))
-    #     )
-    #     return count
-
-
-
-    def _find_schedulable_ops(self, job_ids=None):
-        if not job_ids:
-            job_ids = self.active_job_ids
-
-        schedulable_ops = set(
-            op
-            for job_id in job_ids 
-            for op in self.jobs[job_id].ops
-            if self._check_op_schedulable(op)
-        )
-
-        return schedulable_ops
-
-
-    def _check_op_schedulable(self, op):
-        if self.check_op_saturated(op):
-            return False
-
-        job = self.jobs[op.job_id]
-        for parent_op in job.parent_ops(op):
-            if not self.check_op_saturated(parent_op):
-                return False
-
-        return True
-
-
 
 
 
@@ -462,18 +424,62 @@ class DagSchedEnv:
 
 
 
-    ## Helper functions
+    ## Other helper functions
 
-    def add_commitment(self, n_workers_adjusted, op):
-        self.state.add_commitment(n_workers_adjusted, op.job_id, op.id_)
+    def _find_schedulable_ops(self, job_ids=None):
+        '''returns a union of schedulable operations
+        over all the jobs specified in `job_ids`. If
+        no job ids are provided, then all active
+        jobs are searched.
+        '''
+        if not job_ids:
+            job_ids = self.active_job_ids
+
+        schedulable_ops = set(
+            op
+            for job_id in job_ids 
+            for op in self.jobs[job_id].ops
+            if self._check_op_schedulable(op)
+        )
+
+        return schedulable_ops
+
+
+
+    def _check_op_schedulable(self, op):
+        '''an operation is schedulable if 
+        - it is unsaturated, and
+        - all of its parent operations are saturated
+        '''
+        if self.check_op_saturated(op):
+            return False
+
+        job = self.jobs[op.job_id]
+        for parent_op in job.parent_ops(op):
+            if not self.check_op_saturated(parent_op):
+                return False
+
+        return True
+
+
+
+    def add_commitment(self, n_workers, op):
+        '''commits `n_workers` workers from the current
+        worker source to `op`
+        '''
+        self.state.add_commitment(n_workers, op.job_id, op.id_)
         
         job_id_src, _ = self.state.get_source()
         if job_id_src != op.job_id:
             job = self.jobs[op.job_id]
-            job.add_commitments(n_workers_adjusted)
+            job.add_commitments(n_workers)
+
 
 
     def adjust_n_workers(self, n_workers, op):
+        '''truncates the numer of worker assigned
+        to `op` to the op's demand, if it's larger
+        '''
         worker_demand = self.get_worker_demand(op)
 
         n_workers_adjusted = min(n_workers, worker_demand)
@@ -484,6 +490,15 @@ class DagSchedEnv:
 
 
     def get_worker_demand(self, op):
+        '''an operation's worker demand is the
+        number of workers that it can accept
+        in addition to the workers currently
+        working on, committed to, and moving to 
+        the operation. 
+        Note: demand can be negative if more 
+        resources were assigned to the operation 
+        than needed.
+        '''
         job_id, op_id = op.job_id, op.id_
         demand = op.n_remaining_tasks - \
             self.state.n_workers_moving_to_op(job_id, op_id) - \
@@ -493,30 +508,42 @@ class DagSchedEnv:
 
 
     def check_op_saturated(self, op):
+        '''an operation is saturated if it
+        doesn't need any more workers.
+        '''
         return self.get_worker_demand(op) <= 0
 
 
 
-    @property
     def _is_commitment_round_complete(self):
+        '''a round of commitments is complete
+        if either 
+        - all the workers at the source
+        were committed somewhere, or 
+        - there are no more operations to schedule.
+        '''
         return self.state.all_source_workers_committed or \
             len(self.schedulable_ops - self.selected_ops) == 0
 
 
 
-    @property
     def _should_start_new_commitment_round(self):
         '''start a new commitment round at the current 
         source if 
         - it contains uncommitted workers, and 
         - there are schedulable operations in the system
         '''
-        return not self.state.all_source_workers_committed #and \
-            # len(self.schedulable_ops) > 0
+        return not self.state.all_source_workers_committed and \
+            len(self.schedulable_ops) > 0
             
 
 
     def _work_on_op(self, worker, op):
+        '''starts work on another one of `op`'s 
+        tasks, assuming there are still tasks 
+        remaining and the worker is local to the 
+        operation
+        '''
         assert op is not None
         assert op.n_remaining_tasks > 0
         assert worker.is_at_job(op.job_id)
@@ -533,6 +560,10 @@ class DagSchedEnv:
 
 
     def _send_worker(self, worker, op):
+        '''sends a `worker` to `op`, assuming
+        that the worker is currently at a
+        different job
+        '''
         assert op is not None
         assert worker.available
         assert worker.job_id != op.job_id
@@ -584,10 +615,15 @@ class DagSchedEnv:
 
 
     def _move_worker(self, worker, op, job_frontier_changed):
-        '''if the worker has a commitment, then fulfill it. Otherwise,
-        if `op` completed and unlocked new ops within the job dag, then 
-        move the worker to the job's worker pool so that it can be assigned 
-        to the new ops
+        '''called upon a task completion.
+        
+        if the op has a commitment, then fulfill it, unless the worker
+        is not needed there anymore. In that case, try to find a backup op
+        to work on.
+        
+        Otherwise, if `op` became saturated and unlocked new ops within the 
+        job dag, then move the worker to the job's worker pool so that it can 
+        be assigned to the new ops
         '''
         commitment = self.state.peek_commitment(op.job_id, op.id_)
         if commitment is not None:
@@ -606,19 +642,20 @@ class DagSchedEnv:
 
 
     def _update_worker_source(self, op, commitment, job_frontier_changed):
+        '''called upon a task completion.
+        
+        if any new operations were unlocked within this 
+        job upon the task completion, then start a new 
+        commitment round at this job's pool so that free
+        workers can be assigned to the new operations.
+
+        Otherwise, if the worker has nowhere to go, then
+        start a new commitment round at this operation's
+        pool to give it somewhere to go.
+        '''
         if job_frontier_changed:
-            # if any new operations were unlocked within this 
-            # job, then give the agent a chance to assign
-            # them to free workers from this job's pool
-            # by starting a new commitment round at this
-            # job's pool
             self.state.update_worker_source(op.job_id)
         elif commitment is None:
-            # if no new operations were unlocked and
-            # the worker has nowhere to go, then, necessarily,
-            # none of the workers at this operation have
-            # been committed anywhere. Then start a new
-            # commitment round at this operation
             self.state.update_worker_source(op.job_id, op.id_)
 
 

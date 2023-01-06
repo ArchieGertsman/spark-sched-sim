@@ -21,7 +21,7 @@ def main():
     # writer = SummaryWriter('log/train')
     writer = None
 
-    reinforce_sync.train(
+    reinforce_async.train(
         model,
         optim_type=torch.optim.Adam,
         optim_lr=.001,
@@ -55,12 +55,12 @@ def configure_main_process():
     sys.stdout = open(f'log/proc/main.out', 'a')
 
     # torch.autograd.set_detect_anomaly(True)
-    set_start_method('spawn')
+    set_start_method('forkserver')
 
     torch.manual_seed(69)
     np.random.seed(69)
 
-    torch.set_num_threads(1)
+    # torch.set_num_threads(1)
 
     print('cuda available:', torch.cuda.is_available())
 

@@ -29,7 +29,6 @@ class Operation:
         self.remaining_tasks = set(tasks)
         self.processing_tasks = set()
         self.completed_tasks = set()
-        self.remaining_time = np.inf
 
         self.saturated = False
 
