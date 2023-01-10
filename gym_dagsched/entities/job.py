@@ -21,17 +21,13 @@ class Job:
 
         # list of `Operation` objects
         self.ops = ops
+        self.active_ops = ops.copy()
 
         # networkx dag storing the operations' interdependencies
         self.dag = dag
 
         # time that this job arrived into the system
         self.t_arrival = t_arrival
-
-        # number of operations that have completed executing
-        self.completed_ops_count = 0
-
-        self.saturated_ops_count = 0
 
         # time that this job completed, i.e. when the last
         # operation completed executing
@@ -42,19 +38,21 @@ class Job:
 
         self.num_commitments = 0
         self.num_moving_workers = 0
+        self.saturated_op_count = 0
 
 
 
     @property
     def completed(self):
         '''whether or not this job has completed'''
-        return self.completed_ops_count == len(self.ops)
+        # return self.completed_ops_count == len(self.ops)
+        return self.num_active_ops == 0
 
 
 
     @property
     def saturated(self):
-        return self.saturated_ops_count == len(self.ops)
+        return self.saturated_op_count == len(self.ops)
 
 
     @property
@@ -70,11 +68,18 @@ class Job:
             self.num_moving_workers
 
 
+    @property
+    def num_active_ops(self):
+        return len(self.active_ops)
+
+
 
     def add_op_completion(self, op):
         '''increments the count of completed operations'''
-        assert self.completed_ops_count < len(self.ops)
-        self.completed_ops_count += 1
+        # assert self.completed_ops_count < len(self.ops)
+        # self.completed_ops_count += 1
+
+        self.active_ops.remove(op)
 
         self.frontier_ops.remove(op)
 
@@ -82,18 +87,6 @@ class Job:
         self.frontier_ops |= new_ops
 
         return len(new_ops) > 0
-
-
-
-    def set_op_saturated(self, op, flag):
-        op.saturated = flag
-
-        if flag:
-            assert self.saturated_ops_count < len(self.ops)
-            self.saturated_ops_count += 1
-        else:
-            assert self.saturated_ops_count > 0
-            self.saturated_ops_count -= 1
             
 
 
@@ -200,9 +193,7 @@ class Job:
 
 
     def init_pyg_data(self):
-        # feature_vectors = [self.init_feature_vector(op) for op in self.ops]
         pyg_data = from_networkx(self.dag)
-        # pyg_data.x = torch.tensor(feature_vectors, dtype=torch.float32)
         pyg_data.x = torch.zeros((len(self.ops), 5))
         return pyg_data
 
@@ -242,6 +233,9 @@ class Job:
 
         task = op.remaining_tasks.pop()
         op.processing_tasks.add(task)
+
+        if op.n_remaining_tasks == 0:
+            self.saturated_op_count += 1
             
         worker.task = task
         task.worker_id = worker.id_

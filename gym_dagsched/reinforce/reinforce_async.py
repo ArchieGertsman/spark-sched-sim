@@ -51,8 +51,6 @@ def train(
 
     datagen_state = np.random.RandomState(69)
 
-    model.to(device)
-
     procs, conns = \
         launch_subprocesses(
             num_envs, 
@@ -126,6 +124,9 @@ def launch_subprocesses(
         conn_main, conn_sub = Pipe()
         conns += [conn_main]
 
+        returns_sh = torch.zeros(5000)
+        wall_times_sh = torch.zeros(5000)
+
         proc = Process(
             target=run_episodes, 
             args=(
@@ -133,7 +134,9 @@ def launch_subprocesses(
                 num_envs, 
                 model,
                 datagen_state, 
-                discount, 
+                discount,
+                returns_sh,
+                wall_times_sh,
                 optim_type,
                 optim_lr,
                 conn_sub))
@@ -173,6 +176,8 @@ def run_episodes(
     model,
     datagen_state, 
     discount, 
+    returns_sh,
+    wall_times_sh,
     optim_type,
     optim_lr,
     conn
@@ -181,14 +186,24 @@ def run_episodes(
     by communicating with the parent process'''
     configure_subproc(rank, num_envs)
 
+
+
+    
+
+
+
+
+
+
     prof = Profiler()
+    # prof = None
 
     # this subprocess's copy of the environment
     env = DagSchedEnvAsyncWrapper(rank, datagen_state)
 
     # set up local model and optimizer
     # local_model = deepcopy(model)
-    local_model = DDP(model, device_ids=[device])
+    local_model = DDP(model.to(device), device_ids=[device])
     optim = optim_type(local_model.parameters(), lr=optim_lr)
 
     # streams = []
@@ -197,7 +212,10 @@ def run_episodes(
     # s = streams[rank]
     
 
+    i = 0
     while data := conn.recv():
+        i += 1
+
         # receive episode data from parent process
         (   
             n_job_arrivals, 
@@ -208,7 +226,10 @@ def run_episodes(
             entropy_weight
         ) = data
 
-        prof.enable()
+
+        if prof:
+            prof.enable()
+
 
         # with torch.cuda.stream(s):
         action_lgprobs, rewards, entropies = \
@@ -226,6 +247,13 @@ def run_episodes(
         torch.cuda.synchronize()
 
         returns = compute_returns(rewards, discount)
+        # returns_sh[:ep_len] = returns
+
+        # # notify main proc that returns are ready
+        # conn.send(None)
+
+        # # wait for main proc to compute baselines
+        # baselines = conn.recv()
 
         # compute baselines
         baselines = returns.clone()
@@ -237,27 +265,33 @@ def run_episodes(
 
         # compute loss
         policy_loss = -action_lgprobs @ advantages
+        print('POLICY LOSS:', policy_loss)
         entropy_loss = entropy_weight * entropies.sum()
-        loss = (policy_loss + entropy_loss) / ep_len
+        print('ENTROPY LOSS:', entropy_loss)
+
+        loss = (policy_loss + entropy_loss) / 1e4
 
         # update model
         optim.zero_grad()
         # with torch.cuda.stream(s):
 
-        torch.cuda.synchronize()
-        start = time()
         loss.backward()
-        torch.cuda.synchronize()
-        end = time()
-        print('BACKWARD TIME:', end-start, flush=True )
 
 
         # for param in local_model.parameters():
         #     dist.all_reduce(param.grad)
+
+        for param in local_model.parameters():
+            param.grad.mul_(num_envs)
+
         optim.step()
+
+        if rank == 0 and i % 10 == 0:
+            torch.save(model.state_dict(), 'model.pt')
         
 
-        prof.disable()
+        if prof:
+            prof.disable()
 
         send_ep_stats(conn, loss, env)
 
@@ -270,7 +304,7 @@ def send_ep_stats(conn, loss, env):
     '''
     conn.send((
         loss.item(),
-        avg_job_duration(env),
+        avg_job_duration(env) * 1e-3,
         env.n_completed_jobs))
 
 
@@ -300,7 +334,7 @@ def run_episode(
     mjit,
     n_workers,
     ep_len,
-    agent
+    model
 ):
     obs = env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
     done = False
@@ -309,37 +343,55 @@ def run_episode(
     rewards = torch.zeros(ep_len)
     entropies = torch.zeros(ep_len)
 
-    
 
 
     # if rank == 0:
-    # prof = torch.profiler.profile(
-    #     schedule=torch.profiler.schedule(wait=979, warmup=1, active=3, repeat=1),
-    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('log/perf'),
-    #     record_shapes=True,
-    #     with_stack=True,
-    #     profile_memory=True)
+    #     prof = torch.profiler.profile(
+    #         schedule=torch.profiler.schedule(wait=50, warmup=1, active=20),
+    #         on_trace_ready=torch.profiler.tensorboard_trace_handler('log/perf'),
+    #         record_shapes=True,
+    #         with_stack=True,
+    #         profile_memory=True)
 
-    # prof.start()
+    #     prof.start()
+
+    job_ptr = None
+    
 
     for i in range(ep_len):
         if done:
             break
 
+        (node_features,
+        new_dag_batch, 
+        valid_ops_mask, 
+        active_job_ids, 
+        n_source_workers) = obs
+
+        if new_dag_batch is not None:
+            job_ptr = new_dag_batch.ptr.numpy()
+        else:
+            assert job_ptr is not None
+
         op_scores, prlvl_scores = \
             invoke_agent(
-                agent, 
-                obs,
-                n_workers
+                model,
+                node_features,
+                new_dag_batch,
+                valid_ops_mask,
+                n_source_workers
             )
 
         action, action_lgp, entropy = \
             sample_action(
                 op_scores, 
                 prlvl_scores,
-                env.active_job_ids, 
-                env.op_counts[env.active_job_ids]
+                job_ptr,
+                active_job_ids,
             )
+
+        # entropy_scale = 1 / (np.log(n_source_workers * num_ops))
+        # entropy = entropy_scale * entropy
 
         obs, reward, done = env.step(action)
 
@@ -347,12 +399,11 @@ def run_episode(
         action_lgprobs[i] = action_lgp
         entropies[i] = entropy
 
-    #     # if rank == 0:
-    #     prof.step()
+    #     if rank == 0:
+    #         prof.step()
 
-
-    # # if rank == 0:
-    # prof.stop()
+    # if rank == 0:
+    #     prof.stop()
 
     return action_lgprobs, rewards, entropies    
 
@@ -362,25 +413,33 @@ def run_episode(
 
 
 
-def invoke_agent(agent, obs, n_workers):
-    dag_batch, op_msk, prlvl_msk = obs
+def invoke_agent(
+    agent, 
+    node_features,
+    new_dag_batch,
+    valid_ops_mask,
+    n_workers
+):
+    if new_dag_batch is not None:
+        new_dag_batch = new_dag_batch.clone() \
+            .to(device, non_blocking=True)
 
-    num_jobs = dag_batch.num_graphs
-    dag_batch = dag_batch.to(device=device, non_blocking=True)
+    node_features = node_features \
+        .to(device, non_blocking=True)
 
-    op_scores, prlvl_scores, _, _ = \
+    op_scores, prlvl_scores = \
         agent(
-            dag_batch,
-            num_jobs,
+            node_features,
+            new_dag_batch,
             n_workers
         )
 
     op_scores, prlvl_scores = op_scores.cpu(), prlvl_scores.cpu()
 
-    op_scores[(~op_msk).nonzero()] = torch.finfo(torch.float).min
+    op_scores[(~valid_ops_mask).nonzero()] = torch.finfo(torch.float).min
 
-    idx = (~prlvl_msk).nonzero()
-    prlvl_scores[idx[:,0], idx[:,1]] = torch.finfo(torch.float).min
+    # rows, cols = (~valid_prlvl_msk).nonzero()
+    # prlvl_scores[rows, cols] = torch.finfo(torch.float).min
 
     return op_scores, prlvl_scores
 
@@ -390,45 +449,57 @@ def invoke_agent(agent, obs, n_workers):
 
 
 
-def sample_action(op_scores, prlvl_scores, active_job_ids, op_counts):
+def sample_action(
+    op_scores, 
+    prlvl_scores, 
+    job_ptr,
+    active_job_ids,
+):
     # operation selection
-    op_idx, op_idx_lgp, op_entropy = sample_op_idx(op_scores)
-    job_idx, op_id = translate_op_selection(op_idx, active_job_ids, op_counts)
+    op, op_lgp, op_entropy = \
+        sample_op(op_scores)
+
+    job_idx, op = \
+        translate_op(
+            op, 
+            job_ptr,
+            active_job_ids)
 
     # parallelism level selection
-    prlvl, prlvl_lgp, prlvl_entropy = sample_prlvl(prlvl_scores, job_idx)
+    prlvl, prlvl_lgp, prlvl_entropy = \
+        sample_prlvl(prlvl_scores, job_idx)
 
-    action = (op_id, prlvl)
-    action_lgp = op_idx_lgp + prlvl_lgp
+    action = (op, prlvl)
+    action_lgp = op_lgp + prlvl_lgp
     entropy = op_entropy + prlvl_entropy
 
     return action, action_lgp, entropy
 
 
 
-def translate_op_selection(op_idx, active_job_ids, op_counts):
-    cum = torch.cumsum(op_counts, 0)
-    job_idx = (op_idx >= cum).sum()
+def translate_op(op, job_ptr, active_jobs_ids):
+    job_idx = (op >= job_ptr).sum() - 1
 
-    job_id = active_job_ids[job_idx]
-    op_id = op_idx - (cum[job_idx-1].item() if job_idx > 0 else 0)
-    op_id = (job_id, op_id)
+    job_id = active_jobs_ids[job_idx]
+    active_op_idx = op - job_ptr[job_idx]
+    
+    op = (job_id, active_op_idx)
 
-    return job_idx, op_id
-
-
+    return job_idx, op
 
 
-def sample_op_idx(op_scores):
+
+
+def sample_op(op_scores):
     '''sample index of next operation for each env.
     Returns the operation selections, the log-probability 
     of each selection, and the entropy of policy distribution
     '''
     c = Categorical(logits=op_scores)
-    op_idx = c.sample()
-    lgp = c.log_prob(op_idx)
+    op = c.sample()
+    lgp = c.log_prob(op)
     entropy = c.entropy()
-    return op_idx.item(), lgp, entropy
+    return op.item(), lgp, entropy
 
 
 

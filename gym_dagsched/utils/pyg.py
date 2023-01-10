@@ -1,40 +1,25 @@
 from collections import defaultdict
 
+import numpy as np
 import torch
+from torch_sparse import SparseTensor
 
 
 
-def construct_subbatch(data_batch, mask):
-    node_mask = mask[data_batch.batch]
-
+def construct_subbatch(data_batch, graph_mask, node_mask, num_nodes_per_graph, num_graphs):
+    node_mask = torch.from_numpy(node_mask)
     subbatch = data_batch.subgraph(node_mask)
 
-    subbatch._num_graphs = mask.sum().item()
+    subbatch._num_graphs = num_graphs
 
-    assoc = torch.empty(data_batch.num_graphs, dtype=torch.long)
-    assoc[mask] = torch.arange(subbatch.num_graphs)
-    subbatch.batch = assoc[data_batch.batch][node_mask]
+    assoc = np.zeros(data_batch.num_graphs, dtype=int)
+    assoc[graph_mask] = np.arange(subbatch.num_graphs)
+    batch = assoc[data_batch.batch][node_mask]
+    subbatch.batch = torch.from_numpy(batch)
 
-    ptr = data_batch._slice_dict['x']
-    num_nodes_per_graph = ptr[1:] - ptr[:-1]
-    ptr = torch.cumsum(num_nodes_per_graph[mask], 0)
-    ptr = torch.cat([torch.tensor([0]), ptr])
-    subbatch.ptr = ptr
-
-    edge_ptr = data_batch._slice_dict['edge_index']
-    num_edges_per_graph = edge_ptr[1:] - edge_ptr[:-1]
-    edge_ptr = torch.cumsum(num_edges_per_graph[mask], 0)
-    edge_ptr = torch.cat([torch.tensor([0]), edge_ptr])
-
-    subbatch._inc_dict = defaultdict(dict, {
-        'x': torch.zeros(subbatch.num_graphs, dtype=torch.long),
-        'edge_index': ptr[:-1]
-    })
-
-    subbatch._slice_dict = defaultdict(dict, {
-        'x': ptr,
-        'edge_index': edge_ptr
-    })
+    ptr = np.zeros(num_graphs + 1, dtype=int)
+    np.cumsum(num_nodes_per_graph, out=ptr[1:])
+    subbatch.ptr = torch.from_numpy(ptr)
 
     return subbatch
 

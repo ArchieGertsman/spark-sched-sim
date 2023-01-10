@@ -100,28 +100,29 @@ class DagSchedEnv:
 
         self.done = False
 
-        op_counts = [
-            len(e.job.ops) 
-            for _,_,e in initial_timeline.pq
-        ]
+        # op_counts = np.array([
+        #     len(e.job.ops) 
+        #     for _,_,e in initial_timeline.pq
+        # ])
 
-        feature_tensor = torch.empty((sum(op_counts), 5))
+        # feature_tensor = np.zeros((sum(op_counts), 5))
 
+        # # self.job_feature_tensors = {
+        # #     job_id : np.zeros((op_count, 5))
+        # #     for job_id, op_count in enumerate(op_counts)
+        # # }
+        # self.job_feature_tensors = np.split(
+        #     feature_tensor,
+        #     np.cumsum(op_counts[:-1])
+        # )
         # self.job_feature_tensors = {
-        #     job_id : torch.empty((op_count, 5))
-        #     for job_id, op_count in enumerate(op_counts)
+        #     i: t 
+        #     for i, t in enumerate(self.job_feature_tensors)
         # }
-        self.job_feature_tensors = torch.split(
-            feature_tensor,
-            op_counts
-        )
-        self.job_feature_tensors = {
-            i: t 
-            for i, t in enumerate(self.job_feature_tensors)}
 
         # load all initial jobs into the system
         # by stepping through the timeline
-        while self.wall_time == 0:
+        while self.wall_time == 0 and len(self.timeline) > 0:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
@@ -164,6 +165,8 @@ class DagSchedEnv:
         (job_id, op_id), n_workers = action
         print('action:', (job_id, op_id), n_workers)
 
+        assert n_workers <= self.state.num_uncommitted_source_workers
+
         assert job_id in self.active_job_ids
         job = self.jobs[job_id]
 
@@ -197,8 +200,16 @@ class DagSchedEnv:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
-            if self._should_start_new_commitment_round():
-                break
+            if not self.state.all_source_workers_committed:
+                if len(self.schedulable_ops) > 0:
+                    break
+                else:
+                    free_worker_ids = set((
+                        worker_id 
+                        for worker_id in self.state.get_source_workers() 
+                        if self.workers[worker_id].available
+                    ))
+                    self._move_free_uncommitted_source_workers(free_worker_ids)
 
         reward = self._calculate_reward(t_prev)
 
@@ -209,7 +220,7 @@ class DagSchedEnv:
                 not self.state.all_source_workers_committed
             print('starting new commitment round')
         else:
-            print('DONE!')
+            print('DONE!', flush=True)
 
         return reward, done
 
@@ -228,70 +239,91 @@ class DagSchedEnv:
 
     ## Observations
 
+    # def _observe(self):
+        
+
+    #     active_jobs_feature_mat = \
+    #         self._construct_active_jobs_feature_mat()
+
+    #     op_masks = self._construct_op_masks()
+    #     prlvl_mask = self._construct_prlvl_mask()
+
+    #     return active_jobs_feature_mat, op_masks, prlvl_mask
+
     def _observe(self):
-        self._update_job_feature_tensors()
-        job_feature_tensors = {
-            job_id: self.job_feature_tensors[job_id] 
-            for job_id in self.active_job_ids
-        }
-
-        op_masks = self._construct_op_masks()
-        prlvl_mask = self._construct_prlvl_mask()
-
-        return job_feature_tensors, op_masks, prlvl_mask
-
-
-
-
-    def _update_job_feature_tensors(self):
         n_source_workers = self.state.num_uncommitted_source_workers
         source_job_id = self.state.source_job
-
-        for job_id in self.active_job_ids:
-            job = self.jobs[job_id]
-            worker_count = job.total_worker_count
-            is_source_job = (job_id == source_job_id)
-
-            job_feature_tensor = self.job_feature_tensors[job_id]
-
-            # job-level features
-            job_feature_tensor[:, :3] = torch.tensor([
-                n_source_workers,
-                is_source_job,
-                worker_count
-            ])
-
-            # node-level features
-            job_feature_tensor[:, 3:] = torch.stack([
-                torch.tensor([
-                    op.n_remaining_tasks,
-                    op.approx_remaining_work
-                ])
-                for op in job.ops
-            ])
-
-
-
-    def _construct_op_masks(self):
-        op_masks = {}
-        for job_id in self.active_job_ids:
-            job = self.jobs[job_id]
-            op_masks[job_id] = torch.zeros(job.num_ops, dtype=torch.bool)
-
         valid_ops = self.schedulable_ops - self.selected_ops
+        active_jobs = [self.jobs[job_id] for job_id in self.active_job_ids]
+        return n_source_workers, \
+            source_job_id, \
+            valid_ops, \
+            active_jobs 
 
-        for op in iter(valid_ops):
-            op_masks[op.job_id][op.id_] = 1
-
-        return op_masks
 
 
 
-    def _construct_prlvl_mask(self):
-        prlvl_msk = torch.zeros(self.n_workers, dtype=torch.bool)
-        n_source_workers = self.state.num_uncommitted_source_workers
-        prlvl_msk[:n_source_workers] = 1
-        return prlvl_msk
+    # def _construct_active_jobs_feature_mat(self):
+    #     n_source_workers = self.state.num_uncommitted_source_workers
+    #     source_job_id = self.state.source_job
+
+    #     op_counts = np.array([
+    #         self.jobs[job_id].num_active_ops 
+    #         for job_id in self.active_job_ids
+    #     ])
+
+    #     active_jobs_feature_mat = np.zeros((sum(op_counts), 5))
+
+    #     job_feature_mats = np.split(
+    #         active_jobs_feature_mat,
+    #         np.cumsum(op_counts[:-1])
+    #     )
+
+    #     for job_id, job_feature_mat in zip(self.active_job_ids, job_feature_mats):
+    #         job = self.jobs[job_id]
+    #         worker_count = job.total_worker_count
+    #         is_source_job = (job_id == source_job_id)
+
+    #         # job-level features
+    #         job_feature_mat[:, :3] = np.array([
+    #             n_source_workers / 20,
+    #             int(is_source_job) * 4 - 2,
+    #             worker_count / 20
+    #         ])
+
+    #         # node-level features
+    #         job_feature_mat[:, 3:] = np.stack([
+    #             np.array([
+    #                 op.n_remaining_tasks / 200,
+    #                 op.approx_remaining_work / 1e5
+    #             ])
+    #             for op in iter(job.active_ops)
+    #         ])
+
+    #     return active_jobs_feature_mat
+
+
+
+    # def _construct_op_masks(self):
+    #     op_masks = {}
+    #     for job_id in self.active_job_ids:
+    #         job = self.jobs[job_id]
+    #         op_masks[job_id] = torch.zeros(job.num_ops, dtype=torch.bool)
+
+    #     valid_ops = self.schedulable_ops - self.selected_ops
+
+    #     for op in iter(valid_ops):
+    #         op_masks[op.job_id][op.id_] = 1
+
+    #     return op_masks
+
+
+
+    # def _construct_prlvl_mask(self):
+    #     prlvl_msk = torch.zeros(self.n_workers, dtype=torch.bool)
+    #     n_source_workers = self.state.num_uncommitted_source_workers
+    #     prlvl_msk[:n_source_workers] = 1
+    #     return prlvl_msk
 
 
 
@@ -319,10 +351,10 @@ class DagSchedEnv:
         self.jobs[job.id_] = job
         self.active_job_ids += [job.id_]
         self.state.add_job(job.id_)
+        [self.state.add_op(job.id_, op.id_) for op in job.ops]
 
         src_ops = job.initialize_frontier()
         self.schedulable_ops |= src_ops
-        # [self.state.add_op(job.id_, op.id_) for op in iter(src_ops)]
 
         if self.state.null_pool_has_workers:
             # if there are any workers that don't
@@ -404,7 +436,7 @@ class DagSchedEnv:
         if op.n_remaining_tasks > 0:
             # reassign the worker to keep working on this operation
             # if there is more work to do
-            self._work_on_op(worker, op)
+            self._work_on_op(worker, op, reassign=True)
             return
 
         job_frontier_changed = False
@@ -438,7 +470,7 @@ class DagSchedEnv:
         schedulable_ops = set(
             op
             for job_id in job_ids 
-            for op in self.jobs[job_id].ops
+            for op in self.jobs[job_id].active_ops
             if self._check_op_schedulable(op)
         )
 
@@ -500,9 +532,17 @@ class DagSchedEnv:
         than needed.
         '''
         job_id, op_id = op.job_id, op.id_
-        demand = op.n_remaining_tasks - \
-            self.state.n_workers_moving_to_op(job_id, op_id) - \
+
+        n_workers_moving = \
+            self.state.n_workers_moving_to_op(job_id, op_id)
+            
+        n_commitments = \
             self.state.n_commitments_to_op(job_id, op_id)
+
+        demand = op.n_remaining_tasks - n_workers_moving - n_commitments
+        
+        op.demand = demand
+
         return demand
 
 
@@ -538,7 +578,7 @@ class DagSchedEnv:
             
 
 
-    def _work_on_op(self, worker, op):
+    def _work_on_op(self, worker, op, reassign=False):
         '''starts work on another one of `op`'s 
         tasks, assuming there are still tasks 
         remaining and the worker is local to the 
@@ -549,11 +589,22 @@ class DagSchedEnv:
         assert worker.is_at_job(op.job_id)
         assert worker.available
 
+        if reassign:
+            op.demand -= 1
+
         job = self.jobs[op.job_id]
         task = job.assign_worker(worker, op, self.wall_time)
 
-        if op in self.schedulable_ops and self.check_op_saturated(op):
-            self._process_op_saturation(op)
+        # if op in self.schedulable_ops and self.check_op_saturated(op):
+        #     self._process_op_saturation(op)
+
+        if op in self.schedulable_ops:
+            if reassign:
+                if op.demand <= 0:
+                    self._process_op_saturation(op)
+            else:
+                if self.check_op_saturated(op):
+                    self._process_op_saturation(op)
 
         self._push_task_completion_event(op, task)
 

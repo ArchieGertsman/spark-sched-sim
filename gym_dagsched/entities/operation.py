@@ -31,6 +31,8 @@ class Operation:
         self.completed_tasks = set()
 
         self.saturated = False
+        # self.num_commitments = 0
+        # self.num_moving_workers = 0
 
 
     def __hash__(self):
@@ -72,6 +74,21 @@ class Operation:
     @property
     def approx_remaining_work(self):
         return self.most_recent_duration * self.n_remaining_tasks
+
+
+    # def add_moving_worker(self):
+    #     self.num_moving_workers += 1
+
+    # def remove_moving_worker(self):
+    #     self.num_moving_workers -= 1
+    #     assert self.num_moving_workers >= 0
+
+    # def add_commitments(self, n):
+    #     self.num_commitments += n
+
+    # def remove_commitment(self):
+    #     self.num_commitments -= 1
+    #     assert self.num_commitments >= 0
         
 
 

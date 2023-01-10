@@ -35,7 +35,7 @@ def main():
         n_init_jobs=1, 
         mjit=25000,
         n_workers=50,
-        initial_mean_ep_len=2000,
+        initial_mean_ep_len=3000,
         ep_len_growth=0,
         min_ep_len=0,
         writer=writer
@@ -43,7 +43,7 @@ def main():
 
     # writer.close()
 
-    # torch.save(agent.state_dict(), 'agent.pt')
+    # torch.save(model.state_dict(), 'model.pt')
 
 
 
