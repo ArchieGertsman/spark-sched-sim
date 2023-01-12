@@ -1,3 +1,4 @@
+import bisect
 import sys
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 from time import time
@@ -17,6 +18,7 @@ from ..envs.dagsched_env_async_wrapper import DagSchedEnvAsyncWrapper
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
+from ..utils.gather_with_grad import gather
 
 
 
@@ -51,7 +53,15 @@ def train(
 
     datagen_state = np.random.RandomState(69)
 
-    procs, conns = \
+    # model.share_memory()
+    # model.to(device)
+    # optim = optim_type(model.parameters(), lr=optim_lr)
+
+    (procs, 
+    conns, 
+    returns_sh_list, 
+    wall_times_sh_list,
+    baselines_sh_list) = \
         launch_subprocesses(
             num_envs, 
             model, 
@@ -72,6 +82,8 @@ def train(
 
         print(f'beginning training on sequence {epoch+1} with ep_len = {ep_len}', flush=True)
 
+        # optim.zero_grad()
+
         # send episode data to each of the subprocesses, 
         # which starts the episodes
         for conn in conns:
@@ -83,9 +95,31 @@ def train(
                 ep_len, 
                 entropy_weight))
 
+        # wait for returns and wall times
+        [conn.recv() for conn in conns]
+
+
+        baselines_list = \
+            get_piecewise_linear_fit_baseline(
+                returns_sh_list, 
+                wall_times_sh_list,
+                ep_len)
+
+
+        print('BASELINES:', baselines_list[0][:10])
+
+        # send baselines
+        for baselines, baselines_sh, conn in zip(baselines_list, baselines_sh_list, conns):
+            baselines_sh[:ep_len] = torch.from_numpy(baselines)
+            conn.send(None)
+
+
+
         # wait for model update
-        losses, avg_job_durations, n_completed_jobs_list = \
+        losses, avg_job_durations, n_completed_jobs_list, returns_list = \
             list(zip(*[conn.recv() for conn in conns]))
+
+        # optim.step()
 
         if writer:
             write_tensorboard(
@@ -94,7 +128,8 @@ def train(
                 ep_len,
                 np.mean(losses),
                 np.mean(avg_job_durations),
-                np.mean(n_completed_jobs_list)
+                np.mean(n_completed_jobs_list),
+                np.mean(returns_list)
             )
 
         # increase the mean episode length
@@ -120,12 +155,22 @@ def launch_subprocesses(
     procs = []
     conns = []
 
+    returns_sh_list = []
+    wall_times_sh_list = []
+    baselines_sh_list = []
+
     for rank in range(num_envs):
         conn_main, conn_sub = Pipe()
         conns += [conn_main]
 
         returns_sh = torch.zeros(5000)
+        returns_sh_list += [returns_sh]
+
         wall_times_sh = torch.zeros(5000)
+        wall_times_sh_list += [wall_times_sh]
+
+        baselines_sh = torch.zeros(5000)
+        baselines_sh_list += [baselines_sh]
 
         proc = Process(
             target=run_episodes, 
@@ -137,13 +182,18 @@ def launch_subprocesses(
                 discount,
                 returns_sh,
                 wall_times_sh,
+                baselines_sh,
                 optim_type,
                 optim_lr,
                 conn_sub))
 
         proc.start()
 
-    return procs, conns
+    return procs, \
+        conns, \
+        returns_sh_list, \
+        wall_times_sh_list, \
+        baselines_sh_list
 
 
 
@@ -178,38 +228,26 @@ def run_episodes(
     discount, 
     returns_sh,
     wall_times_sh,
+    baselines_sh,
     optim_type,
     optim_lr,
     conn
 ):
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
+
     configure_subproc(rank, num_envs)
 
 
-
-    
-
-
-
-
-
-
-    prof = Profiler()
-    # prof = None
+    # model.to('cuda')
 
     # this subprocess's copy of the environment
     env = DagSchedEnvAsyncWrapper(rank, datagen_state)
 
     # set up local model and optimizer
-    # local_model = deepcopy(model)
-    local_model = DDP(model.to(device), device_ids=[device])
-    optim = optim_type(local_model.parameters(), lr=optim_lr)
-
-    # streams = []
-    # for _ in range(num_envs):
-    #     streams += [torch.cuda.Stream(device=device)]
-    # s = streams[rank]
+    # local_model = deepcopy(shared_model).to(device)
+    model = DDP(model, device_ids=[device])
+    optim = optim_type(model.parameters(), lr=optim_lr)
     
 
     i = 0
@@ -227,12 +265,18 @@ def run_episodes(
         ) = data
 
 
+        prof = Profiler()
+        # prof = None
+
         if prof:
             prof.enable()
 
 
         # with torch.cuda.stream(s):
-        action_lgprobs, rewards, entropies = \
+        (rewards, 
+        wall_times, 
+        action_lgprobs, 
+        entropies) = \
             run_episode(
                 rank,
                 env,
@@ -241,71 +285,127 @@ def run_episodes(
                 mjit, 
                 n_workers,
                 ep_len,
-                local_model
+                model
             )
 
         torch.cuda.synchronize()
 
-        returns = compute_returns(rewards, discount)
-        # returns_sh[:ep_len] = returns
+        returns = compute_returns(rewards.numpy(), discount)
+        returns = torch.from_numpy(returns).float()
+        returns_sh[:ep_len] = returns
+        wall_times_sh[:ep_len] = wall_times
 
-        # # notify main proc that returns are ready
-        # conn.send(None)
+        # notify main proc that returns are ready
+        conn.send(None)
 
-        # # wait for main proc to compute baselines
-        # baselines = conn.recv()
+        # wait for main proc to compute baselines
+        conn.recv()
 
-        # compute baselines
-        baselines = returns.clone()
-        dist.all_reduce(baselines)
-        baselines /= num_envs
+        baselines = baselines_sh[:ep_len]
             
         # compute advantages
         advantages = returns - baselines
 
         # compute loss
         policy_loss = -action_lgprobs @ advantages
-        print('POLICY LOSS:', policy_loss)
         entropy_loss = entropy_weight * entropies.sum()
-        print('ENTROPY LOSS:', entropy_loss)
 
         loss = (policy_loss + entropy_loss) / 1e4
+        
 
-        # update model
         optim.zero_grad()
-        # with torch.cuda.stream(s):
+
+        # if rank == 0:
+        #     losses = gather(loss)
+        #     total_loss = torch.stack(losses).sum()
+        #     total_loss.backward()
+        # else:
+        #     dummy = gather(loss)
+        #     dummy.backward(loss.new_tensor([]))
+
+
+        # for param in model.parameters():
+        #     dist.all_reduce(param.grad)
 
         loss.backward()
 
 
-        # for param in local_model.parameters():
-        #     dist.all_reduce(param.grad)
-
-        for param in local_model.parameters():
-            param.grad.mul_(num_envs)
+        # update model
 
         optim.step()
 
-        if rank == 0 and i % 10 == 0:
-            torch.save(model.state_dict(), 'model.pt')
+
+        ddp_logging_data = model._get_ddp_logging_data()
+        static_graph = ddp_logging_data.get("can_set_static_graph")
+        print('STATIC GRAPH:', static_graph)
+
+        
+
+        # if rank == 0 and i % 10 == 0:
+        #     torch.save(model.state_dict(), 'model.pt')
         
 
         if prof:
             prof.disable()
 
-        send_ep_stats(conn, loss, env)
+        # send back stats
+        conn.send((
+            loss.item(),
+            avg_job_duration(env) * 1e-3,
+            # avg_job_duration(env) / env.wall_time,
+            env.n_completed_jobs,
+            returns[0]))
+
+    dist.destroy_process_group()
 
 
 
 
-def send_ep_stats(conn, loss, env):
-    '''sends statistics back to main process for tensorboard 
-    logging
-    '''
-    conn.send((
-        loss.item(),
-        avg_job_duration(env) * 1e-3,
-        env.n_completed_jobs))
+def get_piecewise_linear_fit_baseline(all_cum_rewards, all_wall_time, ep_len):
+    # do a piece-wise linear fit baseline
+    # all_cum_rewards: list of lists of cumulative rewards
+    # all_wall_time:   list of lists of physical time
+    assert len(all_cum_rewards) == len(all_wall_time)
+
+    all_cum_rewards = [cum_rewards[:ep_len].numpy() for cum_rewards in all_cum_rewards]
+    all_wall_time = [wall_time[:ep_len].numpy() for wall_time in all_wall_time]
+
+    print('RETURNS:', all_cum_rewards[0][:10])
+    print('WALLTIME:', all_wall_time[0][:10])
+
+    # all unique wall time
+    unique_wall_time = np.unique(np.hstack(all_wall_time))
+
+    # for find baseline value for all unique time points
+    baseline_values = {}
+    for t in unique_wall_time:
+        baseline = 0
+        for i in range(len(all_wall_time)):
+            idx = bisect.bisect_left(all_wall_time[i], t)
+            if idx == 0:
+                baseline += all_cum_rewards[i][idx]
+            elif idx == len(all_cum_rewards[i]):
+                baseline += all_cum_rewards[i][-1]
+            elif all_wall_time[i][idx] == t:
+                baseline += all_cum_rewards[i][idx]
+            else:
+                baseline += \
+                    (all_cum_rewards[i][idx] - all_cum_rewards[i][idx - 1]) / \
+                    (all_wall_time[i][idx] - all_wall_time[i][idx - 1]) * \
+                    (t - all_wall_time[i][idx]) + all_cum_rewards[i][idx]
+
+        baseline_values[t] = baseline / float(len(all_wall_time))
+
+    # output n baselines
+    baselines = []
+    for wall_time in all_wall_time:
+        baseline = np.array([baseline_values[t] for t in wall_time])
+        baselines.append(baseline)
+
+    return baselines
+
+
+
 
 
 
@@ -315,12 +415,14 @@ def write_tensorboard(
     ep_len, 
     loss,
     avg_job_duration,
-    n_completed_jobs
+    n_completed_jobs,
+    returns
 ):
     writer.add_scalar('episode length', ep_len, epoch)
     writer.add_scalar('loss', loss, epoch)
     writer.add_scalar('avg job duration', avg_job_duration, epoch)
     writer.add_scalar('n completed jobs', n_completed_jobs, epoch)
+    writer.add_scalar('returns', returns, epoch)
 
 
 
@@ -339,8 +441,9 @@ def run_episode(
     obs = env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
     done = False
 
-    action_lgprobs = torch.zeros(ep_len)
     rewards = torch.zeros(ep_len)
+    wall_times = torch.zeros(ep_len)
+    action_lgprobs = torch.zeros(ep_len)
     entropies = torch.zeros(ep_len)
 
 
@@ -366,12 +469,15 @@ def run_episode(
         new_dag_batch, 
         valid_ops_mask, 
         active_job_ids, 
-        n_source_workers) = obs
+        n_source_workers,
+        wall_time) = obs
 
         if new_dag_batch is not None:
             job_ptr = new_dag_batch.ptr.numpy()
         else:
             assert job_ptr is not None
+
+        num_ops = node_features.shape[0]
 
         op_scores, prlvl_scores = \
             invoke_agent(
@@ -391,11 +497,13 @@ def run_episode(
             )
 
         # entropy_scale = 1 / (np.log(n_source_workers * num_ops))
-        # entropy = entropy_scale * entropy
+        entropy_scale = 1 / (n_source_workers * num_ops)
+        entropy = entropy_scale * entropy
 
         obs, reward, done = env.step(action)
 
         rewards[i] = reward
+        wall_times[i] = wall_time
         action_lgprobs[i] = action_lgp
         entropies[i] = entropy
 
@@ -405,7 +513,7 @@ def run_episode(
     # if rank == 0:
     #     prof.stop()
 
-    return action_lgprobs, rewards, entropies    
+    return rewards, wall_times, action_lgprobs, entropies    
 
 
 
@@ -519,12 +627,11 @@ def sample_prlvl(prlvl_scores, job_idx):
 
 
 def compute_returns(rewards, discount):
-    rewards = np.array(rewards)
     r = rewards[...,::-1]
     a = [1, -discount]
     b = [1]
     y = lfilter(b, a, x=r)
-    return torch.from_numpy(y[...,::-1].copy()).float()
+    return y[...,::-1].copy()
 
 
 

@@ -103,7 +103,8 @@ class DagSchedEnvAsyncWrapper:
         (n_source_workers,
         source_job_id, 
         valid_ops, 
-        active_jobs) = obs
+        active_jobs,
+        wall_time) = obs
 
         (active_job_mask, 
         active_op_mask, 
@@ -137,7 +138,8 @@ class DagSchedEnvAsyncWrapper:
             new_dag_subbatch, \
             valid_ops_mask, \
             active_job_ids, \
-            n_source_workers
+            n_source_workers, \
+            wall_time
 
 
 

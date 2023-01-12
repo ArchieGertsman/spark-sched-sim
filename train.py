@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.multiprocessing import set_start_method
 
 from gym_dagsched.policies.decima_agent import ActorNetwork
-from gym_dagsched.reinforce import reinforce_sync, reinforce_async
+from gym_dagsched.reinforce import reinforce_async
 
 
 def main():
@@ -18,15 +18,15 @@ def main():
         num_node_features=5, 
         num_dag_features=3)
 
-    # writer = SummaryWriter('log/train')
-    writer = None
+    writer = SummaryWriter('log/train')
+    # writer = None
 
     reinforce_async.train(
         model,
         optim_type=torch.optim.Adam,
         optim_lr=.001,
         n_sequences=1,
-        num_envs=16,
+        num_envs=2,
         discount=.99,
         entropy_weight_init=1.,
         entropy_weight_decay=1e-3,
@@ -35,13 +35,14 @@ def main():
         n_init_jobs=1, 
         mjit=25000,
         n_workers=50,
-        initial_mean_ep_len=3000,
+        initial_mean_ep_len=100,
         ep_len_growth=0,
         min_ep_len=0,
         writer=writer
     )
 
-    # writer.close()
+    if writer:
+        writer.close()
 
     # torch.save(model.state_dict(), 'model.pt')
 

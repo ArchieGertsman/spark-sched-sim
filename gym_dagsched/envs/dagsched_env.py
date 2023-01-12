@@ -239,17 +239,6 @@ class DagSchedEnv:
 
     ## Observations
 
-    # def _observe(self):
-        
-
-    #     active_jobs_feature_mat = \
-    #         self._construct_active_jobs_feature_mat()
-
-    #     op_masks = self._construct_op_masks()
-    #     prlvl_mask = self._construct_prlvl_mask()
-
-    #     return active_jobs_feature_mat, op_masks, prlvl_mask
-
     def _observe(self):
         n_source_workers = self.state.num_uncommitted_source_workers
         source_job_id = self.state.source_job
@@ -258,72 +247,9 @@ class DagSchedEnv:
         return n_source_workers, \
             source_job_id, \
             valid_ops, \
-            active_jobs 
+            active_jobs, \
+            self.wall_time
 
-
-
-
-    # def _construct_active_jobs_feature_mat(self):
-    #     n_source_workers = self.state.num_uncommitted_source_workers
-    #     source_job_id = self.state.source_job
-
-    #     op_counts = np.array([
-    #         self.jobs[job_id].num_active_ops 
-    #         for job_id in self.active_job_ids
-    #     ])
-
-    #     active_jobs_feature_mat = np.zeros((sum(op_counts), 5))
-
-    #     job_feature_mats = np.split(
-    #         active_jobs_feature_mat,
-    #         np.cumsum(op_counts[:-1])
-    #     )
-
-    #     for job_id, job_feature_mat in zip(self.active_job_ids, job_feature_mats):
-    #         job = self.jobs[job_id]
-    #         worker_count = job.total_worker_count
-    #         is_source_job = (job_id == source_job_id)
-
-    #         # job-level features
-    #         job_feature_mat[:, :3] = np.array([
-    #             n_source_workers / 20,
-    #             int(is_source_job) * 4 - 2,
-    #             worker_count / 20
-    #         ])
-
-    #         # node-level features
-    #         job_feature_mat[:, 3:] = np.stack([
-    #             np.array([
-    #                 op.n_remaining_tasks / 200,
-    #                 op.approx_remaining_work / 1e5
-    #             ])
-    #             for op in iter(job.active_ops)
-    #         ])
-
-    #     return active_jobs_feature_mat
-
-
-
-    # def _construct_op_masks(self):
-    #     op_masks = {}
-    #     for job_id in self.active_job_ids:
-    #         job = self.jobs[job_id]
-    #         op_masks[job_id] = torch.zeros(job.num_ops, dtype=torch.bool)
-
-    #     valid_ops = self.schedulable_ops - self.selected_ops
-
-    #     for op in iter(valid_ops):
-    #         op_masks[op.job_id][op.id_] = 1
-
-    #     return op_masks
-
-
-
-    # def _construct_prlvl_mask(self):
-    #     prlvl_msk = torch.zeros(self.n_workers, dtype=torch.bool)
-    #     n_source_workers = self.state.num_uncommitted_source_workers
-    #     prlvl_msk[:n_source_workers] = 1
-    #     return prlvl_msk
 
 
 
