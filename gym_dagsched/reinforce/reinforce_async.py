@@ -1,8 +1,9 @@
-import bisect
 import sys
+
+from attr import dataclass
+
+
 sys.path.append('./gym_dagsched/data_generation/tpch/')
-from time import time
-from copy import deepcopy
 import os
 
 import torch
@@ -13,12 +14,15 @@ import torch.profiler
 import torch.distributed as dist
 from torch.multiprocessing import Pipe, Process
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch_geometric.data import Batch
 
 from ..envs.dagsched_env_async_wrapper import DagSchedEnvAsyncWrapper
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
-from ..utils.gather_with_grad import gather
+from ..utils.baselines import compute_piecewise_linear_fit_baselines
+from ..utils.pyg import add_adj
 
 
 
@@ -50,12 +54,10 @@ def train(
     # set up torch.distributed for IPC
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
+    # os.environ["TORCH_CPP_LOG_LEVEL"]="INFO"
+    # os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 
     datagen_state = np.random.RandomState(69)
-
-    # model.share_memory()
-    # model.to(device)
-    # optim = optim_type(model.parameters(), lr=optim_lr)
 
     (procs, 
     conns, 
@@ -78,11 +80,9 @@ def train(
         # ep_len = np.random.geometric(1/mean_ep_len)
         # ep_len = max(ep_len, min_ep_len)
         # ep_len = min(ep_len, 4500)
-        ep_len = mean_ep_len
+        max_ep_len = mean_ep_len
 
-        print(f'beginning training on sequence {epoch+1} with ep_len = {ep_len}', flush=True)
-
-        # optim.zero_grad()
+        print(f'beginning training on sequence {epoch+1} with ep_len = {max_ep_len}', flush=True)
 
         # send episode data to each of the subprocesses, 
         # which starts the episodes
@@ -92,34 +92,36 @@ def train(
                 n_init_jobs, 
                 mjit, 
                 n_workers, 
-                ep_len, 
+                max_ep_len, 
                 entropy_weight))
 
         # wait for returns and wall times
-        [conn.recv() for conn in conns]
+        ep_lens = [conn.recv() for conn in conns]
 
 
         baselines_list = \
-            get_piecewise_linear_fit_baseline(
+            compute_piecewise_linear_fit_baselines(
                 returns_sh_list, 
                 wall_times_sh_list,
-                ep_len)
+                ep_lens)
 
 
-        print('BASELINES:', baselines_list[0][:10])
+        gen = zip(
+            baselines_sh_list, 
+            baselines_list, 
+            ep_lens, 
+            conns)
 
         # send baselines
-        for baselines, baselines_sh, conn in zip(baselines_list, baselines_sh_list, conns):
+        for baselines_sh, baselines, ep_len, conn in gen:
             baselines_sh[:ep_len] = torch.from_numpy(baselines)
             conn.send(None)
-
 
 
         # wait for model update
         losses, avg_job_durations, n_completed_jobs_list, returns_list = \
             list(zip(*[conn.recv() for conn in conns]))
 
-        # optim.step()
 
         if writer:
             write_tensorboard(
@@ -204,7 +206,7 @@ def terminate_subprocesses(conns, procs):
 
 
 
-def configure_subproc(rank, num_envs):
+def setup(rank, num_envs):
     sys.stdout = open(f'log/proc/{rank}.out', 'a')
 
     torch.set_num_threads(1)
@@ -218,6 +220,15 @@ def configure_subproc(rank, num_envs):
     # each process would produce an identical episode.
     torch.manual_seed(rank)
     np.random.seed(rank)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+
+
+
 
 
 def run_episodes(
@@ -236,33 +247,32 @@ def run_episodes(
     '''subprocess function which runs episodes and trains the model 
     by communicating with the parent process'''
 
-    configure_subproc(rank, num_envs)
+    setup(rank, num_envs)
 
-
-    # model.to('cuda')
-
-    # this subprocess's copy of the environment
     env = DagSchedEnvAsyncWrapper(rank, datagen_state)
 
-    # set up local model and optimizer
-    # local_model = deepcopy(shared_model).to(device)
-    model = DDP(model, device_ids=[device])
-    optim = optim_type(model.parameters(), lr=optim_lr)
-    
+    model = DDP(
+        model.to(device), 
+        device_ids=[device],
+        gradient_as_bucket_view=True)
 
+    optim = ZeroRedundancyOptimizer(
+        model.parameters(),
+        optimizer_class=optim_type,
+        lr=optim_lr
+    )
+    
     i = 0
     while data := conn.recv():
         i += 1
 
         # receive episode data from parent process
-        (   
-            n_job_arrivals, 
-            n_init_jobs, 
-            mjit, 
-            n_workers,
-            ep_len, 
-            entropy_weight
-        ) = data
+        (n_job_arrivals, 
+         n_init_jobs, 
+         mjit, 
+         n_workers,
+         max_ep_len, 
+         entropy_weight) = data
 
 
         prof = Profiler()
@@ -272,11 +282,7 @@ def run_episodes(
             prof.enable()
 
 
-        # with torch.cuda.stream(s):
-        (rewards, 
-        wall_times, 
-        action_lgprobs, 
-        entropies) = \
+        experience = \
             run_episode(
                 rank,
                 env,
@@ -284,127 +290,221 @@ def run_episodes(
                 n_init_jobs, 
                 mjit, 
                 n_workers,
-                ep_len,
+                max_ep_len,
                 model
             )
 
-        torch.cuda.synchronize()
+        wall_times, rewards = \
+            list(zip(*[
+                (exp.wall_time, exp.reward) 
+                for exp in experience]))
 
-        returns = compute_returns(rewards.numpy(), discount)
-        returns = torch.from_numpy(returns).float()
+        ep_len = len(experience)
+
+        returns = compute_returns(rewards, discount)
+
+        # write returns and wall times to shared tensors
         returns_sh[:ep_len] = returns
-        wall_times_sh[:ep_len] = wall_times
+        wall_times_sh[:ep_len] = torch.tensor(wall_times)
 
-        # notify main proc that returns are ready
-        conn.send(None)
+        # notify main proc that returns and wall times are ready
+        conn.send(ep_len)
 
         # wait for main proc to compute baselines
         conn.recv()
-
         baselines = baselines_sh[:ep_len]
             
         # compute advantages
         advantages = returns - baselines
 
-        # compute loss
-        policy_loss = -action_lgprobs @ advantages
-        entropy_loss = entropy_weight * entropies.sum()
 
-        loss = (policy_loss + entropy_loss) / 1e4
-        
+        loss = learn_from_experience(
+            model,
+            optim,
+            experience,
+            advantages,
+            entropy_weight,
+            num_envs
+        )
 
-        optim.zero_grad()
-
-        # if rank == 0:
-        #     losses = gather(loss)
-        #     total_loss = torch.stack(losses).sum()
-        #     total_loss.backward()
-        # else:
-        #     dummy = gather(loss)
-        #     dummy.backward(loss.new_tensor([]))
-
-
-        # for param in model.parameters():
-        #     dist.all_reduce(param.grad)
-
-        loss.backward()
-
-
-        # update model
-
-        optim.step()
-
-
-        ddp_logging_data = model._get_ddp_logging_data()
-        static_graph = ddp_logging_data.get("can_set_static_graph")
-        print('STATIC GRAPH:', static_graph)
-
-        
 
         # if rank == 0 and i % 10 == 0:
         #     torch.save(model.state_dict(), 'model.pt')
         
-
         if prof:
             prof.disable()
 
-        # send back stats
+        # send stats
         conn.send((
-            loss.item(),
+            loss,
             avg_job_duration(env) * 1e-3,
-            # avg_job_duration(env) / env.wall_time,
             env.n_completed_jobs,
             returns[0]))
 
-    dist.destroy_process_group()
+    cleanup()
 
 
 
 
-def get_piecewise_linear_fit_baseline(all_cum_rewards, all_wall_time, ep_len):
-    # do a piece-wise linear fit baseline
-    # all_cum_rewards: list of lists of cumulative rewards
-    # all_wall_time:   list of lists of physical time
-    assert len(all_cum_rewards) == len(all_wall_time)
 
-    all_cum_rewards = [cum_rewards[:ep_len].numpy() for cum_rewards in all_cum_rewards]
-    all_wall_time = [wall_time[:ep_len].numpy() for wall_time in all_wall_time]
+def learn_from_experience(
+    model,
+    optim,
+    experience,
+    advantages,
+    entropy_weight,
+    num_envs
+):
+    model.train()
 
-    print('RETURNS:', all_cum_rewards[0][:10])
-    print('WALLTIME:', all_wall_time[0][:10])
+    batched_model_inputs = \
+        extract_batched_model_inputs(experience)
 
-    # all unique wall time
-    unique_wall_time = np.unique(np.hstack(all_wall_time))
+    node_scores_batch, dag_scores_batch = \
+        model(*batched_model_inputs)
 
-    # for find baseline value for all unique time points
-    baseline_values = {}
-    for t in unique_wall_time:
-        baseline = 0
-        for i in range(len(all_wall_time)):
-            idx = bisect.bisect_left(all_wall_time[i], t)
-            if idx == 0:
-                baseline += all_cum_rewards[i][idx]
-            elif idx == len(all_cum_rewards[i]):
-                baseline += all_cum_rewards[i][-1]
-            elif all_wall_time[i][idx] == t:
-                baseline += all_cum_rewards[i][idx]
-            else:
-                baseline += \
-                    (all_cum_rewards[i][idx] - all_cum_rewards[i][idx - 1]) / \
-                    (all_wall_time[i][idx] - all_wall_time[i][idx - 1]) * \
-                    (t - all_wall_time[i][idx]) + all_cum_rewards[i][idx]
+    action_lgprobs, action_entropies = \
+        action_attributes(
+            node_scores_batch, 
+            dag_scores_batch, 
+            experience
+        )
 
-        baseline_values[t] = baseline / float(len(all_wall_time))
+    loss = compute_loss(
+        action_lgprobs, 
+        action_entropies, 
+        advantages, 
+        entropy_weight
+    )
+    
+    optim.zero_grad()
 
-    # output n baselines
-    baselines = []
-    for wall_time in all_wall_time:
-        baseline = np.array([baseline_values[t] for t in wall_time])
-        baselines.append(baseline)
+    loss.backward()
 
-    return baselines
+    torch.cuda.synchronize()
+
+    # DDP averages grads over the workers, 
+    # while we just want them to be summed,
+    # so scale them back.
+    scale_grads(model, num_envs)
+
+    optim.step()
+
+    return loss.item()
 
 
+
+def scale_grads(model, num_envs):
+    for param in model.parameters():
+        # TODO: figure out why some grads are None...
+        if param.grad is not None:
+            param.grad.mul_(num_envs)
+
+
+
+def extract_batched_model_inputs(experience):
+    (dag_batch_list,
+     num_jobs_per_obs, 
+     num_source_workers_list) = \
+        list(zip(*[
+            (exp.dag_batch,
+             exp.num_jobs,
+             exp.num_source_workers)
+            for exp in experience
+        ]))
+
+    nested_dag_batch = Batch.from_data_list(dag_batch_list)
+    ptr = nested_dag_batch.batch.bincount().cumsum(dim=0)
+    nested_dag_batch.ptr = torch.cat([torch.tensor([0]), ptr], dim=0)
+    add_adj(nested_dag_batch)
+    nested_dag_batch.to(device)
+
+    n_workers_batch = torch.tensor(num_source_workers_list)
+
+    num_jobs_per_obs = torch.tensor(num_jobs_per_obs)
+
+    return nested_dag_batch, n_workers_batch, num_jobs_per_obs
+
+
+
+
+def action_attributes(
+    node_scores_batch, 
+    dag_scores_batch, 
+    experience,
+):
+    action_lgprobs = []
+    action_entropies = []
+
+    gen = zip(
+        node_scores_batch,
+        dag_scores_batch,
+        experience
+    )
+
+    for node_scores, dag_scores, exp in gen:
+        dag_scores = dag_scores.view(exp.num_jobs, exp.num_source_workers)
+
+        node_selection, dag_idx, dag_selection = exp.action
+
+        node_scores = node_scores.cpu()
+        invalid_op_indices = (~exp.valid_ops_mask).nonzero()
+        node_scores[invalid_op_indices] = torch.finfo(torch.float).min
+        node_lgprob, node_entropy = \
+            node_action_attributes(node_scores, node_selection)
+
+        dag_scores = dag_scores.cpu()
+        dag_lgprob, dag_entropy = \
+            dag_action_attributes(dag_scores, dag_idx, dag_selection)
+
+        num_nodes = node_scores.numel()
+        ent_scale = 1 / (exp.num_source_workers * num_nodes)
+
+        action_lgp = node_lgprob + dag_lgprob
+        action_ent = ent_scale * (node_entropy + dag_entropy)
+
+        action_lgprobs += [action_lgp]
+        action_entropies += [action_ent]
+
+    action_lgprobs = torch.stack(action_lgprobs)
+    action_entropies = torch.stack(action_entropies)
+
+    return action_lgprobs, action_entropies
+
+    
+
+
+def compute_loss(
+    action_lgprobs, 
+    action_entropies, 
+    advantages, 
+    entropy_weight
+):
+    policy_loss = -action_lgprobs @ advantages
+    entropy_loss = entropy_weight * action_entropies.sum()
+
+    loss = (policy_loss + entropy_loss) / 1e4
+
+    return loss
+
+
+def node_action_attributes(node_scores, node_selection):
+    c_node = Categorical(logits=node_scores)
+    node_lgprob = c_node.log_prob(node_selection)
+    node_entropy = c_node.entropy()
+    return node_lgprob, node_entropy
+
+
+def dag_action_attributes(dag_scores, dag_idx, dag_selection):
+    dag_lgprob = \
+        Categorical(logits=dag_scores[dag_idx]) \
+            .log_prob(dag_selection)
+
+    dag_entropy = \
+        Categorical(logits=dag_scores) \
+            .entropy().sum()
+    
+    return dag_lgprob, dag_entropy
 
 
 
@@ -437,119 +537,116 @@ def run_episode(
     n_workers,
     ep_len,
     model
-):
+):  
+    model.eval()
+
     obs = env.reset(n_job_arrivals, n_init_jobs, mjit, n_workers)
     done = False
 
-    rewards = torch.zeros(ep_len)
-    wall_times = torch.zeros(ep_len)
-    action_lgprobs = torch.zeros(ep_len)
-    entropies = torch.zeros(ep_len)
-
-
-
-    # if rank == 0:
-    #     prof = torch.profiler.profile(
-    #         schedule=torch.profiler.schedule(wait=50, warmup=1, active=20),
-    #         on_trace_ready=torch.profiler.tensorboard_trace_handler('log/perf'),
-    #         record_shapes=True,
-    #         with_stack=True,
-    #         profile_memory=True)
-
-    #     prof.start()
-
     job_ptr = None
+
+    dag_batch_device = None
+
+
+    experience = []
     
 
     for i in range(ep_len):
         if done:
             break
 
-        (node_features,
-        new_dag_batch, 
+
+        (did_update_dag_batch,
+        dag_batch,
         valid_ops_mask, 
         active_job_ids, 
-        n_source_workers,
+        num_source_workers,
         wall_time) = obs
 
-        if new_dag_batch is not None:
-            job_ptr = new_dag_batch.ptr.numpy()
+
+        if did_update_dag_batch:
+            job_ptr = dag_batch.ptr.numpy()
+            dag_batch_device = dag_batch.clone() \
+                .to(device, non_blocking=True)
         else:
-            assert job_ptr is not None
+            dag_batch_device.x = dag_batch.x \
+                .to(device, non_blocking=True)
 
-        num_ops = node_features.shape[0]
 
-        op_scores, prlvl_scores = \
+        node_scores, dag_scores = \
             invoke_agent(
                 model,
-                node_features,
-                new_dag_batch,
+                dag_batch_device,
                 valid_ops_mask,
-                n_source_workers
+                num_source_workers
             )
 
-        action, action_lgp, entropy = \
+        raw_action, parsed_action = \
             sample_action(
-                op_scores, 
-                prlvl_scores,
+                node_scores, 
+                dag_scores,
                 job_ptr,
                 active_job_ids,
             )
 
-        # entropy_scale = 1 / (np.log(n_source_workers * num_ops))
-        entropy_scale = 1 / (n_source_workers * num_ops)
-        entropy = entropy_scale * entropy
-
-        obs, reward, done = env.step(action)
-
-        rewards[i] = reward
-        wall_times[i] = wall_time
-        action_lgprobs[i] = action_lgp
-        entropies[i] = entropy
-
-    #     if rank == 0:
-    #         prof.step()
-
-    # if rank == 0:
-    #     prof.stop()
-
-    return rewards, wall_times, action_lgprobs, entropies    
+        # entropy_scale = 1 / (num_source_workers * num_ops)
+        # entropy = entropy_scale * entropy
 
 
+        obs, reward, done = env.step(parsed_action)
 
+        num_jobs = len(active_job_ids)
+
+        experience += [Experience(
+            dag_batch.clone(),
+            valid_ops_mask,
+            num_jobs,
+            num_source_workers,
+            wall_time,
+            raw_action,
+            reward
+        )]
+
+
+    return experience
+
+
+
+
+@dataclass
+class Experience:
+    dag_batch: object
+    valid_ops_mask: object
+    num_jobs: int
+    num_source_workers: int
+    wall_time: float
+    action: object
+    reward: float
 
 
 
 
 def invoke_agent(
-    agent, 
-    node_features,
-    new_dag_batch,
+    model,
+    dag_batch_device,
     valid_ops_mask,
-    n_workers
+    worker_count
 ):
-    if new_dag_batch is not None:
-        new_dag_batch = new_dag_batch.clone() \
-            .to(device, non_blocking=True)
-
-    node_features = node_features \
-        .to(device, non_blocking=True)
-
-    op_scores, prlvl_scores = \
-        agent(
-            node_features,
-            new_dag_batch,
-            n_workers
+    node_scores, dag_scores = \
+        model(
+            dag_batch_device,
+            worker_count
         )
 
-    op_scores, prlvl_scores = op_scores.cpu(), prlvl_scores.cpu()
+    node_scores = node_scores.cpu()
+    node_scores[(~valid_ops_mask).nonzero()] = torch.finfo(torch.float).min
 
-    op_scores[(~valid_ops_mask).nonzero()] = torch.finfo(torch.float).min
+    dag_scores = dag_scores.cpu()
+    dag_scores = dag_scores.view(
+        dag_batch_device.num_graphs, 
+        worker_count)
 
-    # rows, cols = (~valid_prlvl_msk).nonzero()
-    # prlvl_scores[rows, cols] = torch.finfo(torch.float).min
-
-    return op_scores, prlvl_scores
+    return node_scores, dag_scores
 
 
 
@@ -558,30 +655,32 @@ def invoke_agent(
 
 
 def sample_action(
-    op_scores, 
-    prlvl_scores, 
+    node_scores, 
+    dag_scores, 
     job_ptr,
     active_job_ids,
 ):
-    # operation selection
-    op, op_lgp, op_entropy = \
-        sample_op(op_scores)
+    # select the next operation to schedule
+    op_sample = Categorical(logits=node_scores).sample()
 
     job_idx, op = \
         translate_op(
-            op, 
+            op_sample.item(), 
             job_ptr,
             active_job_ids)
 
-    # parallelism level selection
-    prlvl, prlvl_lgp, prlvl_entropy = \
-        sample_prlvl(prlvl_scores, job_idx)
+    # select the number of workers to schedule
+    num_workers_sample = \
+        Categorical(logits=dag_scores[job_idx]).sample()
 
-    action = (op, prlvl)
-    action_lgp = op_lgp + prlvl_lgp
-    entropy = op_entropy + prlvl_entropy
+    # action recorded in experience,
+    # used for training later
+    raw_action = (op_sample, job_idx, num_workers_sample)
 
-    return action, action_lgp, entropy
+    # action sent to env
+    parsed_action = (op, 1+num_workers_sample.item())
+
+    return raw_action, parsed_action
 
 
 
@@ -597,41 +696,16 @@ def translate_op(op, job_ptr, active_jobs_ids):
 
 
 
+def compute_returns(rewards_list, discount):
+    rewards = np.array(rewards_list)
 
-def sample_op(op_scores):
-    '''sample index of next operation for each env.
-    Returns the operation selections, the log-probability 
-    of each selection, and the entropy of policy distribution
-    '''
-    c = Categorical(logits=op_scores)
-    op = c.sample()
-    lgp = c.log_prob(op)
-    entropy = c.entropy()
-    return op.item(), lgp, entropy
-
-
-
-def sample_prlvl(prlvl_scores, job_idx):
-    '''sample parallelism level for the job of each selected 
-    operation for each env.
-    Returns the parallelism level selections, the log-probability
-    of each selection, and the 
-    '''
-    prlvl_scores_selected = prlvl_scores[job_idx]
-    c = Categorical(logits=prlvl_scores_selected)
-    prlvl = c.sample()
-    lgp = c.log_prob(prlvl)
-    entropy = Categorical(logits=prlvl_scores).entropy().sum()
-    return (1 + prlvl).item(), lgp, entropy
-
-
-
-def compute_returns(rewards, discount):
     r = rewards[...,::-1]
     a = [1, -discount]
     b = [1]
     y = lfilter(b, a, x=r)
-    return y[...,::-1].copy()
+    y = y[...,::-1].copy()
+
+    return torch.from_numpy(y).float()
 
 
 

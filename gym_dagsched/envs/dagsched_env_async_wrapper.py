@@ -6,7 +6,7 @@ import numpy as np
 
 from .dagsched_env import DagSchedEnv
 from ..data_generation.tpch_datagen import TPCHDataGen
-from ..utils.pyg import construct_subbatch, chunk_feature_tensor
+from ..utils.pyg import construct_subbatch
 
 
 
@@ -64,8 +64,6 @@ class DagSchedEnvAsyncWrapper:
         self.dag_subbatch = None
 
         self._reset_dag_batch(initial_timeline)
-        # self.feature_tensor_chunks = \
-        #     chunk_feature_tensor(self.dag_batch)
 
         obs = self.env.reset(initial_timeline, workers)
 
@@ -82,11 +80,11 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _parse_action(self, action):
-        (job_id, active_op_idx), prlvl = action
+        (job_id, active_op_idx), num_workers = action
         job = self.env.jobs[job_id]
         active_ops = list(job.active_ops)
         op_id = active_ops[active_op_idx].id_
-        action = ((job_id, op_id), prlvl)
+        action = ((job_id, op_id), num_workers)
         return action
 
 
@@ -100,42 +98,38 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _parse_obs(self, obs):
-        (n_source_workers,
-        source_job_id, 
-        valid_ops, 
-        active_jobs,
-        wall_time) = obs
+        (new_commitment_round,
+         n_source_workers,
+         source_job_id, 
+         valid_ops, 
+         active_jobs,
+         wall_time) = obs
 
         (active_job_mask, 
-        active_op_mask, 
-        op_counts, 
-        valid_ops_mask) = \
+         active_op_mask, 
+         op_counts, 
+         valid_ops_mask) = \
             self._bookkeep(active_jobs, valid_ops)
 
-        # valid_prlvl_msk = np.zeros((len(active_jobs), self.n_workers), dtype=bool)
-        # valid_prlvl_msk[:, :n_source_workers] = 1
-
-        new_dag_subbatch = \
+        did_update = \
             self._update_dag_subbatch(
                 active_op_mask,
                 active_job_mask,
                 op_counts,
-                active_jobs
-            )
+                active_jobs)
 
-        node_features = \
-            self._update_node_features(
-                active_jobs,
-                source_job_id,
-                n_source_workers
-            )
+        self._update_node_features(
+            new_commitment_round,
+            active_jobs,
+            source_job_id,
+            n_source_workers)
 
         active_job_ids = np.array(self.env.active_job_ids)
 
         self.active_op_mask = active_op_mask
 
-        return node_features, \
-            new_dag_subbatch, \
+        return did_update, \
+            self.dag_subbatch, \
             valid_ops_mask, \
             active_job_ids, \
             n_source_workers, \
@@ -169,32 +163,42 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _update_node_features(self,
+        new_commitment_round,
         active_jobs,
         source_job_id,
         n_source_workers
     ):
-        all_node_features = np.zeros(self.dag_subbatch.x.shape, dtype=np.float32)
+        # make updates in a numpy array instead
+        # of the tensor directly, because numpy
+        # is faster for cpu computations
+        all_node_features = \
+            np.zeros(self.dag_subbatch.x.shape, dtype=np.float32)
 
         ptr = self.dag_subbatch.ptr[1:].numpy()
 
-        node_features_split = np.split(
-            all_node_features,
-            ptr)
+        node_features_split = \
+            np.split(all_node_features, ptr)
+
+        all_node_features[:, 0] = n_source_workers / 20
 
         for job, node_features in zip(active_jobs, node_features_split):
-            worker_count = job.total_worker_count
-            is_source_job = (job.id_ == source_job_id)
+            node_features[:, 2] = job.total_worker_count / 20
 
-            node_features[:, 0] = n_source_workers / 20
+            if not new_commitment_round:
+                # if we are in the same commitment round
+                # then none of the other features could
+                # have changed.
+                continue
+
+            is_source_job = (job.id_ == source_job_id)
             node_features[:, 1] = int(is_source_job) * 4 - 2
-            node_features[:, 2] = worker_count / 20
 
             for i, op in enumerate(iter(job.active_ops)):
                 node_features[i, 3] = op.n_remaining_tasks / 200
                 node_features[i, 4] = op.approx_remaining_work / 1e5
 
         all_node_features = torch.from_numpy(all_node_features)
-        return all_node_features
+        self.dag_subbatch.x = all_node_features
 
 
 
@@ -209,13 +213,11 @@ class DagSchedEnvAsyncWrapper:
         construct `self.dag_subbatch` to reflact
         that.
 
-        Returns: new subbatch object if the number
-        of active ops has changed, otherwise `None`,
-        indicating that cached subbatch should be
-        reused.
+        Returns whether or not `self.dag_subbatch`
+        was updated.
         '''
 
-        new_dag_subbatch = None
+        did_update = False
 
         if self.active_op_mask is None or \
             (self.active_op_mask.shape != active_op_mask.shape or \
@@ -228,6 +230,6 @@ class DagSchedEnvAsyncWrapper:
                 op_counts,
                 len(active_jobs))
 
-            new_dag_subbatch = self.dag_subbatch
+            did_update = True
 
-        return new_dag_subbatch
+        return did_update

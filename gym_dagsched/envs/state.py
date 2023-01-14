@@ -82,13 +82,13 @@ class State:
 
     @property
     def num_uncommitted_source_workers(self):
-        n_uncommitted = self._n_workers_at(self._curr_source) - \
+        n_uncommitted = self._num_workers_at(self._curr_source) - \
             self._n_commitments_from(self._curr_source)
         assert n_uncommitted >= 0
         return n_uncommitted
 
     def _num_uncommitted_workers(self, source):
-        n_uncommitted = self._n_workers_at(source) - \
+        n_uncommitted = self._num_workers_at(source) - \
             self._n_commitments_from(source)
         assert n_uncommitted >= 0
         return n_uncommitted
@@ -118,16 +118,16 @@ class State:
 
     ## reset: call in environment reset method
 
-    def reset(self, n_workers):
+    def reset(self, num_workers):
         self.G = nx.DiGraph()
 
-        self.add_worker_nodes(n_workers)
+        self.add_worker_nodes(num_workers)
 
         # add all the workers to the graph, and connect
         # them to the 'null' node initially
         self.G.add_edges_from((
             (WorkerNode(worker_id), NullNode()) 
-            for worker_id in range(n_workers)
+            for worker_id in range(num_workers)
         ))
 
         # set inital worker source to be the 'null' node
@@ -138,10 +138,10 @@ class State:
 
     ## add / remove nodes
 
-    def add_worker_nodes(self, n_workers):
+    def add_worker_nodes(self, num_workers):
         self.G.add_nodes_from((
             WorkerNode(worker_id)
-            for worker_id in range(n_workers)
+            for worker_id in range(num_workers)
         ))
 
 
@@ -217,7 +217,7 @@ class State:
 
 
 
-    def n_workers_moving_to_op(self, job_id, op_id):
+    def num_workers_moving_to_op(self, job_id, op_id):
         op_node = OpNode(job_id, op_id, OpState.MOVING)
         if op_node not in self.G:
             return 0
@@ -233,12 +233,12 @@ class State:
 
 
 
-    def n_workers_at_source(self):
+    def num_workers_at_source(self):
         return self.G.in_degree(self._curr_source)
 
 
 
-    def n_workers_at(self, job_id=None, op_id=None):
+    def num_workers_at(self, job_id=None, op_id=None):
         node = self._parse_source(job_id, op_id)
         if node not in self.G:
             return 0
@@ -264,7 +264,7 @@ class State:
 
     def _increment_commitments(self, node_src, op_node_dst, n=1):
         assert isinstance(op_node_dst, OpNode)
-        assert self._n_commitments_from(node_src) + n <= self._n_workers_at(node_src)
+        assert self._n_commitments_from(node_src) + n <= self._num_workers_at(node_src)
         assert op_node_dst in self.G[node_src]
         self.G[node_src][op_node_dst][Attr.N_COMMITMENTS] += n
 
@@ -281,14 +281,14 @@ class State:
 
 
 
-    def _n_workers_at(self, source):
+    def _num_workers_at(self, source):
         if isinstance(source, OpNode):
             assert source.state == OpState.PRESENT
         return self.G.in_degree(source)
 
 
 
-    def _n_workers_moving_to_op(self, op_node):
+    def _num_workers_moving_to_op(self, op_node):
         assert isinstance(op_node, OpNode) and op_node.state == OpState.MOVING
         return self.G.in_degree(op_node)
 
@@ -382,7 +382,7 @@ class State:
 
 
     def add_commitment(self, 
-        n_workers, 
+        num_workers, 
         job_id_dst, 
         op_id_dst, 
         job_id_src=None, 
@@ -396,7 +396,7 @@ class State:
         if self._n_commitments(source, op_node_dst) == 0:
             self._add_commitment_edge(source, op_node_dst)
 
-        self._increment_commitments(source, op_node_dst, n=n_workers)
+        self._increment_commitments(source, op_node_dst, n=num_workers)
 
 
 

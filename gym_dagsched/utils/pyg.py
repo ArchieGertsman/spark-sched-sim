@@ -21,7 +21,20 @@ def construct_subbatch(data_batch, graph_mask, node_mask, num_nodes_per_graph, n
     np.cumsum(num_nodes_per_graph, out=ptr[1:])
     subbatch.ptr = torch.from_numpy(ptr)
 
+    add_adj(subbatch)
+
     return subbatch
+
+
+
+def add_adj(dag_batch):
+    num_nodes = dag_batch.x.shape[0]
+    dag_batch.adj = SparseTensor(
+        row=dag_batch.edge_index[0], 
+        col=dag_batch.edge_index[1],
+        sparse_sizes=(num_nodes, num_nodes),
+        trust_data=True,
+        is_sorted=True)
 
 
 

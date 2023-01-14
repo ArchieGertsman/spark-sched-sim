@@ -70,7 +70,7 @@ class DagSchedEnv:
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
         self.workers = workers
-        self.n_workers = len(workers)
+        self.num_workers = len(workers)
 
         # wall clock time, keeps increasing throughout
         # the simulation
@@ -92,50 +92,33 @@ class DagSchedEnv:
         # dependencies are satisfied
         self.schedulable_ops = set()
 
-        self.executor_interval_map = self._get_executor_interval_map()
+        self.executor_interval_map = \
+            self._get_executor_interval_map()
 
-        self.state.reset(self.n_workers)
+        self.state.reset(self.num_workers)
 
         self.selected_ops = set()
 
         self.done = False
 
-        # op_counts = np.array([
-        #     len(e.job.ops) 
-        #     for _,_,e in initial_timeline.pq
-        # ])
-
-        # feature_tensor = np.zeros((sum(op_counts), 5))
-
-        # # self.job_feature_tensors = {
-        # #     job_id : np.zeros((op_count, 5))
-        # #     for job_id, op_count in enumerate(op_counts)
-        # # }
-        # self.job_feature_tensors = np.split(
-        #     feature_tensor,
-        #     np.cumsum(op_counts[:-1])
-        # )
-        # self.job_feature_tensors = {
-        #     i: t 
-        #     for i, t in enumerate(self.job_feature_tensors)
-        # }
-
         # load all initial jobs into the system
         # by stepping through the timeline
-        while self.wall_time == 0 and len(self.timeline) > 0:
-            self.wall_time, event = self.timeline.pop()
+        while not self.timeline.empty:
+            wall_time, event = self.timeline.peek()
+            if wall_time > 0:
+                break
+            self.timeline.pop()
             self._process_scheduling_event(event)
 
-        return self._observe()
+        return self._observe(True)
 
 
 
     def step(self, action):
-        print(
-            'step', 
-            self.state.get_source(), 
-            self.state.num_uncommitted_source_workers, 
-            flush=True)
+        print('step', 
+              self.state.get_source(), 
+              self.state.num_uncommitted_source_workers, 
+              flush=True)
         
         if self.done:
             return None, 0, True
@@ -145,7 +128,7 @@ class DagSchedEnv:
         if not self._is_commitment_round_complete():
             # current commitment round is not over yet,
             # so consult the agent again
-            return self._observe(), 0, False
+            return self._observe(False), 0, False
             
         # commitment round has completed, i.e.
         # all the workers at the current source
@@ -157,15 +140,15 @@ class DagSchedEnv:
 
         # if the episode isn't done, then start a new commitment 
         # round at the current worker source
-        return self._observe(), reward, self.done
+        return self._observe(True), reward, self.done
 
 
 
     def _take_action(self, action):
-        (job_id, op_id), n_workers = action
-        print('action:', (job_id, op_id), n_workers)
+        (job_id, op_id), num_workers = action
+        print('action:', (job_id, op_id), num_workers)
 
-        assert n_workers <= self.state.num_uncommitted_source_workers
+        assert num_workers <= self.state.num_uncommitted_source_workers
 
         assert job_id in self.active_job_ids
         job = self.jobs[job_id]
@@ -175,13 +158,12 @@ class DagSchedEnv:
 
         assert op in (self.schedulable_ops - self.selected_ops)
 
-        n_workers_adjusted = self.adjust_n_workers(n_workers, op)
-        print(f'n_workers adjustment: {n_workers} -> {n_workers_adjusted}')
+        num_workers_adjusted = \
+            self.adjust_num_workers(num_workers, op)
 
-        # commit `n_workers` workers from the current worker
+        # commit `num_workers` workers from the current worker
         # source to the op with id (job_id, op_id)
-        print('add commitment', (job_id, op_id), n_workers_adjusted)
-        self.add_commitment(n_workers_adjusted, op)
+        self.add_commitment(num_workers_adjusted, op)
 
         if self.check_op_saturated(op):
             self._process_op_saturation(op)
@@ -200,16 +182,18 @@ class DagSchedEnv:
             self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
 
-            if not self.state.all_source_workers_committed:
-                if len(self.schedulable_ops) > 0:
-                    break
-                else:
-                    free_worker_ids = set((
-                        worker_id 
-                        for worker_id in self.state.get_source_workers() 
-                        if self.workers[worker_id].available
-                    ))
-                    self._move_free_uncommitted_source_workers(free_worker_ids)
+            if self.state.all_source_workers_committed:
+                continue
+
+            if len(self.schedulable_ops) > 0:
+                break
+
+            free_worker_ids = set((
+                worker_id 
+                for worker_id in self.state.get_source_workers() 
+                if self.workers[worker_id].available
+            ))
+            self._move_free_uncommitted_source_workers(free_worker_ids)
 
         reward = self._calculate_reward(t_prev)
 
@@ -239,16 +223,17 @@ class DagSchedEnv:
 
     ## Observations
 
-    def _observe(self):
+    def _observe(self, new_commitment_round):
         n_source_workers = self.state.num_uncommitted_source_workers
         source_job_id = self.state.source_job
         valid_ops = self.schedulable_ops - self.selected_ops
         active_jobs = [self.jobs[job_id] for job_id in self.active_job_ids]
-        return n_source_workers, \
-            source_job_id, \
-            valid_ops, \
-            active_jobs, \
-            self.wall_time
+        return new_commitment_round, \
+               n_source_workers, \
+               source_job_id, \
+               valid_ops, \
+               active_jobs, \
+               self.wall_time
 
 
 
@@ -421,29 +406,34 @@ class DagSchedEnv:
 
 
 
-    def add_commitment(self, n_workers, op):
-        '''commits `n_workers` workers from the current
+    def add_commitment(self, num_workers, op):
+        '''commits `num_workers` workers from the current
         worker source to `op`
         '''
-        self.state.add_commitment(n_workers, op.job_id, op.id_)
+        print('add commitment', (op.job_id, op.id_), num_workers)
+
+        self.state.add_commitment(num_workers, op.job_id, op.id_)
         
         job_id_src, _ = self.state.get_source()
         if job_id_src != op.job_id:
             job = self.jobs[op.job_id]
-            job.add_commitments(n_workers)
+            job.add_commitments(num_workers)
 
 
 
-    def adjust_n_workers(self, n_workers, op):
+    def adjust_num_workers(self, num_workers, op):
         '''truncates the numer of worker assigned
         to `op` to the op's demand, if it's larger
         '''
         worker_demand = self.get_worker_demand(op)
 
-        n_workers_adjusted = min(n_workers, worker_demand)
-        assert n_workers_adjusted > 0
+        num_workers_adjusted = min(num_workers, worker_demand)
+        assert num_workers_adjusted > 0
 
-        return n_workers_adjusted
+        print('num_workers adjustment:',
+             f'{num_workers} -> {num_workers_adjusted}')
+
+        return num_workers_adjusted
 
 
 
@@ -459,13 +449,13 @@ class DagSchedEnv:
         '''
         job_id, op_id = op.job_id, op.id_
 
-        n_workers_moving = \
-            self.state.n_workers_moving_to_op(job_id, op_id)
+        num_workers_moving = \
+            self.state.num_workers_moving_to_op(job_id, op_id)
             
         n_commitments = \
             self.state.n_commitments_to_op(job_id, op_id)
 
-        demand = op.n_remaining_tasks - n_workers_moving - n_commitments
+        demand = op.n_remaining_tasks - num_workers_moving - n_commitments
         
         op.demand = demand
 
@@ -728,14 +718,14 @@ class DagSchedEnv:
 
         commitments = self.state.get_source_commitments()
 
-        for job_id, op_id, n_workers in commitments:
-            assert n_workers > 0
-            while n_workers > 0 and len(free_worker_ids) > 0:
+        for job_id, op_id, num_workers in commitments:
+            assert num_workers > 0
+            while num_workers > 0 and len(free_worker_ids) > 0:
                 worker_id = free_worker_ids.pop()
                 worker = self.workers[worker_id]
                 op = self.jobs[job_id].ops[op_id]
                 self._fulfill_commitment(worker, op)
-                n_workers -= 1
+                num_workers -= 1
 
         if len(free_worker_ids) > 0:
             self._move_free_uncommitted_source_workers(free_worker_ids)
@@ -846,7 +836,7 @@ class DagSchedEnv:
         executor_interval_map = {}
 
         executor_data_point = [5, 10, 20, 40, 50, 60, 80, 100]
-        exec_cap = self.n_workers
+        exec_cap = self.num_workers
 
         # get the left most map
         for e in range(executor_data_point[0] + 1):
