@@ -40,33 +40,33 @@ class DagSchedEnvAsyncWrapper:
 
 
 
-    def reset(self, n_job_arrivals, n_init_jobs, mjit, n_workers):
-        initial_timeline = self.datagen.initial_timeline(
-            n_job_arrivals, n_init_jobs, mjit)
-        workers = self.datagen.workers(n_workers)
+    def reset(self, 
+              num_job_arrivals, 
+              num_init_jobs, 
+              job_arrival_rate, 
+              num_workers):
 
-        self.n_workers = n_workers
+        mean_job_interarrival_time = 1 / job_arrival_rate
 
-        self.num_total_jobs = n_init_jobs + n_job_arrivals
+        initial_timeline = \
+            self.datagen.initial_timeline(num_job_arrivals, 
+                                          num_init_jobs, 
+                                          mean_job_interarrival_time)
 
-        self.global_op_idx_map = {}
-        op_idx = 0
-        for _,_,e in initial_timeline.pq:
-            job = e.job
-            self.global_op_idx_map[job.id_] = {}
-            for op in job.ops:
-                self.global_op_idx_map[job.id_][op.id_] = op_idx
-                op_idx += 1
+        workers = self.datagen.workers(num_workers)
 
-        self.num_total_ops = op_idx
+        self.num_workers = num_workers
+
+        self.num_total_jobs = num_init_jobs + num_job_arrivals
+
+        self._reset_global_op_idx_map(initial_timeline)
+
+        self._reset_dag_batch(initial_timeline)
 
         self.active_op_mask = None
         self.dag_subbatch = None
 
-        self._reset_dag_batch(initial_timeline)
-
         obs = self.env.reset(initial_timeline, workers)
-
         return self._parse_obs(obs)
 
 
@@ -90,10 +90,22 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _reset_dag_batch(self, initial_timeline):
-        data_list = [
-            e.job.init_pyg_data() 
-            for _,_,e in initial_timeline.pq]
+        data_list = [e.job.init_pyg_data() 
+                     for _,_,e in initial_timeline.pq]
         self.dag_batch = Batch.from_data_list(data_list)
+
+
+    def _reset_global_op_idx_map(self, initial_timeline):
+        self.global_op_idx_map = {}
+        op_idx = 0
+        for _,_,e in initial_timeline.pq:
+            job = e.job
+            self.global_op_idx_map[job.id_] = {}
+            for op in job.ops:
+                self.global_op_idx_map[job.id_][op.id_] = op_idx
+                op_idx += 1
+
+        self.num_total_ops = op_idx
 
 
 
@@ -112,17 +124,15 @@ class DagSchedEnvAsyncWrapper:
             self._bookkeep(active_jobs, valid_ops)
 
         did_update = \
-            self._update_dag_subbatch(
-                active_op_mask,
-                active_job_mask,
-                op_counts,
-                active_jobs)
+            self._update_dag_subbatch(active_op_mask,
+                                      active_job_mask,
+                                      op_counts,
+                                      active_jobs)
 
-        self._update_node_features(
-            new_commitment_round,
-            active_jobs,
-            source_job_id,
-            n_source_workers)
+        self._update_node_features(new_commitment_round,
+                                   active_jobs,
+                                   source_job_id,
+                                   n_source_workers)
 
         active_job_ids = np.array(self.env.active_job_ids)
 
@@ -163,14 +173,13 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _update_node_features(self,
-        new_commitment_round,
-        active_jobs,
-        source_job_id,
-        n_source_workers
-    ):
-        # make updates in a numpy array instead
-        # of the tensor directly, because numpy
-        # is faster for cpu computations
+                              new_commitment_round,
+                              active_jobs,
+                              source_job_id,
+                              n_source_workers):
+        # make updates in an auxiliary numpy array 
+        # instead of the tensor directly, because 
+        # numpy is faster for cpu computations
         all_node_features = \
             np.zeros(self.dag_subbatch.x.shape, dtype=np.float32)
 
@@ -184,11 +193,11 @@ class DagSchedEnvAsyncWrapper:
         for job, node_features in zip(active_jobs, node_features_split):
             node_features[:, 2] = job.total_worker_count / 20
 
-            if not new_commitment_round:
-                # if we are in the same commitment round
-                # then none of the other features could
-                # have changed.
-                continue
+            # if not new_commitment_round:
+            #     # if we are in the same commitment round
+            #     # then none of the other features could
+            #     # have changed.
+            #     continue
 
             is_source_job = (job.id_ == source_job_id)
             node_features[:, 1] = int(is_source_job) * 4 - 2
@@ -203,11 +212,10 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _update_dag_subbatch(self,
-        active_op_mask,
-        active_job_mask,
-        op_counts,
-        active_jobs
-    ):
+                             active_op_mask,
+                             active_job_mask,
+                             op_counts,
+                             active_jobs):
         '''if the number of active ops has changed
         since the last `step`, then we need to re-
         construct `self.dag_subbatch` to reflact
@@ -220,8 +228,8 @@ class DagSchedEnvAsyncWrapper:
         did_update = False
 
         if self.active_op_mask is None or \
-            (self.active_op_mask.shape != active_op_mask.shape or \
-                not (self.active_op_mask == active_op_mask).all()):
+           (self.active_op_mask.shape != active_op_mask.shape or \
+            not (self.active_op_mask == active_op_mask).all()):
 
             self.dag_subbatch = construct_subbatch(
                 self.dag_batch, 

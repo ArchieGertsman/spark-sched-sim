@@ -4,19 +4,11 @@ import numpy as np
 
 
 
-def compute_piecewise_linear_fit_baselines(all_cum_rewards, all_wall_time, ep_lens):
+def compute_baselines(all_cum_rewards, all_wall_time):
     # do a piece-wise linear fit baseline
     # all_cum_rewards: list of lists of cumulative rewards
     # all_wall_time:   list of lists of physical time
     assert len(all_cum_rewards) == len(all_wall_time)
-
-    all_cum_rewards = [
-        cum_rewards[:ep_len].numpy() 
-        for cum_rewards, ep_len in zip(all_cum_rewards, ep_lens)]
-
-    all_wall_time = [
-        wall_time[:ep_len].numpy() 
-        for wall_time, ep_len in zip(all_wall_time, ep_lens)]
 
     # all unique wall time
     unique_wall_time = np.unique(np.hstack(all_wall_time))

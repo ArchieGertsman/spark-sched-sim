@@ -18,24 +18,24 @@ def main():
         num_node_features=5, 
         num_dag_features=3)
 
-    # writer = SummaryWriter('log/train')
-    writer = None
+    writer = SummaryWriter('log/train')
+    # writer = None
 
     reinforce_async.train(
         model,
-        optim_type=torch.optim.Adam,
+        optim_class=torch.optim.Adam,
         optim_lr=.001,
         n_sequences=1,
-        num_envs=4,
+        num_envs=2,
         discount=.99,
         entropy_weight_init=1.,
         entropy_weight_decay=1e-3,
         entropy_weight_min=1e-4,
-        n_job_arrivals=200,
+        n_job_arrivals=100,
         n_init_jobs=1, 
         mjit=25000,
-        n_workers=50,
-        initial_mean_ep_len=2500,
+        n_workers=25,
+        initial_mean_ep_len=100,
         ep_len_growth=0,
         min_ep_len=0,
         writer=writer
