@@ -37,7 +37,7 @@ def train(model,
           num_job_arrivals, 
           num_init_jobs, 
           job_arrival_rate,
-          n_workers,
+          num_workers,
           initial_mean_ep_len,
           ep_len_growth,
           min_ep_len,
@@ -82,7 +82,7 @@ def train(model,
                 (num_job_arrivals, 
                  num_init_jobs, 
                  job_arrival_rate, 
-                 n_workers, 
+                 num_workers, 
                  max_ep_len, 
                  entropy_weight))
 
@@ -90,13 +90,13 @@ def train(model,
         rewards_list, wall_times_list = \
             list(zip(*[conn.recv() for conn in conns]))
 
-        diff_returns_list, avg_per_step_reward = \
-            diff_return_calc.calculate(wall_times_list, 
+        diff_returns_list = \
+            diff_return_calc.calculate(wall_times_list,
                                        rewards_list)
 
         baselines_list = \
-            compute_baselines(diff_returns_list, 
-                              wall_times_list)
+            compute_baselines(wall_times_list,
+                              diff_returns_list)
 
         # send advantages
         for (returns, 
@@ -107,7 +107,6 @@ def train(model,
             advantages = returns - baselines
             conn.send(advantages)
 
-
         # wait for model update
         (actor_losses, 
          advantage_losses, 
@@ -116,15 +115,16 @@ def train(model,
          completed_job_counts) = \
             list(zip(*[conn.recv() for conn in conns]))
 
-
         if writer:
+            # log episode stats to tensorboard
             episode_stats = {
                 'actor loss': np.mean(actor_losses),
                 'advantage loss': np.mean(advantage_losses),
                 'entropy_loss': np.mean(entropy_losses),
                 'avg job duration': np.mean(avg_job_durations),
                 'completed jobs count': np.mean(completed_job_counts),
-                'avg reward per sec': avg_per_step_reward * 1e-5,
+                'avg reward per sec': \
+                    1e5 * diff_return_calc.avg_per_step_reward,
                 'avg return': np.mean([returns[0] 
                                        for returns in diff_returns_list])
             }
@@ -185,9 +185,12 @@ def setup_worker(rank, world_size):
 
     torch.set_num_threads(1)
 
-    dist.init_process_group('gloo', rank=rank, world_size=world_size)
+    dist.init_process_group(dist.Backend.GLOO, 
+                            rank=rank, 
+                            world_size=world_size)
 
-    torch.cuda.set_per_process_memory_fraction(1/world_size, device=device)
+    torch.cuda.set_per_process_memory_fraction(1/world_size, 
+                                               device=device)
 
     # IMPORTANT! Each worker needs to produce 
     # unique rollouts, which are determined
@@ -225,7 +228,9 @@ def episode_runner(rank,
     optim = optim_class(model.parameters(),
                         lr=optim_lr)
     
+    i = 0
     while data := conn.recv():
+        i += 1
         # receive episode data from parent process
         (num_job_arrivals, 
          num_init_jobs, 
@@ -250,17 +255,16 @@ def episode_runner(rank,
                         model)
 
         wall_times, rewards = \
-            list(zip(*[
-                (exp.wall_time, exp.reward) 
-                for exp in experience]))
+            list(zip(*[(exp.wall_time, exp.reward) 
+                       for exp in experience]))
 
         # notify main proc that returns and wall times are ready
         conn.send((np.array(rewards), 
-                   np.array((0,)+wall_times)))
+                   np.array(wall_times)))
 
         # wait for main proc to compute advantages
         advantages = conn.recv()
-        advantages = torch.from_numpy(advantages)
+        advantages = torch.from_numpy(advantages).float()
 
         actor_loss, advantage_loss, entropy_loss = \
             learn_from_experience(model,
@@ -270,8 +274,8 @@ def episode_runner(rank,
                                   entropy_weight,
                                   num_envs)
 
-        # if rank == 0 and i % 10 == 0:
-        #     torch.save(model.state_dict(), 'model.pt')
+        if rank == 0 and i % 10 == 0:
+            torch.save(model.state_dict(), 'model.pt')
         
         if prof:
             prof.disable()
@@ -286,6 +290,188 @@ def episode_runner(rank,
         ))
 
     cleanup_worker()
+
+
+
+
+@dataclass
+class Experience:
+    dag_batch: object
+    valid_ops_mask: object
+    num_jobs: int
+    num_source_workers: int
+    wall_time: float
+    action: object
+    reward: float
+
+
+
+
+def run_episode(
+    env,
+    num_job_arrivals,
+    num_init_jobs,
+    job_arrival_rate,
+    num_workers,
+    ep_len,
+    model
+):  
+    obs = env.reset(num_job_arrivals, 
+                    num_init_jobs, 
+                    job_arrival_rate, 
+                    num_workers)
+    done = False
+
+    # maintain a cached dag batch,
+    # since graph structure doesn't
+    # always change (i.e. number of
+    # nodes may stay the same). Node
+    # features always get updated.
+    dag_batch_device = None
+    job_ptr = None
+
+    # save experience from each step
+    # of the episode, to later be used
+    # in leaning
+    experience = []
+    
+    for _ in range(ep_len):
+        if done:
+            break
+
+        # unpack the current observation
+        (did_update_dag_batch,
+         dag_batch,
+         valid_ops_mask, 
+         active_job_ids, 
+         num_source_workers,
+         wall_time) = obs
+
+        if did_update_dag_batch:
+            # the whole dag batch object was
+            # updated because the number of
+            # nodes changed, so send the new
+            # object to the GPU
+            job_ptr = dag_batch.ptr.numpy()
+            dag_batch_device = dag_batch.clone() \
+                .to(device, non_blocking=True)
+        else:
+            # only send new node features to
+            # the GPU
+            dag_batch_device.x = dag_batch.x \
+                .to(device, non_blocking=True)
+
+        node_scores, dag_scores = \
+            invoke_agent(model,
+                         dag_batch_device,
+                         num_source_workers,
+                         valid_ops_mask)
+
+        raw_action, env_action = \
+            sample_action(node_scores, 
+                          dag_scores,
+                          job_ptr,
+                          active_job_ids)
+
+        obs, reward, done = env.step(env_action)
+
+        experience += [Experience(
+            dag_batch.clone(),
+            valid_ops_mask,
+            len(active_job_ids),
+            num_source_workers,
+            wall_time,
+            raw_action,
+            reward
+        )]
+
+    return experience
+
+
+
+
+def invoke_agent(
+    model,
+    dag_batch_device,
+    worker_count,
+    valid_ops_mask
+):
+    with torch.no_grad():
+        # no computational graphs needed during 
+        # the episode, only model outputs.
+        node_scores, dag_scores = \
+            model(dag_batch_device, worker_count)
+
+    # move node scores to CPU and mask out
+    # nodes that correspond to invalid
+    # operations
+    node_scores = node_scores.cpu()
+    node_scores[~valid_ops_mask] = float('-inf')
+
+    # move dag scores to CPU and reshape
+    dag_scores = dag_scores.cpu()
+    job_count = dag_batch_device.num_graphs
+    dag_scores = dag_scores.view(job_count, 
+                                 worker_count)
+
+    return node_scores, dag_scores
+
+
+
+
+def sample_action(
+    node_scores, 
+    dag_scores, 
+    job_ptr,
+    active_job_ids,
+):
+    # select the next operation to schedule
+    op_sample = \
+        Categorical(logits=node_scores) \
+            .sample()
+
+    op_env, job_idx = \
+        translate_op(
+            op_sample.item(), 
+            job_ptr,
+            active_job_ids)
+
+    # select the number of workers to schedule
+    num_workers_sample = \
+        Categorical(logits=dag_scores[job_idx]) \
+            .sample()
+    num_workers_env = 1 + num_workers_sample.item()
+
+    # action that's recorded in experience, 
+    # later used during training
+    raw_action = (op_sample, 
+                  job_idx, 
+                  num_workers_sample)
+
+    # action that gets sent to the env
+    env_action = (op_env, num_workers_env)
+
+    return raw_action, env_action
+
+
+
+
+def translate_op(op, job_ptr, active_jobs_ids):
+    '''Returns:
+    - `op`: translation of the policy sample so
+    that the environment can find the correct
+    operation
+    - `job_idx`: index of the job that the
+    selected op belongs to
+    '''
+    job_idx = (op >= job_ptr).sum() - 1
+
+    job_id = active_jobs_ids[job_idx]
+    active_op_idx = op - job_ptr[job_idx]
+    
+    op = (job_id, active_op_idx)
+
+    return op, job_idx
 
 
 
@@ -340,9 +526,9 @@ def learn_from_experience(model,
 
 
 def extract_batched_model_inputs(experience):
-    '''extracts the inputs to the model at each
-    step of the episode from the experience list,
-    and then stacks them into a large batch.
+    '''extracts the inputs to the model from each
+    step of the episode, then stacks them into a
+    large batch.
     '''
     dag_batch_list, job_counts, worker_counts = \
         list(zip(*[
@@ -431,181 +617,3 @@ def dag_action_attributes(dag_scores,
             .entropy().sum()
     
     return dag_lgprob, dag_entropy
-
-
-
-
-@dataclass
-class Experience:
-    dag_batch: object
-    valid_ops_mask: object
-    num_jobs: int
-    num_source_workers: int
-    wall_time: float
-    action: object
-    reward: float
-
-
-
-
-def run_episode(
-    env,
-    num_job_arrivals,
-    num_init_jobs,
-    job_arrival_rate,
-    num_workers,
-    ep_len,
-    model
-):  
-    obs = env.reset(num_job_arrivals, 
-                    num_init_jobs, 
-                    job_arrival_rate, 
-                    num_workers)
-    done = False
-
-    # maintain a cached dag batch,
-    # since graph structure doesn't
-    # always change (i.e. number of
-    # nodes may stay the same). Node
-    # features always get updated.
-    dag_batch_device = None
-    job_ptr = None
-
-    # save experience from each step
-    # of the episode, to later be used
-    # in leaning
-    experience = []
-    
-    for _ in range(ep_len):
-        if done:
-            break
-
-        # unpack the current observation
-        (did_update_dag_batch,
-         dag_batch,
-         valid_ops_mask, 
-         active_job_ids, 
-         num_source_workers,
-         wall_time) = obs
-
-        if did_update_dag_batch:
-            # the whole dag batch object was
-            # updated because the number of
-            # nodes changed, so send the new
-            # object to the GPU
-            job_ptr = dag_batch.ptr.numpy()
-            dag_batch_device = dag_batch.clone() \
-                .to(device, non_blocking=True)
-        else:
-            # only send new node features to
-            # the GPU
-            dag_batch_device.x = dag_batch.x \
-                .to(device, non_blocking=True)
-
-        node_scores, dag_scores = \
-            invoke_agent(model,
-                         dag_batch_device,
-                         num_source_workers,
-                         valid_ops_mask)
-
-        raw_action, parsed_action = \
-            sample_action(node_scores, 
-                          dag_scores,
-                          job_ptr,
-                          active_job_ids)
-
-        obs, reward, done = env.step(parsed_action)
-
-        experience += [Experience(
-            dag_batch.clone(),
-            valid_ops_mask,
-            len(active_job_ids),
-            num_source_workers,
-            wall_time,
-            raw_action,
-            reward
-        )]
-
-    return experience
-
-
-
-
-def invoke_agent(
-    model,
-    dag_batch_device,
-    worker_count,
-    valid_ops_mask
-):
-    with torch.no_grad():
-        # no computational graphs needed during 
-        # the episode, only model outputs.
-        node_scores, dag_scores = \
-            model(dag_batch_device, worker_count)
-
-    node_scores = node_scores.cpu()
-    node_scores[~valid_ops_mask] = float('-inf')
-
-    dag_scores = dag_scores.cpu()
-    job_count = dag_batch_device.num_graphs
-    dag_scores = dag_scores.view(job_count, 
-                                 worker_count)
-
-    return node_scores, dag_scores
-
-
-
-
-def sample_action(
-    node_scores, 
-    dag_scores, 
-    job_ptr,
-    active_job_ids,
-):
-    # select the next operation to schedule
-    op_sample = \
-        Categorical(logits=node_scores) \
-            .sample()
-
-    op_env, job_idx = \
-        translate_op(
-            op_sample.item(), 
-            job_ptr,
-            active_job_ids)
-
-    # select the number of workers to schedule
-    num_workers_sample = \
-        Categorical(logits=dag_scores[job_idx]) \
-            .sample()
-    num_workers_env = 1 + num_workers_sample.item()
-
-    # action that's recorded in experience, 
-    # later used during training
-    raw_action = (op_sample, 
-                  job_idx, 
-                  num_workers_sample)
-
-    # action that gets sent to the env
-    env_action = (op_env, num_workers_env)
-
-    return raw_action, env_action
-
-
-
-
-def translate_op(op, job_ptr, active_jobs_ids):
-    '''Returns:
-    - `op`: translation of the policy sample so
-    that the environment can find the correct
-    operation
-    - `job_idx`: index of the job that the
-    selected op belongs to
-    '''
-    job_idx = (op >= job_ptr).sum() - 1
-
-    job_id = active_jobs_ids[job_idx]
-    active_op_idx = op - job_ptr[job_idx]
-    
-    op = (job_id, active_op_idx)
-
-    return op, job_idx

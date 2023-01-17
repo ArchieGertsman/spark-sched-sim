@@ -1,42 +1,46 @@
-import bisect
+from bisect import bisect_left
 import numpy as np
 
 
 
+def compute_baselines(ts_list, ys_list):
+    '''piecewise linear fit baseline'''
+    ts_unique = np.unique(np.hstack(ts_list))
 
-def compute_baselines(all_cum_rewards, all_wall_time):
-    # do a piece-wise linear fit baseline
-    # all_cum_rewards: list of lists of cumulative rewards
-    # all_wall_time:   list of lists of physical time
-    assert len(all_cum_rewards) == len(all_wall_time)
+    # find baseline value at each unique time point
+    baseline_values = \
+        {t: np.mean([pw_linear_fit(t, ts, ys)
+                     for ts, ys in zip(ts_list, ys_list)])
+         for t in ts_unique}
 
-    # all unique wall time
-    unique_wall_time = np.unique(np.hstack(all_wall_time))
+    # output baselines for each env
+    baselines_list = \
+        [np.array([baseline_values[t] for t in ts])
+         for ts in ts_list]
 
-    # for find baseline value for all unique time points
-    baseline_values = {}
-    for t in unique_wall_time:
-        baseline = 0
-        for i in range(len(all_wall_time)):
-            idx = bisect.bisect_left(all_wall_time[i], t)
-            if idx == 0:
-                baseline += all_cum_rewards[i][idx]
-            elif idx == len(all_cum_rewards[i]):
-                baseline += all_cum_rewards[i][-1]
-            elif all_wall_time[i][idx] == t:
-                baseline += all_cum_rewards[i][idx]
-            else:
-                baseline += \
-                    (all_cum_rewards[i][idx] - all_cum_rewards[i][idx - 1]) / \
-                    (all_wall_time[i][idx] - all_wall_time[i][idx - 1]) * \
-                    (t - all_wall_time[i][idx]) + all_cum_rewards[i][idx]
+    return baselines_list
 
-        baseline_values[t] = baseline / float(len(all_wall_time))
 
-    # output n baselines
-    baselines = []
-    for wall_time in all_wall_time:
-        baseline = np.array([baseline_values[t] for t in wall_time])
-        baselines.append(baseline)
 
-    return baselines
+def pw_linear_fit(t, ts, ys):
+    '''approximates `y(t)` according to a piecewise 
+    linear fit on (ts, ys)
+    '''
+    idx = bisect_left(ts, t)
+    if idx == len(ys):
+        idx = -1
+
+    intercept = ys[idx]
+
+    y_hat = intercept
+
+    if idx in [0, -1] or ts[idx] == t:
+        return y_hat
+
+    dy = ys[idx] - ys[idx-1]
+    dt = ts[idx] - ts[idx-1]
+    slope = dy / dt
+
+    y_hat += slope * (t - ts[idx])
+
+    return y_hat
