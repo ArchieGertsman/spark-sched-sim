@@ -12,79 +12,79 @@ from gym_dagsched.utils.device import device
 
 class ActorNetwork(nn.Module):
     def __init__(self, 
-        num_node_features, 
-        num_dag_features, 
-        dim_embed=8
-    ):
+                 num_node_features, 
+                 num_dag_features, 
+                 num_workers,
+                 dim_embed=8):
         super().__init__()
+
+        # self.num_workers = num_workers
 
         self.encoder = GraphEncoderNetwork(
             num_node_features, dim_embed)
 
-        self.policy_network = PolicyNetwork(
-            num_node_features, 
-            num_dag_features, 
-            dim_embed
-        )
+        self.policy_network = \
+            PolicyNetwork(num_node_features, 
+                          num_dag_features,
+                          num_workers,
+                          dim_embed)
         
 
         
     def forward(self, 
-        dag_batch, 
-        worker_counts,
-        job_counts=None
-    ):
+                dag_batch, 
+                job_counts=None):
         is_data_batched = (job_counts is not None)
 
-        self._bookkeep(dag_batch, job_counts)
+        (obs_indptr, 
+         num_ops_per_job, 
+         op_counts, 
+         job_counts) = \
+            self._bookkeep(dag_batch, job_counts)
 
         (node_embeddings, 
          dag_embeddings, 
          global_embeddings) = \
-            self.encoder(dag_batch, self.obs_indptr)
+            self.encoder(dag_batch, obs_indptr)
 
         node_scores, dag_scores = \
-            self.policy_network(
-                dag_batch,
-                node_embeddings, 
-                dag_embeddings, 
-                global_embeddings,
-                self.num_ops_per_job,
-                self.op_counts,
-                self.job_counts,
-                worker_counts
-            )
+            self.policy_network(dag_batch,
+                                node_embeddings, 
+                                dag_embeddings, 
+                                global_embeddings,
+                                num_ops_per_job,
+                                op_counts,
+                                job_counts)
 
+        ret = (node_scores, dag_scores)
         if is_data_batched:
-            node_scores = \
-                torch.split(
-                    node_scores, 
-                    list(self.op_counts))
-
-            dag_scores = \
-                torch.split(
-                    dag_scores, 
-                    list(job_counts * worker_counts))
-
-        return node_scores, dag_scores
+            ret += (op_counts, obs_indptr)
+        return ret
 
 
 
     def _bookkeep(self, dag_batch, job_counts):
-        self.num_ops_per_job = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
+        num_ops_per_job = \
+            dag_batch.ptr[1:] - dag_batch.ptr[:-1]
 
         if job_counts is None:
-            self.job_counts = dag_batch.num_graphs
-            self.op_counts = dag_batch.x.shape[0]
-            self.obs_indptr = None
+            job_counts = dag_batch.num_graphs
+            op_counts = dag_batch.x.shape[0]
+            obs_indptr = None
         else:
-            self.job_counts = job_counts
-
-            batch_size = len(self.job_counts)
-            self.obs_indptr = torch.zeros(batch_size+1, device=device, dtype=torch.long)
-            torch.cumsum(self.job_counts, 0, out=self.obs_indptr[1:])
+            batch_size = len(job_counts)
+            obs_indptr = torch.zeros(batch_size+1, 
+                                     device=device, 
+                                     dtype=torch.long)
+            torch.cumsum(job_counts, 0, out=obs_indptr[1:])
             
-            self.op_counts = segment_add_csr(self.num_ops_per_job, self.obs_indptr)
+            op_counts = segment_add_csr(num_ops_per_job, 
+                                             obs_indptr)
+
+        return obs_indptr, \
+               num_ops_per_job, \
+               op_counts, \
+               job_counts
 
 
 
@@ -149,12 +149,16 @@ class GraphEncoderNetwork(nn.Module):
             self._compute_node_embeddings(dag_batch)
 
         dag_embeddings = \
-            self._compute_dag_embeddings(dag_batch, node_embeddings)
+            self._compute_dag_embeddings(dag_batch, 
+                                         node_embeddings)
 
         global_embeddings = \
-            self._compute_global_embeddings(dag_embeddings, obs_indptr)
+            self._compute_global_embeddings(dag_embeddings, 
+                                            obs_indptr)
 
-        return node_embeddings, dag_embeddings, global_embeddings
+        return node_embeddings, \
+               dag_embeddings, \
+               global_embeddings
 
     
 
@@ -182,7 +186,9 @@ class GraphEncoderNetwork(nn.Module):
         # for each dag, add together its nodes
         # to obtain its dag embedding
         dag_embeddings = \
-            gnn.global_add_pool(nodes_merged, dag_batch.batch)
+            gnn.global_add_pool(nodes_merged, 
+                                dag_batch.batch,
+                                size=dag_batch.num_graphs)
 
         return dag_embeddings
 
@@ -196,8 +202,10 @@ class GraphEncoderNetwork(nn.Module):
 
         # for each observation, add together its dags
         # to obtain its global embedding
-        z = dag_embeddings.sum(dim=0).unsqueeze(0) if obs_indptr is None \
-            else segment_add_csr(dag_embeddings, obs_indptr)
+        if obs_indptr is None:
+            z = dag_embeddings.sum(dim=0).unsqueeze(0)
+        else:
+            z = segment_add_csr(dag_embeddings, obs_indptr)
 
         return z
         
@@ -205,10 +213,15 @@ class GraphEncoderNetwork(nn.Module):
         
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, num_node_features, num_dag_features, dim_embed):
+    def __init__(self, 
+                 num_node_features, 
+                 num_dag_features, 
+                 num_workers,
+                 dim_embed):
         super().__init__()
         self.num_dag_features = num_dag_features
         self.dim_embed = dim_embed
+        self.num_workers = num_workers
 
         self.dim_node_merged = num_node_features + (3 * dim_embed)
         self.mlp_node_score = make_mlp(self.dim_node_merged, 1)
@@ -219,15 +232,13 @@ class PolicyNetwork(nn.Module):
 
 
     def forward(self,   
-        dag_batch, 
-        node_embeddings,
-        dag_embeddings, 
-        global_embeddings,
-        num_ops_per_job,
-        op_counts,
-        job_counts,
-        n_workers
-    ):
+                dag_batch, 
+                node_embeddings,
+                dag_embeddings, 
+                global_embeddings,
+                num_ops_per_job,
+                op_counts,
+                job_counts):
         node_features = dag_batch.x
 
         node_scores = self._compute_node_scores(
@@ -246,21 +257,20 @@ class PolicyNetwork(nn.Module):
             dag_features, 
             dag_embeddings, 
             global_embeddings, 
-            n_workers, 
-            job_counts)
+            job_counts,
+            dag_batch.num_graphs)
 
         return node_scores, dag_scores
 
     
     
     def _compute_node_scores(self, 
-        node_features, 
-        node_embeddings, 
-        dag_embeddings, 
-        global_embeddings,      
-        num_ops_per_job, 
-        op_counts
-    ):
+                             node_features, 
+                             node_embeddings, 
+                             dag_embeddings, 
+                             global_embeddings,      
+                             num_ops_per_job, 
+                             op_counts):
         dag_embeddings_repeat = \
             dag_embeddings.repeat_interleave( 
                 num_ops_per_job, 
@@ -287,53 +297,43 @@ class PolicyNetwork(nn.Module):
     
     
     def _compute_dag_scores(self, 
-        dag_features, 
-        dag_embeddings, 
-        global_embeddings, 
-        worker_counts, 
-        job_counts
-    ):
-        num_total_jobs = job_counts \
-            if not torch.is_tensor(job_counts) \
-            else job_counts.sum()
+                            dag_features, 
+                            dag_embeddings, 
+                            global_embeddings,
+                            job_counts,
+                            num_total_jobs):
+        worker_actions = torch.arange(self.num_workers, 
+                                      device=device)
+        worker_actions = \
+            worker_actions.repeat(num_total_jobs) \
+                          .unsqueeze(1)
 
-        if torch.is_tensor(worker_counts):
-            assert torch.is_tensor(job_counts)
-            worker_actions_batch = []
-            for job_count, worker_count in zip(job_counts, worker_counts):
-                worker_actions = torch.arange(worker_count, device=device)
-                worker_actions = worker_actions.repeat(job_count).unsqueeze(1)
-                worker_actions_batch += [worker_actions]
-            worker_actions = torch.cat(worker_actions_batch)
-            worker_counts_repeat = worker_counts.repeat_interleave(job_counts, dim=0)
-        else:
-            worker_actions = torch.arange(worker_counts, device=device)
-            worker_actions = worker_actions.repeat(num_total_jobs).unsqueeze(1)
-            worker_counts_repeat = worker_counts
-
-        dag_features_merged = torch.cat(
-            [dag_features, dag_embeddings], 
-            dim=1)
+        dag_features_merged = \
+            torch.cat([dag_features, dag_embeddings], 
+                      dim=1)
 
         dag_features_merged_repeat = \
             dag_features_merged.repeat_interleave(
-                worker_counts_repeat, 
+                self.num_workers, 
                 dim=0,
                 output_size=worker_actions.shape[0])
 
         global_embeddings_repeat = \
             global_embeddings.repeat_interleave( 
-                job_counts * worker_counts, 
+                job_counts * self.num_workers, 
                 dim=0,
                 output_size=worker_actions.shape[0])
         
-        dag_inputs = torch.cat(
-            [dag_features_merged_repeat,
-             global_embeddings_repeat,
-             worker_actions], 
-            dim=1)
+        dag_inputs = \
+            torch.cat([dag_features_merged_repeat,
+                       global_embeddings_repeat,
+                       worker_actions], 
+                      dim=1)
 
         dag_scores = self.mlp_dag_score(dag_inputs).squeeze(-1)
+
+        dag_scores = dag_scores.view(num_total_jobs, 
+                                     self.num_workers)
 
         return dag_scores
 

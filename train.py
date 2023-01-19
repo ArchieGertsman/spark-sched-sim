@@ -8,38 +8,39 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.multiprocessing import set_start_method
 
 from gym_dagsched.policies.decima_agent import ActorNetwork
-from gym_dagsched.reinforce import reinforce_async
+from gym_dagsched.reinforce.reinforce_async import train
 
 
 def main():
     configure_main_process()
 
+    num_workers = 50
+
     model = ActorNetwork(
         num_node_features=5, 
-        num_dag_features=3)
+        num_dag_features=3,
+        num_workers=num_workers)
 
     writer = SummaryWriter('log/train')
     # writer = None
 
-    reinforce_async.train(
-        model,
-        optim_class=torch.optim.Adam,
-        optim_lr=.001,
-        n_sequences=50,
-        num_envs=4,
-        discount=.99,
-        entropy_weight_init=1.,
-        entropy_weight_decay=1e-3,
-        entropy_weight_min=1e-4,
-        num_job_arrivals=200,
-        num_init_jobs=1, 
-        job_arrival_rate=1/25000,
-        num_workers=50,
-        initial_mean_ep_len=3000,
-        ep_len_growth=0,
-        min_ep_len=0,
-        writer=writer
-    )
+    train(model,
+          optim_class=torch.optim.Adam,
+          optim_lr=.001,
+          n_sequences=50,
+          num_envs=16,
+          discount=.99,
+          entropy_weight_init=1.,
+          entropy_weight_decay=1e-3,
+          entropy_weight_min=1e-4,
+          num_job_arrivals=200,
+          num_init_jobs=1, 
+          job_arrival_rate=1/25000,
+          num_workers=num_workers,
+          initial_mean_ep_len=4000, #302,
+          ep_len_growth=0,
+          min_ep_len=0,
+          writer=writer)
 
     if writer:
         writer.close()

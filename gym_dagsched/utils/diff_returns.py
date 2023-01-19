@@ -23,7 +23,7 @@ class DifferentialReturnsCalculator(object):
 
 
 
-    def add(self, reward, time):
+    def add(self, dt, reward):
         if self.count >= self.size:
             stale_reward = self.reward_record.pop(0)
             stale_time = self.time_record.pop(0)
@@ -33,19 +33,20 @@ class DifferentialReturnsCalculator(object):
             self.count += 1
 
         self.reward_record.append(reward)
-        self.time_record.append(time)
+        self.time_record.append(dt)
         self.reward_sum += reward
-        self.time_sum += time
+        self.time_sum += dt
 
 
 
-    def add_list_filter_zero(self, rewards, times):
-        assert len(rewards) == len(times)
-        for i in range(len(rewards)):
-            if times[i] != 0:
-                self.add(rewards[i], times[i])
+    def add_list_filter_zero(self, time_diffs, rewards):
+        np.set_printoptions(precision=3, suppress=True)
+        assert len(time_diffs) == len(rewards)
+        for dt, reward in zip(time_diffs, rewards):
+            if dt != 0:
+                self.add(dt, reward)
             else:
-                assert rewards[i] == 0
+                assert reward == 0
 
 
 
@@ -56,21 +57,21 @@ class DifferentialReturnsCalculator(object):
 
 
     def calculate(self, times_list, rewards_list):
-        diff_times_list = []
-        for wall_times in times_list:
-            diff_times = np.zeros_like(wall_times)
-            diff_times[:-1] = \
-                wall_times[1:] - wall_times[:-1]
-            diff_times_list += [diff_times]
+        time_diffs_list = []
+        for times in times_list:
+            times = np.concatenate([np.array([0.]), times])
+            # time_diffs = np.zeros_like(times)
+            time_diffs = times[1:] - times[:-1]
+            time_diffs_list += [time_diffs]
 
-        for rewards, diff_times in zip(rewards_list, 
-                                       diff_times_list):
-            self.add_list_filter_zero(rewards, diff_times)
+        for i, (time_diffs, rewards) in enumerate(zip(time_diffs_list,
+                                       rewards_list)):
+            self.add_list_filter_zero(time_diffs, rewards)
 
         diff_rewards_list = \
-            [rewards - self.avg_per_step_reward * diff_times
-             for rewards, diff_times in zip(rewards_list, 
-                                            diff_times_list)]
+            [rewards - self.avg_per_step_reward * time_diffs
+             for rewards, time_diffs in zip(rewards_list, 
+                                            time_diffs_list)]
 
         diff_returns_list = \
             [compute_returns(diff_rewards, self.discount) 

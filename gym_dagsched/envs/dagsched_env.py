@@ -123,18 +123,19 @@ class DagSchedEnv:
         if self.done:
             return None, 0, True
 
-        self._take_action(action)
-        
-        if not self._is_commitment_round_complete():
-            # current commitment round is not over yet,
-            # so consult the agent again
-            return self._observe(False), 0, False
+        if action is not None:
+            self._take_action(action)
             
-        # commitment round has completed, i.e.
-        # all the workers at the current source
-        # have somewhere to go
-        self.selected_ops.clear()
-        self._fulfill_source_commitments()
+            if not self._is_commitment_round_complete():
+                # current commitment round is not over yet,
+                # so consult the agent again
+                return self._observe(False), 0, False
+                
+            # commitment round has completed, i.e.
+            # all the workers at the current source
+            # have somewhere to go
+            self.selected_ops.clear()
+            self._fulfill_source_commitments()
 
         reward, self.done = self._step_through_timeline()
 
@@ -188,11 +189,10 @@ class DagSchedEnv:
             if len(self.schedulable_ops) > 0:
                 break
 
-            free_worker_ids = set((
-                worker_id 
-                for worker_id in self.state.get_source_workers() 
-                if self.workers[worker_id].available
-            ))
+            free_worker_ids = \
+                set((worker_id 
+                     for worker_id in self.state.get_source_workers() 
+                     if self.workers[worker_id].available))
             self._move_free_uncommitted_source_workers(free_worker_ids)
 
         reward = self._calculate_reward(t_prev)
@@ -202,7 +202,7 @@ class DagSchedEnv:
         if not done:
             assert len(self.schedulable_ops) > 0 and \
                 not self.state.all_source_workers_committed
-            print('starting new commitment round')
+            print('starting new commitment round', flush=True)
         else:
             print('DONE!', flush=True)
 

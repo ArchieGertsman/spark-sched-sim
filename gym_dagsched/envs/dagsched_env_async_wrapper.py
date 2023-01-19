@@ -80,11 +80,22 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _parse_action(self, action):
-        (job_id, active_op_idx), num_workers = action
+        (job_id, active_op_idx), prlsm_lim = action
+
+        # parse operation
         job = self.env.jobs[job_id]
         active_ops = list(job.active_ops)
         op_id = active_ops[active_op_idx].id_
-        action = ((job_id, op_id), num_workers)
+
+        # parse parallelism limit
+        _, num_source_workers, source_job_id, *_ = self.last_obs
+        worker_count = prlsm_lim - job.total_worker_count
+        if job.id_ == source_job_id:
+            worker_count += num_source_workers
+        
+        assert worker_count >= 1
+
+        action = ((job_id, op_id), worker_count)
         return action
 
 
@@ -110,8 +121,10 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _parse_obs(self, obs):
+        self.last_obs = obs
+
         (new_commitment_round,
-         n_source_workers,
+         num_source_workers,
          source_job_id, 
          valid_ops, 
          active_jobs,
@@ -120,8 +133,12 @@ class DagSchedEnvAsyncWrapper:
         (active_job_mask, 
          active_op_mask, 
          op_counts, 
-         valid_ops_mask) = \
-            self._bookkeep(active_jobs, valid_ops)
+         valid_ops_mask,
+         valid_prlsm_lim_mask) = \
+            self._bookkeep(active_jobs, 
+                           valid_ops,
+                           source_job_id,
+                           num_source_workers)
 
         did_update = \
             self._update_dag_subbatch(active_op_mask,
@@ -132,7 +149,7 @@ class DagSchedEnvAsyncWrapper:
         self._update_node_features(new_commitment_round,
                                    active_jobs,
                                    source_job_id,
-                                   n_source_workers)
+                                   num_source_workers)
 
         active_job_ids = np.array(self.env.active_job_ids)
 
@@ -141,34 +158,63 @@ class DagSchedEnvAsyncWrapper:
         return did_update, \
             self.dag_subbatch, \
             valid_ops_mask, \
+            valid_prlsm_lim_mask, \
             active_job_ids, \
-            n_source_workers, \
+            num_source_workers, \
             wall_time
 
 
 
-    def _bookkeep(self, active_jobs, valid_ops):
+    def _bookkeep(self, 
+                  active_jobs, 
+                  valid_ops,
+                  source_job_id,
+                  num_source_workers):
         active_job_mask = np.zeros(self.num_total_jobs, dtype=bool)
         active_op_mask = np.zeros(self.num_total_ops, dtype=bool)
         op_counts = []
         valid_ops_mask = []
+        valid_prlsm_lim_mask = \
+            np.zeros((len(active_jobs), self.num_workers), 
+                     dtype=bool)
 
-        for job in active_jobs:
+        for i, job in enumerate(active_jobs):
             active_job_mask[job.id_] = 1
             op_counts += [job.num_active_ops]
+
+            # build parallelism limit mask
+            min_prlsm_lim = job.total_worker_count + 1
+            max_prlsm_lim = job.total_worker_count + num_source_workers
+            if job.id_ == source_job_id:
+                min_prlsm_lim -= num_source_workers
+                max_prlsm_lim -= num_source_workers
+            print('IS SOURCE JOB:', job.id_ == source_job_id)
+            print(min_prlsm_lim, max_prlsm_lim)
+
+            assert 0 < min_prlsm_lim
+            assert     min_prlsm_lim <= self.num_workers + 1
+
+            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):max_prlsm_lim] = 1
+
             for op in job.active_ops:
+                # build operation masks
                 global_idx = self.global_op_idx_map[job.id_][op.id_]
                 active_op_mask[global_idx] = 1
-                valid_ops_mask += [1] if op in valid_ops else [0]
+                if min_prlsm_lim <= self.num_workers and \
+                   op in valid_ops:
+                    valid_ops_mask += [1]
+                else:
+                    valid_ops_mask += [0]
 
         op_counts = np.array(op_counts, dtype=int)
 
         valid_ops_mask = np.array(valid_ops_mask, dtype=bool)
 
         return active_job_mask, \
-            active_op_mask, \
-            op_counts, \
-            valid_ops_mask
+               active_op_mask, \
+               op_counts, \
+               valid_ops_mask, \
+               valid_prlsm_lim_mask
 
 
 
