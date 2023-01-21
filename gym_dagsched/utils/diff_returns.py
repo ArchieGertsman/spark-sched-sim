@@ -43,6 +43,7 @@ class DifferentialReturnsCalculator(object):
         np.set_printoptions(precision=3, suppress=True)
         assert len(time_diffs) == len(rewards)
         for dt, reward in zip(time_diffs, rewards):
+            print(dt, reward)
             if dt != 0:
                 self.add(dt, reward)
             else:
@@ -60,12 +61,11 @@ class DifferentialReturnsCalculator(object):
         time_diffs_list = []
         for times in times_list:
             times = np.concatenate([np.array([0.]), times])
-            # time_diffs = np.zeros_like(times)
             time_diffs = times[1:] - times[:-1]
             time_diffs_list += [time_diffs]
 
-        for i, (time_diffs, rewards) in enumerate(zip(time_diffs_list,
-                                       rewards_list)):
+        for time_diffs, rewards in zip(time_diffs_list,
+                                       rewards_list):
             self.add_list_filter_zero(time_diffs, rewards)
 
         diff_rewards_list = \

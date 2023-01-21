@@ -1,12 +1,14 @@
-from collections import defaultdict
-
 import numpy as np
 import torch
 from torch_sparse import SparseTensor
 
 
 
-def construct_subbatch(data_batch, graph_mask, node_mask, num_nodes_per_graph, num_graphs):
+def construct_subbatch(data_batch, 
+                       graph_mask, 
+                       node_mask, 
+                       num_nodes_per_graph, 
+                       num_graphs):
     node_mask = torch.from_numpy(node_mask)
     subbatch = data_batch.subgraph(node_mask)
 

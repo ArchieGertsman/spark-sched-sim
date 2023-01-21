@@ -73,10 +73,13 @@ def train(model,
         # ep_len = np.random.geometric(1/mean_ep_len)
         # ep_len = max(ep_len, min_ep_len)
         # ep_len = min(ep_len, 4500)
-        max_ep_len = mean_ep_len
+        # max_ep_len = mean_ep_len
+
+        # max_wall_time = np.random.geometric(5e-7)
+        max_wall_time = 5e6
 
         print('beginning training on sequence',
-              epoch+1, 'with ep_len =', max_ep_len, 
+              epoch+1, 'with max time =', max_wall_time, 
               flush=True)
 
         # send episode data to each of the workers.
@@ -86,7 +89,7 @@ def train(model,
                  num_init_jobs, 
                  job_arrival_rate, 
                  num_workers, 
-                 max_ep_len, 
+                 max_wall_time, 
                  entropy_weight))
 
         # wait for rewards and wall times
@@ -195,8 +198,8 @@ def setup_worker(rank, world_size):
     # IMPORTANT! Each worker needs to produce 
     # unique rollouts, which are determined
     # by the rng seeds.
-    torch.manual_seed(rank)
-    np.random.seed(rank)
+    torch.manual_seed(3)#rank)
+    np.random.seed(3)#rank)
 
     # torch.autograd.set_detect_anomaly(True)
 
@@ -234,19 +237,33 @@ def episode_runner(rank,
     while data := conn.recv():
         i += 1
         # receive episode data from parent process
-        run_iteration(i, rank, num_envs, env, model, optim, conn, data)
+        run_iteration(i, 
+                      rank, 
+                      num_envs, 
+                      env, 
+                      model, 
+                      optim, 
+                      conn,
+                      data)
 
     cleanup_worker()
 
 
 
 
-def run_iteration(i, rank, num_envs, env, model, optim, conn, data):
+def run_iteration(i, 
+                  rank, 
+                  num_envs, 
+                  env, 
+                  model, 
+                  optim, 
+                  conn, 
+                  data):
     (num_job_arrivals, 
      num_init_jobs, 
      job_arrival_rate, 
      n_workers,
-     max_ep_len, 
+     max_wall_time, 
      entropy_weight) = data
 
     prof = Profiler()
@@ -255,18 +272,19 @@ def run_iteration(i, rank, num_envs, env, model, optim, conn, data):
     if prof:
         prof.enable()
 
+
     experience = \
         run_episode(env,
                     num_job_arrivals, 
                     num_init_jobs, 
                     job_arrival_rate, 
                     n_workers,
-                    max_ep_len,
+                    max_wall_time,
                     model)
 
     dist.barrier()
-    print('SLEEPING', flush=True)
-    sleep(10)
+    # print('SLEEPING', flush=True)
+    # sleep(10)
 
     wall_times, rewards = \
         list(zip(*[(exp.wall_time, exp.reward) 
@@ -320,19 +338,19 @@ class Experience:
 
 
 
-def run_episode(
-    env,
-    num_job_arrivals,
-    num_init_jobs,
-    job_arrival_rate,
-    num_workers,
-    ep_len,
-    model
-):  
+def run_episode(env,
+                num_job_arrivals,
+                num_init_jobs,
+                job_arrival_rate,
+                num_workers,
+                max_wall_time,
+                model):  
+
     obs = env.reset(num_job_arrivals, 
                     num_init_jobs, 
                     job_arrival_rate, 
-                    num_workers)
+                    num_workers,
+                    max_wall_time)
 
     done = False
 
@@ -349,10 +367,7 @@ def run_episode(
     # in leaning
     experience = []
     
-    for _ in range(ep_len):
-        if done:
-            break
-
+    while not done:
         # unpack the current observation
         (did_update_dag_batch,
          dag_batch,
@@ -376,11 +391,12 @@ def run_episode(
             dag_batch_device.x = dag_batch.x \
                 .to(device, non_blocking=True)
         
+        
         node_scores, dag_scores = \
             invoke_agent(model,
-                         dag_batch_device,
-                         valid_ops_mask,
-                         valid_prlsm_lim_mask)
+                        dag_batch_device,
+                        valid_ops_mask,
+                        valid_prlsm_lim_mask)
 
         raw_action, env_action = \
             sample_action(node_scores, 
@@ -390,8 +406,7 @@ def run_episode(
 
         obs, reward, done = env.step(env_action)
 
-        if obs is not None:
-            *_, wall_time = obs
+        *_, wall_time = obs
 
         experience += \
             [Experience(dag_batch.clone(),
@@ -412,19 +427,16 @@ def invoke_agent(model,
                  dag_batch_device,
                  valid_ops_mask,
                  valid_prlsm_lim_mask):
+           
     with torch.no_grad():
         # no computational graphs needed during 
         # the episode, only model outputs.
         node_scores, dag_scores = \
             model(dag_batch_device)
 
-    # move node scores to CPU and mask out
-    # nodes that correspond to invalid
-    # operations
     node_scores = node_scores.cpu()
     node_scores[~valid_ops_mask] = float('-inf')
 
-    # move dag scores to CPU and mask
     dag_scores = dag_scores.cpu()
     invalid_row, invalid_col = \
         (~valid_prlsm_lim_mask).nonzero()

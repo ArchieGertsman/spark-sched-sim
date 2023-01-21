@@ -21,14 +21,14 @@ def main():
         num_dag_features=3,
         num_workers=num_workers)
 
-    writer = SummaryWriter('log/train')
-    # writer = None
+    # writer = SummaryWriter('log/train')
+    writer = None
 
     train(model,
           optim_class=torch.optim.Adam,
           optim_lr=.001,
-          n_sequences=50,
-          num_envs=16,
+          n_sequences=1,
+          num_envs=1,
           discount=.99,
           entropy_weight_init=1.,
           entropy_weight_decay=1e-3,

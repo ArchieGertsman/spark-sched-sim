@@ -44,7 +44,8 @@ class DagSchedEnvAsyncWrapper:
               num_job_arrivals, 
               num_init_jobs, 
               job_arrival_rate, 
-              num_workers):
+              num_workers,
+              max_wall_time):
 
         mean_job_interarrival_time = 1 / job_arrival_rate
 
@@ -66,7 +67,10 @@ class DagSchedEnvAsyncWrapper:
         self.active_op_mask = None
         self.dag_subbatch = None
 
-        obs = self.env.reset(initial_timeline, workers)
+        obs = self.env.reset(initial_timeline, 
+                             workers, 
+                             max_wall_time)
+
         return self._parse_obs(obs)
 
 
@@ -74,7 +78,7 @@ class DagSchedEnvAsyncWrapper:
     def step(self, action):
         action = self._parse_action(action)
         obs, reward, done = self.env.step(action)
-        obs = self._parse_obs(obs) if not done else None
+        obs = self._parse_obs(obs)
         return obs, reward, done
 
 
@@ -104,6 +108,7 @@ class DagSchedEnvAsyncWrapper:
         data_list = [e.job.init_pyg_data() 
                      for _,_,e in initial_timeline.pq]
         self.dag_batch = Batch.from_data_list(data_list)
+
 
 
     def _reset_global_op_idx_map(self, initial_timeline):
@@ -151,7 +156,8 @@ class DagSchedEnvAsyncWrapper:
                                    source_job_id,
                                    num_source_workers)
 
-        active_job_ids = np.array(self.env.active_job_ids)
+        active_job_ids = \
+            np.array([job.id_ for job in active_jobs])
 
         self.active_op_mask = active_op_mask
 
@@ -178,6 +184,8 @@ class DagSchedEnvAsyncWrapper:
             np.zeros((len(active_jobs), self.num_workers), 
                      dtype=bool)
 
+        print('WORKER COUNTS', {job.id_: job.total_worker_count for job in active_jobs})
+
         for i, job in enumerate(active_jobs):
             active_job_mask[job.id_] = 1
             op_counts += [job.num_active_ops]
@@ -188,27 +196,26 @@ class DagSchedEnvAsyncWrapper:
             if job.id_ == source_job_id:
                 min_prlsm_lim -= num_source_workers
                 max_prlsm_lim -= num_source_workers
-            print('IS SOURCE JOB:', job.id_ == source_job_id)
-            print(min_prlsm_lim, max_prlsm_lim)
 
             assert 0 < min_prlsm_lim
-            assert     min_prlsm_lim <= self.num_workers + 1
+            # assert     min_prlsm_lim <= self.num_workers + 1
 
             valid_prlsm_lim_mask[i, (min_prlsm_lim-1):max_prlsm_lim] = 1
 
-            for op in job.active_ops:
+            for op in iter(job.active_ops):
                 # build operation masks
                 global_idx = self.global_op_idx_map[job.id_][op.id_]
                 active_op_mask[global_idx] = 1
-                if min_prlsm_lim <= self.num_workers and \
-                   op in valid_ops:
-                    valid_ops_mask += [1]
-                else:
-                    valid_ops_mask += [0]
+                if min_prlsm_lim > self.num_workers:
+                    assert op not in valid_ops
+                valid_ops_mask += [1] if op in valid_ops else [0]
 
         op_counts = np.array(op_counts, dtype=int)
 
         valid_ops_mask = np.array(valid_ops_mask, dtype=bool)
+
+        # print('NODE MASK', valid_ops_mask)
+        # print('PRLSM MASK', valid_prlsm_lim_mask, flush=True)
 
         return active_job_mask, \
                active_op_mask, \

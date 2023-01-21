@@ -21,7 +21,7 @@ class Job:
 
         # list of `Operation` objects
         self.ops = ops
-        self.active_ops = ops.copy()
+        self.active_ops = set(ops)
 
         # networkx dag storing the operations' interdependencies
         self.dag = dag

@@ -18,10 +18,9 @@ class ActorNetwork(nn.Module):
                  dim_embed=8):
         super().__init__()
 
-        # self.num_workers = num_workers
-
-        self.encoder = GraphEncoderNetwork(
-            num_node_features, dim_embed)
+        self.encoder = \
+            GraphEncoderNetwork(num_node_features, 
+                                dim_embed)
 
         self.policy_network = \
             PolicyNetwork(num_node_features, 
@@ -79,7 +78,7 @@ class ActorNetwork(nn.Module):
             torch.cumsum(job_counts, 0, out=obs_indptr[1:])
             
             op_counts = segment_add_csr(num_ops_per_job, 
-                                             obs_indptr)
+                                        obs_indptr)
 
         return obs_indptr, \
                num_ops_per_job, \
@@ -138,8 +137,12 @@ class GCNConv(MessagePassing):
 class GraphEncoderNetwork(nn.Module):
     def __init__(self, num_node_features, dim_embed):
         super().__init__()
-        self.graph_conv = GCNConv(num_node_features, dim_embed)
-        self.mlp_node = make_mlp(num_node_features + dim_embed, dim_embed)
+        self.graph_conv = GCNConv(num_node_features, 
+                                  dim_embed)
+
+        self.mlp_node = make_mlp(num_node_features + dim_embed, 
+                                 dim_embed)
+
         self.mlp_dag = make_mlp(dim_embed, dim_embed)
 
 
@@ -171,14 +174,15 @@ class GraphEncoderNetwork(nn.Module):
     
 
 
-    def _compute_dag_embeddings(self, dag_batch, node_embeddings):
+    def _compute_dag_embeddings(self, 
+                                dag_batch, 
+                                node_embeddings):
         '''one embedding per job'''
 
         # merge original node features with new node embeddings
         nodes_merged = \
-            torch.cat(
-                [dag_batch.x, node_embeddings], 
-                dim=1)
+            torch.cat([dag_batch.x, node_embeddings], 
+                      dim=1)
 
         # pass combined node features through mlp
         nodes_merged = self.mlp_node(nodes_merged)
@@ -194,7 +198,9 @@ class GraphEncoderNetwork(nn.Module):
 
 
 
-    def _compute_global_embeddings(self, dag_embeddings, obs_indptr):
+    def _compute_global_embeddings(self, 
+                                   dag_embeddings, 
+                                   obs_indptr):
         '''one embedding per observation'''
 
         # pass dag embeddings through mlp
@@ -271,26 +277,29 @@ class PolicyNetwork(nn.Module):
                              global_embeddings,      
                              num_ops_per_job, 
                              op_counts):
+        num_nodes = node_features.shape[0]
+
         dag_embeddings_repeat = \
-            dag_embeddings.repeat_interleave( 
-                num_ops_per_job, 
-                dim=0,
-                output_size=node_features.shape[0])
+            dag_embeddings \
+                .repeat_interleave(num_ops_per_job, 
+                                   dim=0,
+                                   output_size=num_nodes)
         
         global_embeddings_repeat = \
-            global_embeddings.repeat_interleave( 
-                op_counts, 
-                dim=0,
-                output_size=node_features.shape[0])
+            global_embeddings \
+                .repeat_interleave(op_counts, 
+                                   dim=0,
+                                   output_size=num_nodes)
 
-        node_inputs = torch.cat(
-            [node_features, 
-             node_embeddings, 
-             dag_embeddings_repeat, 
-             global_embeddings_repeat], 
-            dim=1)
+        node_inputs = \
+            torch.cat([node_features, 
+                       node_embeddings, 
+                       dag_embeddings_repeat, 
+                       global_embeddings_repeat], 
+                      dim=1)
 
-        node_scores = self.mlp_node_score(node_inputs).squeeze(-1)
+        node_scores = \
+            self.mlp_node_score(node_inputs).squeeze(-1)
 
         return node_scores
     
@@ -312,17 +321,19 @@ class PolicyNetwork(nn.Module):
             torch.cat([dag_features, dag_embeddings], 
                       dim=1)
 
+        num_total_actions = worker_actions.shape[0]
+
         dag_features_merged_repeat = \
-            dag_features_merged.repeat_interleave(
-                self.num_workers, 
-                dim=0,
-                output_size=worker_actions.shape[0])
+            dag_features_merged \
+                .repeat_interleave(self.num_workers, 
+                                   dim=0,
+                                   output_size=num_total_actions)
 
         global_embeddings_repeat = \
-            global_embeddings.repeat_interleave( 
-                job_counts * self.num_workers, 
-                dim=0,
-                output_size=worker_actions.shape[0])
+            global_embeddings \
+                .repeat_interleave(job_counts * self.num_workers, 
+                                   dim=0,
+                                   output_size=num_total_actions)
         
         dag_inputs = \
             torch.cat([dag_features_merged_repeat,
@@ -330,7 +341,8 @@ class PolicyNetwork(nn.Module):
                        worker_actions], 
                       dim=1)
 
-        dag_scores = self.mlp_dag_score(dag_inputs).squeeze(-1)
+        dag_scores = \
+            self.mlp_dag_score(dag_inputs).squeeze(-1)
 
         dag_scores = dag_scores.view(num_total_jobs, 
                                      self.num_workers)
