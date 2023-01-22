@@ -19,5 +19,6 @@ log
 gym_dagsched/envs/vec_dagsched_env.py
 gym_dagsched/envs/shared_obs.py
 gym_dagsched/envs/env_run.py
-
-gym_dagsched/utils/gather_with_grad.py
+gym_dagsched/policies/heuristics.py
+gym_dagsched/reinforce/reinforce_sync.py
+gym_dagsched/data_generation/random_datagen.py
