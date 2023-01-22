@@ -229,12 +229,11 @@ class Job:
 
 
     def assign_worker(self, worker, op, wall_time):
-        assert op.n_saturated_tasks < op.n_tasks
+        assert op.num_saturated_tasks < op.num_tasks
 
-        task = op.remaining_tasks.pop()
-        op.processing_tasks.add(task)
+        task = op.start_on_next_task()
 
-        if op.n_remaining_tasks == 0:
+        if op.num_remaining_tasks == 0:
             self.saturated_op_count += 1
             
         worker.task = task
@@ -246,10 +245,9 @@ class Job:
 
     def add_task_completion(self, op, task, worker, wall_time):
         assert not op.completed
-        assert task in op.processing_tasks
+        # assert task in op.processing_tasks
 
-        op.processing_tasks.remove(task)
-        op.completed_tasks.add(task)
+        op.mark_task_completed(task)
 
         worker.task = None
         task.t_completed = wall_time

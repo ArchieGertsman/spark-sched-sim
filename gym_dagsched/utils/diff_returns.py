@@ -43,7 +43,6 @@ class DifferentialReturnsCalculator(object):
         np.set_printoptions(precision=3, suppress=True)
         assert len(time_diffs) == len(rewards)
         for dt, reward in zip(time_diffs, rewards):
-            print(dt, reward)
             if dt != 0:
                 self.add(dt, reward)
             else:

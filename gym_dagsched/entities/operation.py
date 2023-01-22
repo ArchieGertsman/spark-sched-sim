@@ -14,25 +14,28 @@ class Features:
 
 class Operation:
 
-    def __init__(self, id, job_id, n_tasks, task_duration, rough_duration):
+    def __init__(self, id, job_id, num_tasks, task_duration, rough_duration):
         self.id_ = id
         self.job_id = job_id
         self.task_duration = task_duration
         self.rough_duration = rough_duration
         self.most_recent_duration = rough_duration
 
-        self.n_tasks = n_tasks
+        self.num_tasks = num_tasks
         tasks = [
             Task(id_=i, op_id=self.id_, job_id=self.job_id) 
-            for i in range(n_tasks)
+            for i in range(num_tasks)
         ]
         self.remaining_tasks = set(tasks)
-        self.processing_tasks = set()
-        self.completed_tasks = set()
+        self.num_remaining_tasks = num_tasks
+
+        # self.processing_tasks = set()
+        self.num_processing_tasks = 0
+
+        # self.completed_tasks = set()
+        self.num_completed_tasks = 0
 
         self.saturated = False
-        # self.num_commitments = 0
-        # self.num_moving_workers = 0
 
 
     def __hash__(self):
@@ -52,43 +55,37 @@ class Operation:
 
     @property
     def completed(self):
-        return len(self.completed_tasks) == self.n_tasks
+        return self.num_completed_tasks == self.num_tasks
 
     @property
-    def n_saturated_tasks(self):
-        return len(self.processing_tasks) + len(self.completed_tasks)
+    def num_saturated_tasks(self):
+        return self.num_processing_tasks + self.num_completed_tasks
 
     @property
     def next_task_id(self):
-        return self.n_saturated_tasks
-
-    # @property
-    # def saturated(self):
-    #     assert self.n_saturated_tasks <= self.n_tasks
-    #     return self.n_saturated_tasks == self.n_tasks
-
-    @property
-    def n_remaining_tasks(self):
-        return self.n_tasks - self.n_saturated_tasks
+        return self.num_saturated_tasks
 
     @property
     def approx_remaining_work(self):
-        return self.most_recent_duration * self.n_remaining_tasks
+        return self.most_recent_duration * self.num_remaining_tasks
 
 
-    # def add_moving_worker(self):
-    #     self.num_moving_workers += 1
+    def start_on_next_task(self):
+        task = self.remaining_tasks.pop()
+        self.num_remaining_tasks -= 1
 
-    # def remove_moving_worker(self):
-    #     self.num_moving_workers -= 1
-    #     assert self.num_moving_workers >= 0
+        # self.processing_tasks.add(task)
+        self.num_processing_tasks += 1
 
-    # def add_commitments(self, n):
-    #     self.num_commitments += n
+        return task
 
-    # def remove_commitment(self):
-    #     self.num_commitments -= 1
-    #     assert self.num_commitments >= 0
+
+    def mark_task_completed(self, task):
+        # self.processing_tasks.remove(task)
+        self.num_processing_tasks -= 1
+
+        # self.completed_tasks.add(task)
+        self.num_completed_tasks += 1
         
 
 

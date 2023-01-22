@@ -28,7 +28,7 @@ def main():
           optim_class=torch.optim.Adam,
           optim_lr=.001,
           n_sequences=1,
-          num_envs=1,
+          num_envs=16,
           discount=.99,
           entropy_weight_init=1.,
           entropy_weight_decay=1e-3,
@@ -37,9 +37,9 @@ def main():
           num_init_jobs=1, 
           job_arrival_rate=1/25000,
           num_workers=num_workers,
-          initial_mean_ep_len=4000, #302,
-          ep_len_growth=0,
-          min_ep_len=0,
+          max_time_mean_init=2e6,
+          max_time_mean_growth=1.6e3,
+          max_time_mean_ceil=2e7,
           writer=writer)
 
     if writer:

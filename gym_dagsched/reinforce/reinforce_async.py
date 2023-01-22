@@ -41,9 +41,9 @@ def train(model,
           num_init_jobs, 
           job_arrival_rate,
           num_workers,
-          initial_mean_ep_len,
-          ep_len_growth,
-          min_ep_len,
+          max_time_mean_init,
+          max_time_mean_growth,
+          max_time_mean_ceil,
           writer):
     '''trains the model on different job arrival sequences. 
     Multiple episodes are run on each sequence in parallel.
@@ -53,7 +53,7 @@ def train(model,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
 
-    datagen_state = np.random.RandomState(69)
+    datagen_state = np.random.RandomState(42)
 
     diff_return_calc = \
         DifferentialReturnsCalculator(discount)
@@ -65,21 +65,16 @@ def train(model,
                       optim_lr,
                       datagen_state)
 
-    mean_ep_len = initial_mean_ep_len
+    max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
 
-    for epoch in range(n_sequences):
-        # sample the length of the current episode
-        # ep_len = np.random.geometric(1/mean_ep_len)
-        # ep_len = max(ep_len, min_ep_len)
-        # ep_len = min(ep_len, 4500)
-        # max_ep_len = mean_ep_len
+    for i in range(n_sequences):
+        # sample the max wall duration of the current episode
+        max_time = np.random.exponential(max_time_mean)
 
-        # max_wall_time = np.random.geometric(5e-7)
-        max_wall_time = 5e6
-
-        print('beginning training on sequence',
-              epoch+1, 'with max time =', max_wall_time, 
+        print('training on sequence '
+              f'{i+1} with max wall time = ' 
+              f'{max_time*1e-3:.1f}s',
               flush=True)
 
         # send episode data to each of the workers.
@@ -89,7 +84,7 @@ def train(model,
                  num_init_jobs, 
                  job_arrival_rate, 
                  num_workers, 
-                 max_wall_time, 
+                 max_time, 
                  entropy_weight))
 
         # wait for rewards and wall times
@@ -136,15 +131,17 @@ def train(model,
             }
 
             for name, stat in episode_stats.items():
-                writer.add_scalar(name, stat, epoch)
+                writer.add_scalar(name, stat, i)
 
-        # increase the mean episode length
-        mean_ep_len += ep_len_growth
+        # increase the mean episode duration
+        max_time_mean = \
+            min(max_time_mean + max_time_mean_growth,
+                max_time_mean_ceil)
 
         # decrease the entropy weight
-        entropy_weight = max(
-            entropy_weight - entropy_weight_decay, 
-            entropy_weight_min)
+        entropy_weight = \
+            max(entropy_weight - entropy_weight_decay, 
+                entropy_weight_min)
 
     cleanup_workers(conns, procs)
 
@@ -198,8 +195,8 @@ def setup_worker(rank, world_size):
     # IMPORTANT! Each worker needs to produce 
     # unique rollouts, which are determined
     # by the rng seeds.
-    torch.manual_seed(3)#rank)
-    np.random.seed(3)#rank)
+    torch.manual_seed(rank)
+    np.random.seed(rank)
 
     # torch.autograd.set_detect_anomaly(True)
 
@@ -282,7 +279,7 @@ def run_iteration(i,
                     max_wall_time,
                     model)
 
-    dist.barrier()
+    # dist.barrier()
     # print('SLEEPING', flush=True)
     # sleep(10)
 
@@ -483,11 +480,10 @@ def sample_action(node_scores,
 
 def translate_op(op, job_ptr, active_jobs_ids):
     '''Returns:
-    - `op`: translation of the policy sample so
-    that the environment can find the correct
-    operation
-    - `job_idx`: index of the job that the
-    selected op belongs to
+    - `op`: translation of the policy sample so that 
+    the environment can find the corresponding operation
+    - `job_idx`: index of the job that the selected op 
+    belongs to
     '''
     job_idx = (op >= job_ptr).sum() - 1
 
@@ -531,6 +527,8 @@ def learn_from_experience(model,
     # update model parameters
     optim.step()
 
+    optim.zero_grad(set_to_none=True)
+
     return actor_loss.item(), \
            advantage_loss.item(), \
            entropy_loss.item()
@@ -548,6 +546,7 @@ def compute_loss(model,
     # episode back through the model, this time
     # recording a computational graph
     model_outputs = model(*batched_model_inputs)
+    torch.cuda.synchronize()
 
     # move model outputs to CPU
     (node_scores_batch, 
@@ -654,43 +653,6 @@ def action_attributes(node_scores_batch,
 
     return action_lgprob_batch, \
            action_entropy_batch
-
-
-    action_lgprobs = []
-    action_entropies = []
-
-    for node_scores, dag_scores, exp in zip(node_scores_batch,
-                                            dag_scores_batch,
-                                            experience):
-        node_selection, dag_idx, dag_selection = exp.action
-
-        node_scores = node_scores.cpu()
-        node_scores[~exp.valid_ops_mask] = float('-inf')
-        node_lgprob, node_entropy = \
-            node_action_attributes(node_scores, 
-                                   node_selection)
-
-        dag_scores = dag_scores.cpu()
-        invalid_row, invalid_col = \
-            (~exp.valid_prlsm_lim_mask).nonzero()
-        dag_scores[invalid_row, invalid_col] = float('-inf')
-        dag_lgprob, dag_entropy = \
-            dag_action_attributes(dag_scores, 
-                                  dag_idx, 
-                                  dag_selection)
-
-        num_nodes = node_scores.numel()
-        entropy_norm = np.log(exp.num_source_workers * num_nodes)
-        entropy_scale = 1 / max(1, entropy_norm)
-
-        action_lgprob = node_lgprob + dag_lgprob
-        action_entropy = entropy_scale * (node_entropy + dag_entropy)
-
-        action_lgprobs += [action_lgprob]
-        action_entropies += [action_entropy]
-
-    return torch.stack(action_lgprobs), \
-           torch.stack(action_entropies)
 
 
 

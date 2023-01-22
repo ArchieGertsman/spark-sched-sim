@@ -256,7 +256,7 @@ class DagSchedEnvAsyncWrapper:
             node_features[:, 1] = int(is_source_job) * 4 - 2
 
             for i, op in enumerate(iter(job.active_ops)):
-                node_features[i, 3] = op.n_remaining_tasks / 200
+                node_features[i, 3] = op.num_remaining_tasks / 200
                 node_features[i, 4] = op.approx_remaining_work / 1e5
 
         all_node_features = torch.from_numpy(all_node_features)

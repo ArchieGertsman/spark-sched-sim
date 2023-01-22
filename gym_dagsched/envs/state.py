@@ -37,22 +37,22 @@ class Attr(Enum):
 '''classes for each type of node in the graph'''
 
 @dataclass(frozen=True, eq=True)
-class WorkerNode:
+class Worker:
     worker_id: int
 
 
 @dataclass(frozen=True, eq=True)
-class NullNode:
+class GeneralPool:
     pass
 
 
 @dataclass(frozen=True, eq=True)
-class JobNode:
+class JobPool:
     job_id: int
 
 
 @dataclass(frozen=True, eq=True)
-class OpNode:
+class OpPool:
     job_id: int
     op_id: int
     state: OpState
@@ -79,24 +79,24 @@ class State:
 
         self.add_worker_nodes(num_workers)
 
-        self.G.add_nodes_from([(NullNode(), 
+        self.G.add_nodes_from([(GeneralPool(), 
                                 {Attr.NUM_IN_COMMIT: 0,
                                  Attr.NUM_OUT_COMMIT: 0})])
 
         # add all the workers to the graph, and connect
-        # them to the 'null' node initially
-        edge_gen = ((WorkerNode(worker_id), NullNode()) 
+        # them to the 'general' node initially
+        edge_gen = ((Worker(worker_id), GeneralPool()) 
                     for worker_id in range(num_workers))
         self.G.add_edges_from(edge_gen)
 
-        # set inital worker source to be the 'null' node
+        # set inital worker source to be the 'general' node
         # since it initially contains all the workers
-        self._curr_source = NullNode()
+        self._curr_source = GeneralPool()
 
 
 
     def add_worker_nodes(self, num_workers):
-        node_gen = (WorkerNode(worker_id)
+        node_gen = (Worker(worker_id)
                     for worker_id in range(num_workers))
         self.G.add_nodes_from(node_gen)
 
@@ -106,7 +106,7 @@ class State:
         # using `add_nodes_from` instead of `add_node` 
         # in order to set enum-keyed attributes, because 
         # `add_node` only allows string keys
-        node = (JobNode(job_id), 
+        node = (JobPool(job_id), 
                 {Attr.NUM_IN_COMMIT: 0,
                  Attr.NUM_OUT_COMMIT: 0})
         self.G.add_nodes_from([node])
@@ -114,7 +114,7 @@ class State:
 
 
     def add_op(self, job_id, op_id):
-        node_gen = ((OpNode(job_id, op_id, state), 
+        node_gen = ((OpPool(job_id, op_id, state), 
                      {Attr.NUM_IN_COMMIT: 0,
                       Attr.NUM_OUT_COMMIT: 0})
                     for state in OpState)
@@ -124,14 +124,14 @@ class State:
 
     def remove_op(self, job_id, op_id):
         for state in OpState:
-            self._remove_node(OpNode(job_id, 
+            self._remove_node(OpPool(job_id, 
                                      op_id, 
                                      state)) 
             
 
 
     def remove_job(self, job_id):
-        self._remove_node(JobNode(job_id))
+        self._remove_node(JobPool(job_id))
 
 
 
@@ -145,13 +145,14 @@ class State:
 
 
 
-    def null_pool_has_workers(self):
-        return self.G.in_degree[NullNode()] > 0
+    def general_pool_has_workers(self):
+        return self.G.in_degree[GeneralPool()] > 0
 
 
 
     def source_job(self):
-        if isinstance(self._curr_source, NullNode):
+        if self._curr_source is None or \
+           isinstance(self._curr_source, GeneralPool):
             return None
         else:
             return self._curr_source.job_id
@@ -159,9 +160,9 @@ class State:
 
 
     def get_source(self):
-        if isinstance(self._curr_source, NullNode):
+        if isinstance(self._curr_source, GeneralPool):
             return None, None
-        elif isinstance(self._curr_source, JobNode):
+        elif isinstance(self._curr_source, JobPool):
             return self._curr_source.job_id, None
         else:
             return self._curr_source.job_id, \
@@ -171,19 +172,19 @@ class State:
 
     def is_worker_moving(self, worker_id):
         node = self._get_worker_location(worker_id)
-        return isinstance(node, OpNode) and \
+        return isinstance(node, OpPool) and \
                node.state == OpState.MOVING
 
 
 
     def num_workers_moving_to_op(self, job_id, op_id):
-        op_node = OpNode(job_id, op_id, OpState.MOVING)
+        op_node = OpPool(job_id, op_id, OpState.MOVING)
         return self._num_workers_moving_to_op(op_node)
 
 
 
     def num_commitments_to_op(self, job_id, op_id):
-        op_node = OpNode(job_id, op_id, OpState.COMMITTED)
+        op_node = OpPool(job_id, op_id, OpState.COMMITTED)
         return self._num_commitments_to_op(op_node)
 
 
@@ -213,6 +214,11 @@ class State:
 
 
 
+    def clear_worker_source(self):
+        self._curr_source = None
+
+
+
     def get_source_commitments(self):
         ''' returns a generator over all the operations that the
         current source has commitments to; generates tuples
@@ -235,20 +241,21 @@ class State:
     def move_worker_to_job_pool(self, worker_id):
         op_node_old = self.remove_worker_from_pool(worker_id)
         print('moving worker to job pool:', worker_id, op_node_old)
-        assert isinstance(op_node_old, OpNode)
-        job_node = JobNode(op_node_old.job_id)
-        self.G.add_edge(WorkerNode(worker_id), job_node)
+        assert isinstance(op_node_old, OpPool)
+        job_node = JobPool(op_node_old.job_id)
+        self.G.add_edge(Worker(worker_id), job_node)
 
 
 
-    def move_worker_to_null_pool(self, worker_id):
-        print('moving worker to null pool:', worker_id)
+    def move_worker_to_general_pool(self, worker_id):
+        print('moving worker to general pool:', worker_id)
         _ = self.remove_worker_from_pool(worker_id)
-        self.G.add_edge(WorkerNode(worker_id), NullNode())
+        self.G.add_edge(Worker(worker_id), GeneralPool())
 
 
 
     def get_source_workers(self):
+        assert self._curr_source is not None
         pred = self.G.predecessors(self._curr_source)
         return (worker_node.worker_id 
                 for worker_node in pred)
@@ -267,7 +274,7 @@ class State:
                                      op_id_src, 
                                      default=self._curr_source)
 
-        op_node_dst = OpNode(job_id_dst, 
+        op_node_dst = OpPool(job_id_dst, 
                              op_id_dst, 
                              OpState.COMMITTED)
 
@@ -302,8 +309,8 @@ class State:
     def remove_commitment(self, worker_id, job_id_dst, op_id_dst):
         assert not self.is_worker_moving(worker_id)
 
-        worker_node = WorkerNode(worker_id)
-        op_node_dst = OpNode(job_id_dst, 
+        worker_node = Worker(worker_id)
+        op_node_dst = OpPool(job_id_dst, 
                              op_id_dst, 
                              OpState.COMMITTED)
 
@@ -339,17 +346,17 @@ class State:
                       job_id_dst, 
                       op_id_dst, 
                       move):
-        assert self.G.out_degree[WorkerNode(worker_id)] == 0
+        assert self.G.out_degree[Worker(worker_id)] == 0
         state = OpState.MOVING if move else OpState.PRESENT
-        op_node_new = OpNode(job_id_dst, op_id_dst, state)
-        self.G.add_edge(WorkerNode(worker_id), op_node_new)
+        op_node_new = OpPool(job_id_dst, op_id_dst, state)
+        self.G.add_edge(Worker(worker_id), op_node_new)
 
 
 
     def remove_worker_from_pool(self, worker_id):
         node_old = self._get_worker_location(worker_id)
-        self.G.remove_edge(WorkerNode(worker_id), node_old)
-        if not isinstance(node_old, OpNode) or \
+        self.G.remove_edge(Worker(worker_id), node_old)
+        if not isinstance(node_old, OpPool) or \
            node_old.state == OpState.PRESENT:
             assert self._num_uncommitted_workers(node_old) >= 0
         return node_old
@@ -359,7 +366,7 @@ class State:
     def mark_worker_present(self, worker_id):
         op_node = self.remove_worker_from_pool(worker_id)
 
-        assert isinstance(op_node, OpNode) and \
+        assert isinstance(op_node, OpPool) and \
                op_node.state == OpState.MOVING
 
         self.assign_worker(worker_id, 
@@ -377,11 +384,11 @@ class State:
                       op_id=None, 
                       default=None):
         if op_id is not None:
-            return OpNode(job_id, op_id, OpState.PRESENT)
+            return OpPool(job_id, op_id, OpState.PRESENT)
         elif job_id is not None:
-            return JobNode(job_id)
+            return JobPool(job_id)
         else:
-            return default if default else NullNode()
+            return default if default else GeneralPool()
 
 
 
@@ -402,7 +409,7 @@ class State:
                                node_src, 
                                op_node_dst, 
                                n=1):
-        assert isinstance(op_node_dst, OpNode)
+        assert isinstance(op_node_dst, OpPool)
         assert self._num_commitments(node_src, op_node_dst) > 0
         assert op_node_dst in self.G[node_src]
 
@@ -416,7 +423,7 @@ class State:
                                node_src, 
                                op_node_dst, 
                                n=1):
-        assert isinstance(op_node_dst, OpNode)
+        assert isinstance(op_node_dst, OpPool)
 
         demand = self._num_commitments_from(node_src)
         supply = self._num_workers_at(node_src)
@@ -438,31 +445,31 @@ class State:
 
     @_zero_if_exception
     def _num_commitments_to_op(self, op_node):
-        assert isinstance(op_node, OpNode) and \
-               op_node.state == OpState.COMMITTED
+        # assert isinstance(op_node, OpPool) and \
+        #        op_node.state == OpState.COMMITTED
         return self.G.nodes[op_node][Attr.NUM_IN_COMMIT]
+
+
+
+    @_zero_if_exception
+    def _num_workers_moving_to_op(self, op_node):
+        # assert isinstance(op_node, OpPool) and \
+        #        op_node.state == OpState.MOVING
+        return self.G.in_degree[op_node]
 
 
     
     @_zero_if_exception
     def _num_workers_at(self, source):
-        if isinstance(source, OpNode):
+        if isinstance(source, OpPool):
             assert source.state == OpState.PRESENT
         return self.G.in_degree[source]
 
 
 
     @_zero_if_exception
-    def _num_workers_moving_to_op(self, op_node):
-        assert isinstance(op_node, OpNode) and \
-               op_node.state == OpState.MOVING
-        return self.G.in_degree[op_node]
-
-
-
-    @_zero_if_exception
     def _num_commitments(self, node_src, op_node_dst):
-        assert isinstance(op_node_dst, OpNode)
+        assert isinstance(op_node_dst, OpPool)
         return self.G[node_src][op_node_dst][Attr.NUM_COMMIT]
 
 
@@ -477,7 +484,7 @@ class State:
 
 
     def _get_worker_location(self, worker_id):
-        worker_node = WorkerNode(worker_id)
+        worker_node = Worker(worker_id)
         dest_nodes = set(self.G[worker_node])
 
         # worker should be connected to exactly one node
