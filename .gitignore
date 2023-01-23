@@ -23,3 +23,4 @@ gym_dagsched/policies/heuristics.py
 gym_dagsched/reinforce/reinforce_sync.py
 gym_dagsched/data_generation/random_datagen.py
 gym_dagsched/envs/state_old.py
+gym_dagsched/test

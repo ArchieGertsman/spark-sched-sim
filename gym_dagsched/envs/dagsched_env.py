@@ -1,9 +1,6 @@
-from bisect import bisect_left
-
 import numpy as np
-import torch
 
-from .state_new import State
+from .state import State
 from ..entities.timeline import JobArrival, TaskCompletion, WorkerArrival
 
 
