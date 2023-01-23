@@ -53,7 +53,7 @@ def train(model,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
 
-    datagen_state = np.random.RandomState(42)
+    datagen_state = np.random.RandomState(69)#42)
 
     diff_return_calc = \
         DifferentialReturnsCalculator(discount)
@@ -70,7 +70,8 @@ def train(model,
 
     for i in range(n_sequences):
         # sample the max wall duration of the current episode
-        max_time = np.random.exponential(max_time_mean)
+        # max_time = np.random.exponential(max_time_mean)
+        max_time = 2e6
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
