@@ -68,8 +68,8 @@ def train(model,
 
     for i in range(n_sequences):
         # sample the max wall duration of the current episode
-        max_time = np.random.exponential(max_time_mean)
-        # max_time = np.inf
+        # max_time = np.random.exponential(max_time_mean)
+        max_time = np.inf
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
@@ -578,7 +578,7 @@ def compute_loss(model,
     action_loss = -advantages @ action_lgprobs
     entropy_loss = action_entropies.sum()
     total_loss = action_loss + \
-                 entropy_weight * entropy_loss
+                entropy_weight * entropy_loss
 
     return total_loss, \
            action_loss, \
@@ -838,8 +838,7 @@ def dag_action_attributes(dag_scores_batch,
     # entropy for these rows becomes 0.
     inf_counts = torch.isinf(dag_scores_batch).sum(1)
     allinf_rows = (inf_counts == dag_scores_batch.shape[1])
-    # dag_scores_batch[allinf_rows, 0] = 0
-    dag_scores_batch[allinf_rows] = 0
+    dag_scores_batch[allinf_rows, 0] = 0
 
     # compute expected entropy over dags for each obs.
     # each dag is weighted by the probability of it 

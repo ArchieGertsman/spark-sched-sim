@@ -39,19 +39,23 @@ class Operation:
 
 
     def __hash__(self):
-        return hash(self.__unique_id)
+        return hash(self.pool_key)
         
 
     def __eq__(self, other):
         if type(other) is type(self):
-            return self.__unique_id == other.__unique_id
+            return self.pool_key == other.pool_key
         else:
             return False
 
 
     @property
-    def __unique_id(self):
+    def pool_key(self):
         return (self.job_id, self.id_)
+
+    @property
+    def job_pool_key(self):
+        return (self.job_id, None)
 
     @property
     def completed(self):

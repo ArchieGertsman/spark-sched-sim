@@ -1,8 +1,9 @@
 
 
+import numpy as np
 import torch
 from torch_geometric.data import Batch
-import numpy as np
+from torch_geometric.utils.convert import from_networkx
 
 from .dagsched_env import DagSchedEnv
 from ..data_generation.tpch_datagen import TPCHDataGen
@@ -64,7 +65,7 @@ class DagSchedEnvAsyncWrapper:
 
         self._reset_dag_batch(initial_timeline)
 
-        self.active_op_mask = None
+        self.prev_active_op_mask = None
         self.dag_subbatch = None
 
         obs = self.env.reset(initial_timeline, 
@@ -108,8 +109,16 @@ class DagSchedEnvAsyncWrapper:
 
 
     def _reset_dag_batch(self, initial_timeline):
-        data_list = [e.job.init_pyg_data() 
-                     for _,_,e in initial_timeline.pq]
+        # initial timeline is filled with job arrival events
+        # so extract the job object from each of those events
+        jobs = (e.job for *_, e in initial_timeline.pq)
+        
+        data_list = []
+        for job in jobs:
+            pyg_data = from_networkx(job.dag)
+            pyg_data.x = torch.zeros((len(job.ops), 5))
+            data_list += [pyg_data]
+
         self.dag_batch = Batch.from_data_list(data_list)
 
 
@@ -162,7 +171,7 @@ class DagSchedEnvAsyncWrapper:
         active_job_ids = \
             np.array([job.id_ for job in active_jobs])
 
-        self.active_op_mask = active_op_mask
+        self.prev_active_op_mask = active_op_mask
 
         return did_update, \
             self.dag_subbatch, \
@@ -195,13 +204,15 @@ class DagSchedEnvAsyncWrapper:
 
             # build parallelism limit mask
             min_prlsm_lim = job.total_worker_count + 1
+            max_prlsm_lim = job.total_worker_count + num_source_workers
             if job.id_ == source_job_id:
                 min_prlsm_lim -= num_source_workers
+                max_prlsm_lim -= num_source_workers
 
             assert 0 < min_prlsm_lim
             assert     min_prlsm_lim <= self.num_workers + 1
 
-            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):] = 1
+            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):max_prlsm_lim] = 1
 
             for op in iter(job.active_ops):
                 # build operation masks
@@ -258,7 +269,7 @@ class DagSchedEnvAsyncWrapper:
 
             for i, op in enumerate(iter(job.active_ops)):
                 node_features[i, 3] = op.num_remaining_tasks / 200
-                node_features[i, 4] = op.approx_remaining_work / 1e5
+                node_features[i, 4] = op.approx_remaining_work * 1e-5
 
         all_node_features = torch.from_numpy(all_node_features)
         self.dag_subbatch.x = all_node_features
@@ -281,16 +292,16 @@ class DagSchedEnvAsyncWrapper:
 
         did_update = False
 
-        if self.active_op_mask is None or \
-           (self.active_op_mask.shape != active_op_mask.shape or \
-            not (self.active_op_mask == active_op_mask).all()):
+        if self.prev_active_op_mask is None or \
+           (self.prev_active_op_mask.shape != active_op_mask.shape or \
+            not (self.prev_active_op_mask == active_op_mask).all()):
 
-            self.dag_subbatch = construct_subbatch(
-                self.dag_batch, 
-                active_job_mask, 
-                active_op_mask, 
-                op_counts,
-                len(active_jobs))
+            self.dag_subbatch = \
+                construct_subbatch(self.dag_batch, 
+                                   active_job_mask, 
+                                   active_op_mask, 
+                                   op_counts,
+                                   len(active_jobs))
 
             did_update = True
 

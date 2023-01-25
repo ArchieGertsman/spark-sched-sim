@@ -1,7 +1,7 @@
 
 
 
-_GENERAL_POOL_KEY = (None, None)
+GENERAL_POOL_KEY = (None, None)
 
 
 class WorkerAssignmentState:
@@ -24,14 +24,14 @@ class WorkerAssignmentState:
         # worker id -> key of pool where the worker
         # currently resides
         self._worker_locations = \
-            {worker_id: _GENERAL_POOL_KEY
+            {worker_id: GENERAL_POOL_KEY
              for worker_id in range(num_workers)}
 
         # pool key -> set of id's of workers who
         # reside at this pool
         self._pools = \
             {None: set(),
-             _GENERAL_POOL_KEY: set(range(num_workers))}
+             GENERAL_POOL_KEY: set(range(num_workers))}
 
         # pool key A -> 
         #   (pool key B -> 
@@ -39,13 +39,13 @@ class WorkerAssignmentState:
         #       pool A to pool B)
         self._commitments = \
             {None: {},
-             _GENERAL_POOL_KEY: {}}
+             GENERAL_POOL_KEY: {}}
 
         # pool key -> total number of outgoing commitments
         # from this pool
         self._num_commitments_from = \
             {None: 0,
-             _GENERAL_POOL_KEY: 0}
+             GENERAL_POOL_KEY: 0}
 
         # op pool key -> total number of commitments to op
         self._num_commitments_to_op = {}
@@ -58,8 +58,8 @@ class WorkerAssignmentState:
         # of its operations
         self._total_worker_count = {}
 
-        # initial worker source
-        self._curr_source = _GENERAL_POOL_KEY
+        # initialize worker source
+        self._curr_source = GENERAL_POOL_KEY
 
 
 
@@ -82,12 +82,20 @@ class WorkerAssignmentState:
 
 
 
-    def all_source_workers_committed(self):
-        return self.num_uncommitted_source_workers() == 0
+    def get_source(self):
+        return self._curr_source
 
 
 
-    def num_uncommitted_source_workers(self):
+    def source_job_id(self):
+        if self._curr_source in [None, GENERAL_POOL_KEY]:
+            return None
+        else:
+            return self._curr_source[0]
+
+
+
+    def num_workers_to_schedule(self):
         num_uncommitted = \
             len(self._pools[self._curr_source]) - \
             self._num_commitments_from[self._curr_source]
@@ -97,45 +105,32 @@ class WorkerAssignmentState:
 
 
     def general_pool_has_workers(self):
-        return len(self._pools[_GENERAL_POOL_KEY]) > 0
+        return len(self._pools[GENERAL_POOL_KEY]) > 0
 
 
 
-    def source_job(self):
-        if self._curr_source in [None, _GENERAL_POOL_KEY]:
-            return None
-        else:
-            return self._curr_source[0]
+    def num_workers_moving_to_op(self, op_pool_key):
+        return self._num_moving_to_op[op_pool_key]
 
 
 
-    def get_source(self):
-        return self._curr_source
+    def num_commitments_to_op(self, op_pool_key):
+        return self._num_commitments_to_op[op_pool_key]
 
 
 
-    def num_workers_moving_to_op(self, job_id, op_id):
-        return self._num_moving_to_op[(job_id, op_id)]
+    # def num_workers_at_source(self):
+    #     return len(self._pools[self._curr_source])
 
 
 
-    def num_commitments_to_op(self, job_id, op_id):
-        return self._num_commitments_to_op[(job_id, op_id)]
+    # def num_workers_at(self, pool_key):
+    #     return len(self._pools[pool_key])
 
 
 
-    def num_workers_at_source(self):
-        return len(self._pools[self._curr_source])
-
-
-
-    def num_workers_at(self, job_id=None, op_id=None):
-        return len(self._pools[(job_id, op_id)])
-
-
-
-    def num_commitments_from(self, job_id=None, op_id=None):
-        return self._num_commitments_from[(job_id, op_id)]
+    # def num_commitments_from(self, pool_key):
+    #     return self._num_commitments_from[pool_key]
 
 
     
@@ -217,11 +212,12 @@ class WorkerAssignmentState:
             self._worker_locations[worker_id] = None
 
         if not send:
+            # directly move worker into new pool
             self._worker_locations[worker_id] = new_pool_key
             self._pools[new_pool_key].add(worker_id)
             return
 
-        # sending worker to pool
+        # send worker to pool
         self._num_moving_to_op[new_pool_key] += 1
 
         old_job_id = old_pool_key[0] \
@@ -239,7 +235,7 @@ class WorkerAssignmentState:
     
     # internal methods
 
-    def _increment_commitments(self, dst_pool_key, n=1):
+    def _increment_commitments(self, dst_pool_key, n):
         try:
             self._commitments[self._curr_source][dst_pool_key] += n
         except:

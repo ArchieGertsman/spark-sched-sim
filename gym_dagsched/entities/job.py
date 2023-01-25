@@ -1,12 +1,4 @@
-from typing import List
-import time
-
-import networkx as nx
 import numpy as np
-import torch
-from torch_geometric.utils.convert import from_networkx
-
-from .operation import Features
 
 
 
@@ -19,9 +11,17 @@ class Job:
         # unique identifier of this job
         self.id_ = id_
 
-        # list of `Operation` objects
+        # list of objects of all the operations
+        # that belong to this job
         self.ops = ops
+
+        # subset of operations which have not
+        # been completed yet
         self.active_ops = set(ops)
+        
+        # subset of operations whose dependencies
+        # are satisfied and are ready to start
+        self.frontier_ops = set()
 
         # networkx dag storing the operations' interdependencies
         self.dag = dag
@@ -33,8 +33,9 @@ class Job:
         # operation completed executing
         self.t_completed = np.inf
 
+        # set of workers that are local to this job,
+        # including idle and busy ones
         self.local_workers = set()
-        self.frontier_ops = set()
 
         self.saturated_op_count = 0
 
@@ -43,11 +44,14 @@ class Job:
 
 
     @property
+    def pool_key(self):
+        return (self.id_, None)
+
+
+    @property
     def completed(self):
         '''whether or not this job has completed'''
-        # return self.completed_ops_count == len(self.ops)
         return self.num_active_ops == 0
-
 
 
     @property
@@ -68,9 +72,6 @@ class Job:
 
     def add_op_completion(self, op):
         '''increments the count of completed operations'''
-        # assert self.completed_ops_count < len(self.ops)
-        # self.completed_ops_count += 1
-
         self.active_ops.remove(op)
 
         self.frontier_ops.remove(op)
@@ -136,8 +137,7 @@ class Job:
             # add this child to the frontiers
             new_op = self.ops[suc_op_id]
             if not new_op.check_criterion(criterion) and \
-                self.check_dependencies(suc_op_id, criterion) \
-                :
+               self.check_dependencies(suc_op_id, criterion):
                 new_ops.add(new_op)
         
         return new_ops
@@ -184,13 +184,6 @@ class Job:
 
 
 
-    def init_pyg_data(self):
-        pyg_data = from_networkx(self.dag)
-        pyg_data.x = torch.zeros((len(self.ops), 5))
-        return pyg_data
-
-
-
     def add_local_worker(self, worker):
         self.local_workers.add(worker.id_)
         worker.job_id = self.id_
@@ -220,7 +213,6 @@ class Job:
 
     def add_task_completion(self, op, task, worker, wall_time):
         assert not op.completed
-        # assert task in op.processing_tasks
 
         op.mark_task_completed(task)
 

@@ -29,7 +29,7 @@ def main():
     train(model,
           optim_class=torch.optim.Adam,
           optim_lr=.001,
-          n_sequences=500,
+          n_sequences=1000,
           num_envs=16,
           discount=.99,
           entropy_weight_init=1.,
