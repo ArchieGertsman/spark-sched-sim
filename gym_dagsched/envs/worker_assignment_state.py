@@ -4,14 +4,31 @@
 _GENERAL_POOL_KEY = (None, None)
 
 
-class State:
+class WorkerAssignmentState:
+    '''Keeps track of the state of worker assignments. 
+    The following worker pools exist:
+    - Null pool (key `None`): not an actual pool;
+      it never contains any workers. the worker source
+      is set to null pool when no pool is ready to schedule 
+      its workers.
+    - General pool (key `(None, None)`): the pool
+      where workers reside when they are not at any
+      job. All workers start out in the general pool.
+    - Job pool (key `(job_id, None)`): pool of idle
+      workers at a job
+    - Operation pool (key `(job_id, op_id)`): pool of
+      workers at an operation, including idle and busy
+    '''
+
     def reset(self, num_workers):
-        # worker id -> pool key
+        # worker id -> key of pool where the worker
+        # currently resides
         self._worker_locations = \
             {worker_id: _GENERAL_POOL_KEY
              for worker_id in range(num_workers)}
 
-        # pool key -> set of worker id's
+        # pool key -> set of id's of workers who
+        # reside at this pool
         self._pools = \
             {None: set(),
              _GENERAL_POOL_KEY: set(range(num_workers))}
@@ -25,16 +42,21 @@ class State:
              _GENERAL_POOL_KEY: {}}
 
         # pool key -> total number of outgoing commitments
+        # from this pool
         self._num_commitments_from = \
             {None: 0,
              _GENERAL_POOL_KEY: 0}
 
-        ## operations only
         # op pool key -> total number of commitments to op
-        self._num_commitments_to = {}
+        self._num_commitments_to_op = {}
 
         # op pool key -> number of workers moving to op
-        self._num_moving_to = {}
+        self._num_moving_to_op = {}
+
+        # job id -> size of job's pool plus the total number
+        # of external commitments and moving workers to any 
+        # of its operations
+        self._total_worker_count = {}
 
         # initial worker source
         self._curr_source = _GENERAL_POOL_KEY
@@ -46,6 +68,7 @@ class State:
         self._pools[job_key] = set()
         self._commitments[job_key] = {}
         self._num_commitments_from[job_key] = 0
+        self._total_worker_count[job_id] = 0
 
 
 
@@ -54,8 +77,8 @@ class State:
         self._pools[op_key] = set()
         self._commitments[op_key] = {}
         self._num_commitments_from[op_key] = 0
-        self._num_commitments_to[op_key] = 0
-        self._num_moving_to[op_key] = 0
+        self._num_commitments_to_op[op_key] = 0
+        self._num_moving_to_op[op_key] = 0
 
 
 
@@ -92,12 +115,12 @@ class State:
 
 
     def num_workers_moving_to_op(self, job_id, op_id):
-        return self._num_moving_to[(job_id, op_id)]
+        return self._num_moving_to_op[(job_id, op_id)]
 
 
 
     def num_commitments_to_op(self, job_id, op_id):
-        return self._num_commitments_to[(job_id, op_id)]
+        return self._num_commitments_to_op[(job_id, op_id)]
 
 
 
@@ -113,6 +136,11 @@ class State:
 
     def num_commitments_from(self, job_id=None, op_id=None):
         return self._num_commitments_from[(job_id, op_id)]
+
+
+    
+    def total_worker_count(self, job_id):
+        return self._total_worker_count[job_id]
 
 
 
@@ -139,6 +167,11 @@ class State:
     def add_commitment(self, num_workers, dst_pool_key):
         self._increment_commitments(dst_pool_key, n=num_workers)
 
+        dst_job_id = dst_pool_key[0]
+        src_job_id = self._curr_source[0]
+        if dst_job_id != src_job_id:
+            self._total_worker_count[dst_job_id] += num_workers
+
 
 
     def remove_commitment(self, worker_id, dst_pool_key):
@@ -146,6 +179,12 @@ class State:
 
         # update commitment from source to dest op
         self._decrement_commitments(src_pool_key, dst_pool_key)
+
+        dst_job_id = dst_pool_key[0]
+        src_job_id = src_pool_key[0]
+        if dst_job_id != src_job_id:
+            self._total_worker_count[dst_job_id] -= 1
+            assert self._total_worker_count[dst_job_id] >= 0
 
         return src_pool_key
 
@@ -160,11 +199,9 @@ class State:
 
 
 
-    def mark_worker_present(self, worker_id, dst_pool_key):
-        self._num_moving_to[dst_pool_key] -= 1
-        assert self._num_moving_to[dst_pool_key] >= 0
-
-        self.move_worker_to_pool(worker_id, dst_pool_key)
+    def count_worker_arrival(self, op_pool_key):
+        self._num_moving_to_op[op_pool_key] -= 1
+        assert self._num_moving_to_op[op_pool_key] >= 0
 
 
 
@@ -173,15 +210,30 @@ class State:
                             new_pool_key, 
                             send=False):
         old_pool_key = self._worker_locations[worker_id]
+
         if old_pool_key is not None:
+            # remove worker from old pool
             self._pools[old_pool_key].remove(worker_id)
             self._worker_locations[worker_id] = None
 
-        if send:
-            self._num_moving_to[new_pool_key] += 1
-        else:
+        if not send:
             self._worker_locations[worker_id] = new_pool_key
             self._pools[new_pool_key].add(worker_id)
+            return
+
+        # sending worker to pool
+        self._num_moving_to_op[new_pool_key] += 1
+
+        old_job_id = old_pool_key[0] \
+                     if old_pool_key is not None else None
+        new_job_id = new_pool_key[0]
+        assert old_job_id != new_job_id
+        
+        self._total_worker_count[new_job_id] += 1
+        if old_job_id is not None:
+            self._total_worker_count[old_job_id] -= 1
+            assert self._total_worker_count[old_job_id] >= 0
+            
 
 
     
@@ -195,7 +247,7 @@ class State:
             self._commitments[self._curr_source][dst_pool_key] = n
 
         self._num_commitments_from[self._curr_source] += n
-        self._num_commitments_to[dst_pool_key] += n
+        self._num_commitments_to_op[dst_pool_key] += n
 
         supply = len(self._pools[self._curr_source])
         demand = self._num_commitments_from[self._curr_source]
@@ -206,10 +258,10 @@ class State:
     def _decrement_commitments(self, src_pool_key, dst_pool_key):
         self._commitments[src_pool_key][dst_pool_key] -= 1
         self._num_commitments_from[src_pool_key] -= 1
-        self._num_commitments_to[dst_pool_key] -= 1
+        self._num_commitments_to_op[dst_pool_key] -= 1
 
         assert self._num_commitments_from[src_pool_key] >= 0
-        assert self._num_commitments_to[dst_pool_key] >= 0
+        assert self._num_commitments_to_op[dst_pool_key] >= 0
 
         if self._commitments[src_pool_key][dst_pool_key] == 0:
             self._commitments[src_pool_key].pop(dst_pool_key)

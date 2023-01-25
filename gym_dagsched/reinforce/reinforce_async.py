@@ -1,21 +1,18 @@
 import sys
-from time import sleep
-from attr import dataclass
-from torch_scatter import segment_add_csr
-
+from dataclasses import dataclass
 
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 import os
 
+import numpy as np
 import torch
 from torch.distributions import Categorical
-import numpy as np
 import torch.profiler
 import torch.distributed as dist
 from torch.multiprocessing import Pipe, Process
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Batch
-from torch.nn.utils.rnn import pad_sequence
+from torch_scatter import segment_add_csr
 
 from ..envs.dagsched_env_async_wrapper import DagSchedEnvAsyncWrapper
 from ..utils.metrics import avg_job_duration
@@ -24,6 +21,7 @@ from ..utils.profiler import Profiler
 from ..utils.baselines import compute_baselines
 from ..utils.pyg import add_adj
 from ..utils.diff_returns import DifferentialReturnsCalculator
+from ..utils.hidden_prints import HiddenPrints
 
 
 
@@ -53,7 +51,7 @@ def train(model,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
 
-    datagen_state = np.random.RandomState(69)#42)
+    datagen_state = np.random.RandomState(0)
 
     diff_return_calc = \
         DifferentialReturnsCalculator(discount)
@@ -70,8 +68,8 @@ def train(model,
 
     for i in range(n_sequences):
         # sample the max wall duration of the current episode
-        # max_time = np.random.exponential(max_time_mean)
-        max_time = 2e6
+        max_time = np.random.exponential(max_time_mean)
+        # max_time = np.inf
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
@@ -100,6 +98,7 @@ def train(model,
             compute_baselines(wall_times_list,
                               diff_returns_list)
 
+        value_losses = []
         # send advantages
         for (returns, 
              baselines, 
@@ -107,12 +106,12 @@ def train(model,
                           baselines_list,
                           conns):
             advantages = returns - baselines
+            value_losses += [np.sum(advantages**2)]
             conn.send(advantages)
 
         # wait for model update
-        (actor_losses, 
-         advantage_losses, 
-         entropy_losses,
+        (action_losses,
+         entropies,
          avg_job_durations, 
          completed_job_counts) = \
             list(zip(*[conn.recv() for conn in conns]))
@@ -120,15 +119,18 @@ def train(model,
         if writer:
             # log episode stats to tensorboard
             episode_stats = {
-                'actor loss': np.mean(actor_losses),
-                'advantage loss': np.mean(advantage_losses),
-                'entropy_loss': np.mean(entropy_losses),
                 'avg job duration': np.mean(avg_job_durations),
+                'max wall time': max_time,
                 'completed jobs count': np.mean(completed_job_counts),
                 'avg reward per sec': \
                     1e5 * diff_return_calc.avg_per_step_reward,
-                'avg return': np.mean([returns[0] 
-                                       for returns in diff_returns_list])
+                'avg return': \
+                    np.mean([returns[0] for returns in diff_returns_list]),
+                'action loss': np.mean(action_losses),
+                'entropy': np.mean(entropies),
+                'value loss': np.mean(value_losses),
+                'episode length': \
+                    np.mean([len(rewards) for rewards in rewards_list])
             }
 
             for name, stat in episode_stats.items():
@@ -199,8 +201,6 @@ def setup_worker(rank, world_size):
     torch.manual_seed(rank)
     np.random.seed(rank)
 
-    # torch.autograd.set_detect_anomaly(True)
-
 
 
 
@@ -270,19 +270,15 @@ def run_iteration(i,
     if prof:
         prof.enable()
 
-
-    experience = \
-        run_episode(env,
-                    num_job_arrivals, 
-                    num_init_jobs, 
-                    job_arrival_rate, 
-                    n_workers,
-                    max_wall_time,
-                    model)
-
-    # dist.barrier()
-    # print('SLEEPING', flush=True)
-    # sleep(10)
+    with HiddenPrints():
+        experience = \
+            run_episode(env,
+                        num_job_arrivals, 
+                        num_init_jobs, 
+                        job_arrival_rate, 
+                        n_workers,
+                        max_wall_time,
+                        model)
 
     wall_times, rewards = \
         list(zip(*[(exp.wall_time, exp.reward) 
@@ -296,25 +292,24 @@ def run_iteration(i,
     advantages = conn.recv()
     advantages = torch.from_numpy(advantages).float()
 
-    actor_loss, advantage_loss, entropy_loss = \
+    action_loss, entropy_loss = \
         learn_from_experience(model,
-                                optim,
-                                experience,
-                                advantages,
-                                entropy_weight,
-                                num_envs)
+                              optim,
+                              experience,
+                              advantages,
+                              entropy_weight,
+                              num_envs)
 
     if rank == 0 and i % 10 == 0:
-        torch.save(model.state_dict(), 'model.pt')
+        torch.save(model.module.state_dict(), 'model.pt')
 
     if prof:
         prof.disable()
 
     # send episode stats
     conn.send((
-        actor_loss, 
-        advantage_loss, 
-        entropy_loss,
+        action_loss, 
+        entropy_loss / len(experience),
         avg_job_duration(env) * 1e-3,
         env.n_completed_jobs
     ))
@@ -381,7 +376,9 @@ def run_episode(env,
             # nodes changed, so send the new
             # object to the GPU
             job_ptr = dag_batch.ptr.numpy()
-            dag_batch_device = dag_batch.clone() \
+            dag_batch_clone = dag_batch.clone()
+            dag_batch_clone.edge_index = None
+            dag_batch_device = dag_batch_clone \
                 .to(device, non_blocking=True)
         else:
             # only send new node features to
@@ -436,9 +433,10 @@ def invoke_agent(model,
     node_scores[~valid_ops_mask] = float('-inf')
 
     dag_scores = dag_scores.cpu()
-    invalid_row, invalid_col = \
-        (~valid_prlsm_lim_mask).nonzero()
-    dag_scores[invalid_row, invalid_col] = float('-inf')
+    valid_prlsm_lim_mask = \
+        torch.from_numpy(valid_prlsm_lim_mask)
+    dag_scores.masked_fill_(~valid_prlsm_lim_mask, 
+                            float('-inf'))
 
     return node_scores, dag_scores
 
@@ -504,34 +502,28 @@ def learn_from_experience(model,
                           advantages,
                           entropy_weight,
                           num_envs):
-    (actor_loss,
-     advantage_loss,
+    (total_loss,
+     action_loss,
      entropy_loss) = \
         compute_loss(model,
                      experience,
                      advantages,
                      entropy_weight)
-
-    dist.barrier()
     
     # compute gradients
     optim.zero_grad()
-    actor_loss.backward()
+    total_loss.backward()
 
     # we want the sum of grads over all the
     # workers, but DDP gives average, so
     # scale the grads back
-    torch.cuda.synchronize()
     for param in model.parameters():
         param.grad.mul_(num_envs)
 
     # update model parameters
     optim.step()
 
-    optim.zero_grad(set_to_none=True)
-
-    return actor_loss.item(), \
-           advantage_loss.item(), \
+    return action_loss.item(), \
            entropy_loss.item()
 
 
@@ -540,19 +532,33 @@ def compute_loss(model,
                  experience,
                  advantages,
                  entropy_weight):
-    batched_model_inputs = \
-        extract_batched_model_inputs(experience)
+    (dag_batch_list, 
+     num_dags_per_obs,
+     valid_ops_mask_list, 
+     valid_prlsm_lim_mask_list,
+     actions) = \
+        list(zip(*[(exp.dag_batch, 
+                    exp.num_jobs,
+                    exp.valid_ops_mask,
+                    exp.valid_prlsm_lim_mask,
+                    exp.action)
+                   for exp in experience]))
+                   
+    nested_dag_batch, num_nodes_per_dag = \
+        construct_nested_dag_batch(dag_batch_list, 
+                                   num_dags_per_obs)
 
     # re-feed all the inputs from the entire
     # episode back through the model, this time
     # recording a computational graph
-    model_outputs = model(*batched_model_inputs)
-    torch.cuda.synchronize()
+    model_outputs = \
+        model(nested_dag_batch,
+              torch.tensor(num_dags_per_obs))
 
     # move model outputs to CPU
     (node_scores_batch, 
      dag_scores_batch, 
-     op_counts, 
+     num_nodes_per_obs, 
      obs_indptr) = \
         [t.cpu() for t in model_outputs]
 
@@ -561,96 +567,95 @@ def compute_loss(model,
     action_lgprobs, action_entropies = \
         action_attributes(node_scores_batch, 
                           dag_scores_batch,
-                          op_counts,
+                          num_nodes_per_dag,
+                          num_nodes_per_obs,
                           obs_indptr,
-                          experience)
+                          valid_ops_mask_list,
+                          valid_prlsm_lim_mask_list,
+                          actions)
 
     # compute loss
-    advantage_loss = -advantages @ action_lgprobs
+    action_loss = -advantages @ action_lgprobs
     entropy_loss = action_entropies.sum()
-    actor_loss = \
-        advantage_loss + entropy_weight * entropy_loss
+    total_loss = action_loss + \
+                 entropy_weight * entropy_loss
 
-    return actor_loss, \
-           advantage_loss, \
+    return total_loss, \
+           action_loss, \
            entropy_loss
 
 
 
-def extract_batched_model_inputs(experience):
+def construct_nested_dag_batch(dag_batch_list, 
+                               num_dags_per_obs):
     '''extracts the inputs to the model from each
     step of the episode, then stacks them into a
     large batch.
     '''
-    dag_batch_list, job_counts = \
-        list(zip(*[(exp.dag_batch, exp.num_jobs)
-                   for exp in experience]))
-
     nested_dag_batch = Batch.from_data_list(dag_batch_list)
-    ptr = nested_dag_batch.batch.bincount().cumsum(dim=0)
-    nested_dag_batch.ptr = torch.cat([torch.tensor([0]), ptr], dim=0)
-    nested_dag_batch._num_graphs = sum(job_counts)
+    num_nodes_per_dag = nested_dag_batch.batch.bincount()
+    ptr = num_nodes_per_dag.cumsum(dim=0)
+    nested_dag_batch.ptr = \
+        torch.cat([torch.tensor([0]), ptr], dim=0)
+    nested_dag_batch._num_graphs = sum(num_dags_per_obs)
     add_adj(nested_dag_batch)
     nested_dag_batch.to(device)
 
-    job_counts = torch.tensor(job_counts)
-
-    return nested_dag_batch, job_counts
+    return nested_dag_batch, \
+           num_nodes_per_dag
 
 
 
 
 def action_attributes(node_scores_batch, 
                       dag_scores_batch,
-                      op_counts,
+                      num_nodes_per_dag,
+                      num_nodes_per_obs,
                       obs_indptr,
-                      experience):
+                      valid_ops_mask_list,
+                      valid_prlsm_lim_mask_list,
+                      actions):
 
-    valid_ops_mask_list, valid_prlsm_lim_mask_list = \
-        list(zip(*[(exp.valid_ops_mask,
-                    exp.valid_prlsm_lim_mask)
-                   for exp in experience]))
-
-    # mask node scores
-    valid_ops_mask_batch = np.concatenate(valid_ops_mask_list)
-    node_scores_batch[(~valid_ops_mask_batch).nonzero()] = float('-inf')
-
-    # mask dag scores
-    valid_prlsm_lim_mask_batch = \
-        np.vstack(valid_prlsm_lim_mask_list)
-    invalid_row, invalid_col = \
-        (~valid_prlsm_lim_mask_batch).nonzero()
-    dag_scores_batch[invalid_row, invalid_col] = float('-inf')
-
-    # batch the actions
-    actions = list(zip(*[exp.action for exp in experience]))
+    node_scores_batch, dag_scores_batch = \
+        mask_outputs(node_scores_batch, 
+                     dag_scores_batch,
+                     valid_ops_mask_list,
+                     valid_prlsm_lim_mask_list)
 
     (node_selection_batch, 
      dag_idx_batch, 
      dag_selection_batch) = \
-        [torch.tensor(lst) for lst in actions]
+        [torch.tensor(lst) for lst in zip(*actions)]
 
-
-    node_lgprob_batch, node_entropy_batch = \
+    (all_node_probs, 
+     node_lgprob_batch, 
+     node_entropy_batch) = \
         node_action_attributes_batch(node_scores_batch,
                                      node_selection_batch,
-                                     op_counts)
+                                     num_nodes_per_obs)
+
+    dag_probs = compute_dag_probs(all_node_probs, 
+                                  num_nodes_per_dag)
     
     dag_idx_batch += obs_indptr[:-1]
     dag_lgprob_batch, dag_entropy_batch = \
         dag_action_attributes(dag_scores_batch, 
                               dag_idx_batch, 
                               dag_selection_batch,
+                              dag_probs,
                               obs_indptr)
 
     # normalize entropy
     num_workers = dag_scores_batch.shape[1]
-    entropy_norm = torch.log(num_workers * op_counts)
-    entropy_scale = 1 / torch.max(torch.tensor(1), entropy_norm)
+    entropy_scale = get_entropy_scale(num_workers, 
+                                      num_nodes_per_obs)
 
-    action_lgprob_batch = node_lgprob_batch + dag_lgprob_batch
+    action_lgprob_batch = \
+        node_lgprob_batch + dag_lgprob_batch
+
     action_entropy_batch = \
-        entropy_scale * (node_entropy_batch + dag_entropy_batch)
+        entropy_scale * (node_entropy_batch + \
+                         dag_entropy_batch)
 
     return action_lgprob_batch, \
            action_entropy_batch
@@ -658,9 +663,50 @@ def action_attributes(node_scores_batch,
 
 
 
+def mask_outputs(node_scores_batch, 
+                 dag_scores_batch,
+                 valid_ops_mask_list,
+                 valid_prlsm_lim_mask_list):
+    # mask node scores
+    valid_ops_mask_batch = np.concatenate(valid_ops_mask_list)
+    node_scores_batch[~valid_ops_mask_batch] = float('-inf')
+
+    # mask dag scores
+    valid_prlsm_lim_mask_batch = \
+        torch.from_numpy(np.vstack(valid_prlsm_lim_mask_list))
+    dag_scores_batch.masked_fill_(~valid_prlsm_lim_mask_batch,
+                                  float('-inf'))
+
+    return node_scores_batch, \
+           dag_scores_batch
+
+
+
+
+def compute_dag_probs(all_node_probs, num_nodes_per_dag):
+    '''for each dag, compute the probability of it
+    being selected by summing over the probabilities
+    of each of its nodes being selected
+    '''
+    dag_indptr = num_nodes_per_dag.cumsum(0)
+    dag_indptr = torch.cat([torch.tensor([0]), dag_indptr], 0)
+    dag_probs = segment_add_csr(all_node_probs, dag_indptr)
+    return dag_probs
+
+
+
+
+def get_entropy_scale(num_workers, num_nodes_per_obs):
+    entropy_norm = torch.log(num_workers * num_nodes_per_obs)
+    entropy_scale = 1 / torch.max(torch.tensor(1), entropy_norm)
+    return entropy_scale
+
+
+
+
 def node_action_attributes_batch(node_scores_batch,
                                  node_selection_batch,
-                                 node_counts):
+                                 num_nodes_per_obs):
     '''splits the node score/selection batches into subbatches 
     (see subroutine below), then for each subbatch, comptues 
     attributes (action log-probability and entropy) using 
@@ -680,51 +726,73 @@ def node_action_attributes_batch(node_scores_batch,
      subbatch_node_counts) = \
         split_node_experience_into_subbatches(node_scores_batch, 
                                               node_selection_batch, 
-                                              node_counts)
+                                              num_nodes_per_obs)
 
     # for each subbatch, compute the node
     # action attributes, vectorized
+    node_probs_list = []
     node_lgprob_list = []
     node_entropy_list = []
 
     for (node_scores_subbatch, 
          node_selection_subbatch,
-         op_count) in zip(node_scores_subbatches,
+         node_count) in zip(node_scores_subbatches,
                           node_selection_subbatches,
                           subbatch_node_counts):
         node_scores_subbatch = \
-            node_scores_subbatch.view(-1, op_count)
+            node_scores_subbatch.view(-1, node_count)
 
-        node_lgprob_subbatch, node_entropy_subbatch = \
+        node_probs, node_lgprob_subbatch, node_entropy_subbatch = \
             node_action_attributes(node_scores_subbatch,
                                    node_selection_subbatch)
 
+        node_probs_list += [torch.flatten(node_probs)]
         node_lgprob_list += [node_lgprob_subbatch]
         node_entropy_list += [node_entropy_subbatch]
 
-    # concatenate the subbatch attributes together
-    return torch.cat(node_lgprob_list), \
-           torch.cat(node_entropy_list)
+    ## concatenate the subbatch attributes together
+
+    # for each node ever seen, records the probability
+    # that that node is selected out of all the
+    # nodes within its observation
+    all_node_probs = torch.cat(node_probs_list)
+
+    # for each observation, records the log probability
+    # of its node selection
+    node_lgprob_batch = torch.cat(node_lgprob_list)
+
+    # for each observation, records its node entropy
+    node_entropy_batch = torch.cat(node_entropy_list)
+
+    return all_node_probs, \
+           node_lgprob_batch, \
+           node_entropy_batch
 
 
 
 
 def split_node_experience_into_subbatches(node_scores_batch, 
                                           node_selection_batch, 
-                                          node_counts):
+                                          num_nodes_per_obs):
     '''splits the node score/selection batches into
     subbatches, where each each sample within a subbatch
     has the same node count.
     '''
+    batch_size = len(num_nodes_per_obs)
+
     # find indices where op count changes
-    op_count_change_mask = node_counts[:-1] != node_counts[1:]
+    op_count_change_mask = \
+        num_nodes_per_obs[:-1] != num_nodes_per_obs[1:]
     ptr = 1 + op_count_change_mask.nonzero().squeeze()
+    if ptr.shape == torch.Size():
+        # ptr is zero-dimentional; not allowed in torch.cat
+        ptr = ptr.unsqueeze(0)
     ptr = torch.cat([torch.tensor([0]), 
                      ptr, 
-                     torch.tensor([len(node_counts)])])
+                     torch.tensor([batch_size])])
 
     # unique op count within each subbatch
-    subbatch_node_counts = node_counts[ptr[:-1]]
+    subbatch_node_counts = num_nodes_per_obs[ptr[:-1]]
 
     # number of samples in each subbatch
     subbatch_sizes = ptr[1:] - ptr[:-1]
@@ -747,34 +815,39 @@ def split_node_experience_into_subbatches(node_scores_batch,
 
 
 def node_action_attributes(node_scores, node_selection):
-    c_node = Categorical(logits=node_scores)
-    node_lgprob = c_node.log_prob(node_selection)
-    node_entropy = c_node.entropy()
-    return node_lgprob, node_entropy
+    c = Categorical(logits=node_scores)
+    node_lgprob = c.log_prob(node_selection)
+    node_entropy = c.entropy()
+    return c.probs, node_lgprob, node_entropy
 
 
 
 
-def dag_action_attributes(dag_scores, 
-                          dag_idx, 
-                          dag_selection,
+def dag_action_attributes(dag_scores_batch, 
+                          dag_idx_batch, 
+                          dag_selection_batch,
+                          dag_probs,
                           obs_indptr):
-    dag_lgprob = \
-        Categorical(logits=dag_scores[dag_idx]) \
-            .log_prob(dag_selection)
+    dag_lgprob_batch = \
+        Categorical(logits=dag_scores_batch[dag_idx_batch]) \
+            .log_prob(dag_selection_batch)
 
     # can't have rows where all the entries are
     # -inf when computing entropy, so for all such 
     # rows, set the first entry to be 0. then the 
     # entropy for these rows becomes 0.
-    inf_counts = torch.isinf(dag_scores).sum(1)
-    allinf_rows = (inf_counts == dag_scores.shape[1])
-    dag_scores[allinf_rows, 0] = 0
+    inf_counts = torch.isinf(dag_scores_batch).sum(1)
+    allinf_rows = (inf_counts == dag_scores_batch.shape[1])
+    # dag_scores_batch[allinf_rows, 0] = 0
+    dag_scores_batch[allinf_rows] = 0
 
-    dag_entropy = Categorical(logits=dag_scores) \
-                    .entropy()
-
-    dag_entropy = segment_add_csr(dag_entropy, 
-                                  obs_indptr)
+    # compute expected entropy over dags for each obs.
+    # each dag is weighted by the probability of it 
+    # being selected. sum is segmented over observations.
+    entropy_per_dag = \
+        Categorical(logits=dag_scores_batch).entropy()
+    dag_entropy_batch = \
+        segment_add_csr(dag_probs * entropy_per_dag, 
+                        obs_indptr)
     
-    return dag_lgprob, dag_entropy
+    return dag_lgprob_batch, dag_entropy_batch

@@ -99,6 +99,9 @@ class DagSchedEnvAsyncWrapper:
         
         assert worker_count >= 1
 
+        worker_count = \
+            min(worker_count, num_source_workers)
+
         action = ((job_id, op_id), worker_count)
         return action
 
@@ -192,15 +195,13 @@ class DagSchedEnvAsyncWrapper:
 
             # build parallelism limit mask
             min_prlsm_lim = job.total_worker_count + 1
-            max_prlsm_lim = job.total_worker_count + num_source_workers
             if job.id_ == source_job_id:
                 min_prlsm_lim -= num_source_workers
-                max_prlsm_lim -= num_source_workers
 
             assert 0 < min_prlsm_lim
-            # assert     min_prlsm_lim <= self.num_workers + 1
+            assert     min_prlsm_lim <= self.num_workers + 1
 
-            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):max_prlsm_lim] = 1
+            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):] = 1
 
             for op in iter(job.active_ops):
                 # build operation masks

@@ -36,9 +36,9 @@ class Job:
         self.local_workers = set()
         self.frontier_ops = set()
 
-        self.num_commitments = 0
-        self.num_moving_workers = 0
         self.saturated_op_count = 0
+
+        self.total_worker_count = 0
 
 
 
@@ -58,14 +58,6 @@ class Job:
     @property
     def num_ops(self):
         return len(self.ops)
-
-
-
-    @property
-    def total_worker_count(self):
-        return len(self.local_workers) + \
-            self.num_commitments + \
-            self.num_moving_workers
 
 
     @property
@@ -196,23 +188,6 @@ class Job:
         pyg_data = from_networkx(self.dag)
         pyg_data.x = torch.zeros((len(self.ops), 5))
         return pyg_data
-
-
-
-    def add_commitments(self, n):
-        self.num_commitments += n
-
-    def remove_commitment(self):
-        self.num_commitments -= 1
-        assert self.num_commitments >= 0
-
-
-    def add_moving_worker(self):
-        self.num_moving_workers += 1
-
-    def remove_moving_worker(self):
-        self.num_moving_workers -= 1
-        assert self.num_moving_workers >= 0
 
 
 
