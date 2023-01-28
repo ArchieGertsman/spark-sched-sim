@@ -1,22 +1,22 @@
 from abc import abstractmethod
-import numpy as np
-import networkx as nx
 
-from ..entities.job import Job
-from ..entities.operation import Operation
+import numpy as np
+
 from ..entities.worker import Worker
 from ..entities.timeline import Timeline, JobArrival
 
 
 class DataGen:
 
-    def __init__(self, np_random, n_worker_types=1):
+    def __init__(self, n_worker_types=1):
         self.N_WORKER_TYPES = n_worker_types
-        self.np_random = np_random
 
 
 
-    def initial_timeline(self, n_job_arrivals, n_init_jobs, mjit):
+    def initial_timeline(self, 
+                         n_init_jobs, 
+                         n_job_arrivals, 
+                         job_arrival_rate):
         '''Fills timeline with job arrival events, which follow
         a Poisson process parameterized by mjit (mean job
         interarrival time)
@@ -31,7 +31,8 @@ class DataGen:
                 job = self._job(id, t)
             else:
                 # sample time until next arrival
-                dt_interarrival = self.np_random.exponential(mjit)
+                dt_interarrival = \
+                    np.random.exponential(1/job_arrival_rate)
                 t += dt_interarrival
                 job = self._job(id, t)
 
@@ -50,9 +51,7 @@ class DataGen:
 
 
     def _worker(self, i):
-        type_ = i if i < self.N_WORKER_TYPES \
-            else self.np_random.randint(low=0, high=self.N_WORKER_TYPES)
-        return Worker(id_=i, type_=type_)
+        return Worker(id_=i)
 
 
 

@@ -51,8 +51,6 @@ def train(model,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
 
-    datagen_state = np.random.RandomState(0)
-
     diff_return_calc = \
         DifferentialReturnsCalculator(discount)
 
@@ -60,16 +58,15 @@ def train(model,
         setup_workers(num_envs, 
                       model,  
                       optim_class, 
-                      optim_lr,
-                      datagen_state)
+                      optim_lr)
 
     max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
 
     for i in range(n_sequences):
         # sample the max wall duration of the current episode
-        # max_time = np.random.exponential(max_time_mean)
-        max_time = np.inf
+        max_time = np.random.exponential(max_time_mean)
+        # max_time = np.inf
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
@@ -154,8 +151,7 @@ def train(model,
 def setup_workers(num_envs, 
                   model, 
                   optim_class,
-                  optim_lr,
-                  datagen_state):
+                  optim_lr):
     procs = []
     conns = []
 
@@ -169,8 +165,7 @@ def setup_workers(num_envs,
                              conn_sub,
                              model,
                              optim_class,
-                             optim_lr,
-                             datagen_state))
+                             optim_lr))
         procs += [proc]
         proc.start()
 
@@ -199,7 +194,7 @@ def setup_worker(rank, world_size):
     # unique rollouts, which are determined
     # by the rng seeds.
     torch.manual_seed(rank)
-    np.random.seed(rank)
+    # np.random.seed(rank)
 
 
 
@@ -215,15 +210,14 @@ def episode_runner(rank,
                    conn,
                    model, 
                    optim_class,
-                   optim_lr,
-                   datagen_state):
+                   optim_lr):
     '''worker target which runs episodes 
     and trains the model by communicating 
     with the main process and other workers
     '''
     setup_worker(rank, num_envs)
 
-    env = DagSchedEnvAsyncWrapper(rank, datagen_state)
+    env = DagSchedEnvAsyncWrapper(rank)
 
     model = DDP(model.to(device), 
                 device_ids=[device])
@@ -233,6 +227,8 @@ def episode_runner(rank,
     
     i = 0
     while data := conn.recv():
+        np.random.seed(i)
+
         i += 1
         # receive episode data from parent process
         run_iteration(i, 
@@ -284,6 +280,11 @@ def run_iteration(i,
         list(zip(*[(exp.wall_time, exp.reward) 
                     for exp in experience]))
 
+    for i, (t, val) in enumerate(zip(wall_times, rewards)):
+        if i == 100:
+            break
+        print(f'{t}: {val:.3f}')
+
     # notify main proc that returns and wall times are ready
     conn.send((np.array(rewards), 
                 np.array(wall_times)))
@@ -311,7 +312,7 @@ def run_iteration(i,
         action_loss, 
         entropy_loss / len(experience),
         avg_job_duration(env) * 1e-3,
-        env.n_completed_jobs
+        env.num_completed_jobs
     ))
 
 
@@ -339,8 +340,8 @@ def run_episode(env,
                 max_wall_time,
                 model):  
 
-    obs = env.reset(num_job_arrivals, 
-                    num_init_jobs, 
+    obs = env.reset(num_init_jobs, 
+                    num_job_arrivals, 
                     job_arrival_rate, 
                     num_workers,
                     max_wall_time)
@@ -838,7 +839,8 @@ def dag_action_attributes(dag_scores_batch,
     # entropy for these rows becomes 0.
     inf_counts = torch.isinf(dag_scores_batch).sum(1)
     allinf_rows = (inf_counts == dag_scores_batch.shape[1])
-    dag_scores_batch[allinf_rows, 0] = 0
+    # dag_scores_batch[allinf_rows, 0] = 0
+    dag_scores_batch[allinf_rows] = 0
 
     # compute expected entropy over dags for each obs.
     # each dag is weighted by the probability of it 

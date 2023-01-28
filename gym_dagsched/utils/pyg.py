@@ -37,19 +37,3 @@ def add_adj(dag_batch):
         sparse_sizes=(num_nodes, num_nodes),
         trust_data=True,
         is_sorted=True)
-
-
-
-
-def chunk_feature_tensor(dag_batch):
-    '''returns a list of chunks of the feature tensor,
-    where there is one chunk per job, per environment,
-    i.e. the list has length `self.n * self.n_job_arrivals`.
-    each chunk has as many rows as there are operations
-    in the corresponding job.
-    '''
-    ptr = dag_batch._slice_dict['x']
-    num_nodes_per_graph = (ptr[1:] - ptr[:-1]).tolist()
-    feature_tensor_chunks = torch.split(
-        dag_batch.x, num_nodes_per_graph)
-    return feature_tensor_chunks

@@ -21,29 +21,12 @@ class DagSchedEnv:
 
     @property
     def all_jobs_complete(self):
-        return self.n_completed_jobs == self.n_job_arrivals
+        return self.num_completed_jobs == self.num_job_arrivals
 
 
     @property
-    def n_completed_jobs(self):
+    def num_completed_jobs(self):
         return len(self.completed_job_ids)
-
-
-
-    @property
-    def n_active_jobs(self):
-        return len(self.active_job_ids)
-
-
-
-    @property
-    def n_seen_jobs(self):
-        return self.n_completed_jobs + self.n_active_jobs
-
-
-
-    def n_ops_per_job(self):
-        return [len(self.jobs[j].ops) for j in iter(self.active_job_ids)]
 
 
 
@@ -54,7 +37,7 @@ class DagSchedEnv:
         # a priority queue containing scheduling 
         # events indexed by wall time of occurance
         self.timeline = initial_timeline
-        self.n_job_arrivals = len(initial_timeline.pq)
+        self.num_job_arrivals = len(initial_timeline.pq)
         
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
@@ -111,14 +94,7 @@ class DagSchedEnv:
               self._state.num_workers_to_schedule(), 
               flush=True)
 
-        scheduled_op = self._take_action(action)
-
-        # mark op as selected so that it doesn't get
-        # selected again during this scheduling round
-        self.selected_ops.add(scheduled_op)
-
-        # find remaining schedulable operations
-        schedulable_ops = self._find_schedulable_ops()
+        schedulable_ops = self._take_action(action)
 
         if self._state.num_workers_to_schedule() > 0 and \
            len(schedulable_ops) > 0:
@@ -128,16 +104,25 @@ class DagSchedEnv:
             return obs, 0, False
             
         # scheduling round has completed
+        num_uncommitted_workers = self._state.num_workers_to_schedule()
+        if num_uncommitted_workers > 0:
+            self._state.add_commitment(num_uncommitted_workers, 
+                                       GENERAL_POOL_KEY)
+
         self._fulfill_commitments_from_source()
         self._state.clear_worker_source()
         self.selected_ops.clear()
 
-        new_wall_time, schedulable_ops = self._run_simulation()
+        # save old attributes for computing reward
+        old_wall_time = self.wall_time
+        old_active_job_ids = self.active_job_ids.copy()
 
-        reward = self._calculate_reward(new_wall_time)
+        schedulable_ops = self._run_simulation()
+
+        reward = self._calculate_reward(old_wall_time,
+                                        old_active_job_ids)
         self.done = self.all_jobs_complete or \
-                    new_wall_time >= self.max_wall_time
-        self.wall_time = new_wall_time
+                    self.wall_time >= self.max_wall_time
 
         if not self.done:
             print('starting new scheduling round', flush=True)
@@ -178,7 +163,13 @@ class DagSchedEnv:
         self._state.add_commitment(num_workers, 
                                    op.pool_key)
 
-        return op
+        # mark op as selected so that it doesn't get
+        # selected again during this scheduling round
+        self.selected_ops.add(op)
+
+        # find remaining schedulable operations
+        schedulable_ops = self._find_schedulable_ops()
+        return schedulable_ops
 
 
 
@@ -190,8 +181,11 @@ class DagSchedEnv:
         schedulable_ops = set()
 
         while not self.timeline.empty:
-            wall_time, event = self.timeline.pop()
+            self.wall_time, event = self.timeline.pop()
             self._process_scheduling_event(event)
+
+            src = self._state.get_source()
+            print(src, self._state._pools[src])
 
             if self._state.num_workers_to_schedule() == 0:
                 continue
@@ -200,10 +194,11 @@ class DagSchedEnv:
             if len(schedulable_ops) > 0:
                 break
 
+            print('no ops to schedule')
             self._move_free_uncommitted_source_workers()
             self._state.clear_worker_source()
 
-        return wall_time, schedulable_ops
+        return schedulable_ops
 
 
 
@@ -223,6 +218,13 @@ class DagSchedEnv:
         for job_id in self.active_job_ids:
             self.jobs[job_id].total_worker_count = \
                 self._state.total_worker_count(job_id)
+
+        print('gen pool:', (len(self._state._pools[GENERAL_POOL_KEY]), 
+                            self._state._total_worker_count[None]),
+              {job_id: self.jobs[job_id].total_worker_count 
+               for job_id in self.active_job_ids})
+
+        print('POOLS', self._state._pools)
 
         return new_commitment_round, \
                self._state.num_workers_to_schedule(), \
@@ -260,15 +262,14 @@ class DagSchedEnv:
         self._state.add_job(job.id_)
         [self._state.add_op(*op.pool_key) for op in job.ops]
 
-        job.initialize_frontier()
+        job.init_frontier()
 
         if self._state.general_pool_has_workers():
             # if there are any workers that don't
-            # belong to any job, then give the 
-            # agent a chance to assign them to this 
-            # new job by starting a new commitment 
-            # round at the 'general' pool
-            self._state.update_worker_source()
+            # belong to any job, then the agent might
+            # want to schedule them to this job,
+            # so start a new round at the general pool
+            self._state.update_worker_source(GENERAL_POOL_KEY)
      
 
 
@@ -299,7 +300,6 @@ class DagSchedEnv:
             # so try to greedily find a backup operation 
             # for the worker
             self._try_backup_schedule(worker)
-            return
         elif op not in job.frontier_ops:
             # op's parents haven't completed yet
             self._process_worker_at_unready_op(worker, op)
@@ -363,7 +363,7 @@ class DagSchedEnv:
 
         # worker may have somewhere to be moved
         had_commitment = \
-            self._move_worker(worker, 
+            self._move_worker(worker.id_, 
                               op, 
                               did_job_frontier_change)
 
@@ -515,7 +515,7 @@ class DagSchedEnv:
         
 
 
-    def _move_worker(self, worker, op, did_job_frontier_change):
+    def _move_worker(self, worker_id, op, did_job_frontier_change):
         '''called upon a task completion.
         
         if the op has a commitment, then fulfill it, unless the worker
@@ -526,27 +526,27 @@ class DagSchedEnv:
         job dag, then move the worker to the job's worker pool so that it can 
         be assigned to the new ops
         '''
-        commitment = self._state.peek_commitment(op.pool_key)
-        had_commitment = (commitment is not None)
+        commitment_pool_key = \
+            self._state.peek_commitment(op.pool_key)
 
-        if commitment is not None:
-            # op has at least one commitment, so fulfill it
-            job_id_committed, op_id_committed = commitment
-            job = self.jobs[job_id_committed]
-            op_committed = job.ops[op_id_committed]
-            if op_committed.num_remaining_tasks > 0:
-                self._fulfill_commitment(worker, op_committed)
-            else:
-                self._try_backup_schedule(worker, commitment)
-        elif did_job_frontier_change:
-            # no commitment, but frontier changed
-            self._state.move_worker_to_pool(worker.id_, op.job_pool_key)
+        if commitment_pool_key is not None:
+            self._fulfill_commitment(worker_id,
+                                     commitment_pool_key)
+            return True
+    
+        if did_job_frontier_change:
+            self._state.move_worker_to_pool(worker_id, 
+                                            op.job_pool_key)
+
+        return False
+
         
-        return had_commitment
 
 
-
-    def _update_worker_source(self, op, had_commitment, did_job_frontier_change):
+    def _update_worker_source(self, 
+                              op, 
+                              had_commitment, 
+                              did_job_frontier_change):
         '''called upon a task completion.
         
         if any new operations were unlocked within this 
@@ -559,9 +559,9 @@ class DagSchedEnv:
         pool to give it somewhere to go.
         '''
         if did_job_frontier_change:
-            self._state.update_worker_source(*op.job_pool_key)
+            self._state.update_worker_source(op.job_pool_key)
         elif not had_commitment:
-            self._state.update_worker_source(*op.pool_key)
+            self._state.update_worker_source(op.pool_key)
 
 
 
@@ -586,27 +586,40 @@ class DagSchedEnv:
 
 
 
-    def _fulfill_commitment(self, worker, op):
-        assert op.num_remaining_tasks > 0
+    def _fulfill_commitment(self, worker_id, dst_pool_key):
+        print('fulfilling commitment to', dst_pool_key)
 
-        print('fulfilling commitment to', op.pool_key)
+        src_pool_key = \
+            self._state.remove_commitment(worker_id, dst_pool_key)
 
-        job = self.jobs[op.job_id]
+        if dst_pool_key == GENERAL_POOL_KEY:
+            # this worker is free and isn't commited to
+            # any actual operation
+            self._move_free_uncommitted_source_workers(src_pool_key, [worker_id])
+            return
 
-        self._state.remove_commitment(worker.id_, op.pool_key)
+        job_id, op_id = dst_pool_key
+        op = self.jobs[job_id].ops[op_id]
+        worker = self.workers[worker_id]
+
+        if op.num_remaining_tasks == 0:
+            # operation is saturated
+            self._try_backup_schedule(worker)
+            return
 
         if not worker.is_at_job(op.job_id):
             # worker isn't local to the job, 
             # so send it over.
             self._state.move_worker_to_pool(worker.id_, 
-                                           op.pool_key, 
-                                           send=True)
+                                            op.pool_key, 
+                                            send=True)
             self._send_worker(worker, op)
             return
 
         # worker is at the job
-
         self._state.move_worker_to_pool(worker.id_, op.pool_key)
+
+        job = self.jobs[op.job_id]
 
         if op in job.frontier_ops:
             # op's dependencies are satisfied, so 
@@ -648,44 +661,44 @@ class DagSchedEnv:
         # some of the source workers may not be
         # free right now; find the ones that are.
         free_worker_ids = self._get_free_source_workers()
-
         commitments = self._state.get_source_commitments()
 
-        for (job_id, op_id), num_workers in commitments.items():
+        for dst_pool_key, num_workers in commitments.items():
             assert num_workers > 0
             while num_workers > 0 and len(free_worker_ids) > 0:
                 worker_id = free_worker_ids.pop()
-                worker = self.workers[worker_id]
-                op = self.jobs[job_id].ops[op_id]
-                self._fulfill_commitment(worker, op)
+                self._fulfill_commitment(worker_id, dst_pool_key)
                 num_workers -= 1
 
-        if len(free_worker_ids) > 0:
-            self._move_free_uncommitted_source_workers(free_worker_ids)
+        assert len(free_worker_ids) == 0
 
 
 
-    def _move_free_uncommitted_source_workers(self, free_worker_ids=None):
+    def _move_free_uncommitted_source_workers(self, 
+                                              src_pool_key=None, 
+                                              worker_ids=None):
         '''A scheduling round may end with some workers still not 
         committed anywhere, because there were no more operations left
         to schedule. When this happens, we may need to move the free 
         workers of that bunch to a different pool.
         '''
-        source = self._state.get_source()
-        assert source is not None
+        if src_pool_key is None:
+            src_pool_key = self._state.get_source()
+        assert src_pool_key is not None
 
-        if source == GENERAL_POOL_KEY:
+        if worker_ids is None:
+            worker_ids = list(self._get_free_source_workers())
+        assert len(worker_ids) > 0
+
+        if src_pool_key == GENERAL_POOL_KEY:
             return # don't move workers
 
-        job_id, op_id = source
+        job_id, op_id = src_pool_key
         is_job_saturated = self.jobs[job_id].saturated
 
         if op_id is None and not is_job_saturated:
             # source is an unsaturated job's pool
             return # don't move workers
-
-        if free_worker_ids is None:
-            free_worker_ids = self._get_free_source_workers()
 
         # if the source is a saturated job's pool, then move it to the 
         # general pool. If it's an operation's pool, then move it to 
@@ -693,16 +706,16 @@ class DagSchedEnv:
         dst_pool_key = GENERAL_POOL_KEY if is_job_saturated \
                        else (job_id, None)
 
-        for worker_id in iter(free_worker_ids):
-            self._state.move_worker_to_pool(worker_id, dst_pool_key)
+        print(f'moving free uncommited workers from {src_pool_key} to {dst_pool_key}')
+
+        for worker_id in worker_ids:
+            self._state.move_worker_to_pool(worker_id, 
+                                            dst_pool_key)
 
 
 
-    def _try_backup_schedule(self, worker, commitment=None):
-        print('trying backup; old commitment =', commitment)
-
-        if commitment:
-            self._state.remove_commitment(worker.id_, commitment)
+    def _try_backup_schedule(self, worker):
+        print('trying backup')
 
         backup_op = self._find_backup_op(worker)
 
@@ -745,8 +758,9 @@ class DagSchedEnv:
 
     def _find_backup_op(self, worker):
         # first, try searching within the same job
-        local_ops = self._find_schedulable_ops(job_ids=[worker.job_id], 
-                                         source_job_id=worker.job_id)
+        local_ops = \
+            self._find_schedulable_ops(job_ids=[worker.job_id], 
+                                       source_job_id=worker.job_id)
         if len(local_ops) > 0:
             return local_ops.pop()
 
@@ -756,7 +770,7 @@ class DagSchedEnv:
              if job_id != worker.job_id]
         other_ops = \
             self._find_schedulable_ops(job_ids=other_job_ids,
-                                 source_job_id=worker.job_id)
+                                       source_job_id=worker.job_id)
 
         if len(other_ops) > 0:
             return other_ops.pop()
@@ -766,12 +780,21 @@ class DagSchedEnv:
 
 
 
-    def _calculate_reward(self, new_wall_time):
+    def _calculate_reward(self, 
+                          old_wall_time, 
+                          old_active_job_ids):
         reward = 0.
-        for job_id in iter(self.active_job_ids):
+
+        # include jobs that completed and arrived
+        # during the most recent simulation run
+        job_ids = old_active_job_ids | self.active_job_ids
+
+        print('calc reward', len(job_ids), old_wall_time, self.wall_time)
+
+        for job_id in iter(job_ids):
             job = self.jobs[job_id]
-            start = max(job.t_arrival, self.wall_time)
-            end = min(job.t_completed, new_wall_time)
+            start = max(job.t_arrival, old_wall_time)
+            end = min(job.t_completed, self.wall_time)
             reward -= (end - start)
         return reward * self.REWARD_SCALE
 

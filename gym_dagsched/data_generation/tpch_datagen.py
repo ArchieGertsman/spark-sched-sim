@@ -10,16 +10,13 @@ from ..entities.operation import Operation
 
 class TPCHDataGen(DataGen):
 
-    def __init__(self, np_random):
-        super().__init__(np_random)
-
 
     def _job(self, id, t_arrival):
         tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
-        query_size = tpch_sizes[self.np_random.randint(len(tpch_sizes))]
+        query_size = tpch_sizes[np.random.randint(len(tpch_sizes))]
         
         tpch_num = 22
-        query_idx = str(self.np_random.randint(tpch_num) + 1)
+        query_idx = str(np.random.randint(tpch_num) + 1)
 
         query_path = f'./gym_dagsched/data_generation/tpch/{query_size}/'
         

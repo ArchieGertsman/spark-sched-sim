@@ -79,21 +79,16 @@ class Job:
         new_ops = self.find_new_frontier_ops(op, 'completed')
         self.frontier_ops |= new_ops
 
-        return len(new_ops) > 0
+        return len(new_ops) > 0 or self.completed
             
 
 
-    def initialize_frontier(self):
+    def init_frontier(self):
         '''returns a set containing all the operations which are
         source nodes in the dag, i.e. which have no dependencies
         '''
         assert len(self.frontier_ops) == 0
-        
-        sources = self.source_ops()
-
-        self.frontier_ops |= sources
-
-        return sources
+        self.frontier_ops |= self.source_ops()
 
 
     def source_ops(self):

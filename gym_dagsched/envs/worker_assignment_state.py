@@ -48,7 +48,8 @@ class WorkerAssignmentState:
              GENERAL_POOL_KEY: 0}
 
         # op pool key -> total number of commitments to op
-        self._num_commitments_to_op = {}
+        self._num_commitments_to_op = \
+            {GENERAL_POOL_KEY: 0}
 
         # op pool key -> number of workers moving to op
         self._num_moving_to_op = {}
@@ -56,7 +57,8 @@ class WorkerAssignmentState:
         # job id -> size of job's pool plus the total number
         # of external commitments and moving workers to any 
         # of its operations
-        self._total_worker_count = {}
+        self._total_worker_count = \
+            {None: 0}
 
         # initialize worker source
         self._curr_source = GENERAL_POOL_KEY
@@ -118,29 +120,14 @@ class WorkerAssignmentState:
         return self._num_commitments_to_op[op_pool_key]
 
 
-
-    # def num_workers_at_source(self):
-    #     return len(self._pools[self._curr_source])
-
-
-
-    # def num_workers_at(self, pool_key):
-    #     return len(self._pools[pool_key])
-
-
-
-    # def num_commitments_from(self, pool_key):
-    #     return self._num_commitments_from[pool_key]
-
-
     
     def total_worker_count(self, job_id):
         return self._total_worker_count[job_id]
 
 
 
-    def update_worker_source(self, job_id=None, op_id=None):
-        self._curr_source = (job_id, op_id)
+    def update_worker_source(self, pool_key):
+        self._curr_source = pool_key
 
 
 
@@ -252,6 +239,8 @@ class WorkerAssignmentState:
 
     
     def _decrement_commitments(self, src_pool_key, dst_pool_key):
+        assert dst_pool_key in self._commitments[src_pool_key]
+
         self._commitments[src_pool_key][dst_pool_key] -= 1
         self._num_commitments_from[src_pool_key] -= 1
         self._num_commitments_to_op[dst_pool_key] -= 1

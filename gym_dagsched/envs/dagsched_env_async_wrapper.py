@@ -12,12 +12,14 @@ from ..utils.pyg import construct_subbatch
 
 
 class DagSchedEnvAsyncWrapper:
+    '''Wrapper around `DagSchedEnv`, which parses
+    observations from the env into model inputs,
+    and parses actions from the agent for the env
+    '''
 
-    def __init__(self, rank, datagen_state):
+    def __init__(self, rank):
         self.env = DagSchedEnv(rank)
-        self.datagen = TPCHDataGen(datagen_state)
-
-
+        self.datagen = TPCHDataGen()
 
     @property
     def active_job_ids(self):
@@ -28,8 +30,8 @@ class DagSchedEnvAsyncWrapper:
         return self.env.completed_job_ids
 
     @property
-    def n_completed_jobs(self):
-        return self.env.n_completed_jobs
+    def num_completed_jobs(self):
+        return self.env.num_completed_jobs
 
     @property
     def jobs(self):
@@ -42,18 +44,16 @@ class DagSchedEnvAsyncWrapper:
 
 
     def reset(self, 
-              num_job_arrivals, 
               num_init_jobs, 
+              num_job_arrivals, 
               job_arrival_rate, 
               num_workers,
               max_wall_time):
 
-        mean_job_interarrival_time = 1 / job_arrival_rate
-
         initial_timeline = \
-            self.datagen.initial_timeline(num_job_arrivals, 
-                                          num_init_jobs, 
-                                          mean_job_interarrival_time)
+            self.datagen.initial_timeline(num_init_jobs, 
+                                          num_job_arrivals, 
+                                          job_arrival_rate)
 
         workers = self.datagen.workers(num_workers)
 
@@ -61,12 +61,22 @@ class DagSchedEnvAsyncWrapper:
 
         self.num_total_jobs = num_init_jobs + num_job_arrivals
 
-        self._reset_global_op_idx_map(initial_timeline)
+        self._reset_op_idx_map(initial_timeline)
 
         self._reset_dag_batch(initial_timeline)
 
-        self.prev_active_op_mask = None
+        # induced subgraph of `self.dag_batch`, which
+        # only contains nodes that correspond with
+        # currently active operations. Only gets
+        # reconstructed when set of active operations
+        # changes.
         self.dag_subbatch = None
+
+        # mask indicating which operations are currently
+        # active. This gets recomputed during every step,
+        # but the previous one is saved just to see if the 
+        # set of nodes has changed
+        self.prev_active_op_mask = None
 
         obs = self.env.reset(initial_timeline, 
                              workers, 
@@ -98,23 +108,27 @@ class DagSchedEnvAsyncWrapper:
         if job.id_ == source_job_id:
             worker_count += num_source_workers
         
-        assert worker_count >= 1
+        assert 1 <= worker_count
+        # assert      worker_count <= num_source_workers
 
-        worker_count = \
-            min(worker_count, num_source_workers)
+        worker_count = min(worker_count, num_source_workers)
 
         action = ((job_id, op_id), worker_count)
         return action
 
 
 
+    def _get_all_jobs(self, initial_timeline):
+        '''initial timeline is filled with job arrival events
+        so extract the job object from each of those events
+        '''
+        return (e.job for *_, e in initial_timeline.pq)
+
+
+
     def _reset_dag_batch(self, initial_timeline):
-        # initial timeline is filled with job arrival events
-        # so extract the job object from each of those events
-        jobs = (e.job for *_, e in initial_timeline.pq)
-        
         data_list = []
-        for job in jobs:
+        for job in self._get_all_jobs(initial_timeline):
             pyg_data = from_networkx(job.dag)
             pyg_data.x = torch.zeros((len(job.ops), 5))
             data_list += [pyg_data]
@@ -123,17 +137,21 @@ class DagSchedEnvAsyncWrapper:
 
 
 
-    def _reset_global_op_idx_map(self, initial_timeline):
-        self.global_op_idx_map = {}
-        op_idx = 0
-        for _,_,e in initial_timeline.pq:
-            job = e.job
-            self.global_op_idx_map[job.id_] = {}
+    def _reset_op_idx_map(self, initial_timeline):
+        '''maps the 'global' index of an operation (i.e. relative 
+        to all operations in the entirety of the simulation) to
+        the 'local' index of that operation (i.e. relative to its 
+        job dag)
+        '''
+        self.op_idx_map = {}
+        global_idx = 0
+        for job in self._get_all_jobs(initial_timeline):
+            self.op_idx_map[job.id_] = {}
             for op in job.ops:
-                self.global_op_idx_map[job.id_][op.id_] = op_idx
-                op_idx += 1
+                self.op_idx_map[job.id_][op.id_] = global_idx
+                global_idx += 1
 
-        self.num_total_ops = op_idx
+        self.num_total_ops = global_idx
 
 
 
@@ -196,27 +214,25 @@ class DagSchedEnvAsyncWrapper:
             np.zeros((len(active_jobs), self.num_workers), 
                      dtype=bool)
 
-        print('WORKER COUNTS', {job.id_: job.total_worker_count for job in active_jobs})
-
         for i, job in enumerate(active_jobs):
             active_job_mask[job.id_] = 1
             op_counts += [job.num_active_ops]
 
             # build parallelism limit mask
             min_prlsm_lim = job.total_worker_count + 1
-            max_prlsm_lim = job.total_worker_count + num_source_workers
+            # max_prlsm_lim = job.total_worker_count + num_source_workers
             if job.id_ == source_job_id:
                 min_prlsm_lim -= num_source_workers
-                max_prlsm_lim -= num_source_workers
+                # max_prlsm_lim -= num_source_workers
 
             assert 0 < min_prlsm_lim
             assert     min_prlsm_lim <= self.num_workers + 1
 
-            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):max_prlsm_lim] = 1
+            valid_prlsm_lim_mask[i, (min_prlsm_lim-1):] = 1
 
             for op in iter(job.active_ops):
                 # build operation masks
-                global_idx = self.global_op_idx_map[job.id_][op.id_]
+                global_idx = self.op_idx_map[job.id_][op.id_]
                 active_op_mask[global_idx] = 1
                 if min_prlsm_lim > self.num_workers:
                     assert op not in valid_ops
@@ -225,9 +241,6 @@ class DagSchedEnvAsyncWrapper:
         op_counts = np.array(op_counts, dtype=int)
 
         valid_ops_mask = np.array(valid_ops_mask, dtype=bool)
-
-        # print('NODE MASK', valid_ops_mask)
-        # print('PRLSM MASK', valid_prlsm_lim_mask, flush=True)
 
         return active_job_mask, \
                active_op_mask, \
@@ -241,22 +254,22 @@ class DagSchedEnvAsyncWrapper:
                               new_commitment_round,
                               active_jobs,
                               source_job_id,
-                              n_source_workers):
+                              num_source_workers):
         # make updates in an auxiliary numpy array 
         # instead of the tensor directly, because 
         # numpy is faster for cpu computations
         all_node_features = \
             np.zeros(self.dag_subbatch.x.shape, dtype=np.float32)
 
+        all_node_features[:, 0] = num_source_workers / self.num_workers
+
         ptr = self.dag_subbatch.ptr[1:].numpy()
 
-        node_features_split = \
+        job_features_list = \
             np.split(all_node_features, ptr)
 
-        all_node_features[:, 0] = n_source_workers / 20
-
-        for job, node_features in zip(active_jobs, node_features_split):
-            node_features[:, 2] = job.total_worker_count / 20
+        for job, job_features in zip(active_jobs, job_features_list):
+            job_features[:, 2] = job.total_worker_count / self.num_workers
 
             # if not new_commitment_round:
             #     # if we are in the same commitment round
@@ -265,11 +278,11 @@ class DagSchedEnvAsyncWrapper:
             #     continue
 
             is_source_job = (job.id_ == source_job_id)
-            node_features[:, 1] = int(is_source_job) * 4 - 2
+            job_features[:, 1] = int(is_source_job) * 4 - 2
 
             for i, op in enumerate(iter(job.active_ops)):
-                node_features[i, 3] = op.num_remaining_tasks / 200
-                node_features[i, 4] = op.approx_remaining_work * 1e-5
+                job_features[i, 3] = op.num_remaining_tasks / 200
+                job_features[i, 4] = op.approx_remaining_work * 1e-5
 
         all_node_features = torch.from_numpy(all_node_features)
         self.dag_subbatch.x = all_node_features
