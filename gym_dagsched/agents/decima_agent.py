@@ -1,11 +1,157 @@
 import torch
 import torch.nn as nn
+from torch.distributions import Categorical
 from torch_geometric.nn import MessagePassing
 import torch_geometric.nn as gnn
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
 
 from gym_dagsched.utils.device import device
+from .base_agent import BaseAgent
+
+
+
+
+class DecimaAgent(BaseAgent):
+    def __init__(self, 
+                 num_workers,
+                 mode='train',
+                 state_dict_path=None,
+                 device=None,
+                 num_node_features=5, 
+                 num_dag_features=3, 
+                 dim_embed=8):
+        super().__init__('Decima')
+
+        self.actor_network = \
+            ActorNetwork(num_node_features, 
+                         num_dag_features, 
+                         num_workers,
+                         dim_embed)
+
+        if state_dict_path is not None:
+            state_dict = torch.load(state_dict_path)
+            self.actor_network.load_state_dict(state_dict)
+        
+        if device is not None:
+            self.actor_network.to(device)
+
+        if mode == 'train':
+            self.actor_network.train()
+        elif mode == 'eval':
+            self.actor_network.eval()
+        else:
+            raise Exception('invalid mode')
+
+        self.mode = mode
+
+        self.cached_dag_batch = None
+
+
+
+
+    def invoke(self, obs):
+        (did_update_dag_batch,
+         dag_batch,
+         valid_ops_mask,
+         valid_prlsm_lim_mask,
+         active_job_ids, 
+         *_) = obs
+
+        if did_update_dag_batch:
+            # the whole dag batch object was
+            # updated because the number of
+            # nodes changed, so send the new
+            # object to the GPU
+            dag_batch_clone = dag_batch.clone()
+            dag_batch_clone.edge_index = None
+            self.cached_dag_batch = dag_batch_clone \
+                .to(device, non_blocking=True)
+        else:
+            # only send new node features to
+            # the GPU; reuse cached dag batch
+            # for everything else
+            self.cached_dag_batch.x = dag_batch.x \
+                .to(device, non_blocking=True)
+
+        with torch.no_grad():
+            # no computational graphs needed during 
+            # the episode, only model outputs.
+            node_scores, dag_scores = \
+                self.actor_network(self.cached_dag_batch)
+
+        node_scores = node_scores.cpu()
+        node_scores[~valid_ops_mask] = float('-inf')
+
+        dag_scores = dag_scores.cpu()
+        valid_prlsm_lim_mask = \
+            torch.from_numpy(valid_prlsm_lim_mask)
+        dag_scores.masked_fill_(~valid_prlsm_lim_mask, 
+                                float('-inf'))
+
+        env_action, raw_action = \
+            self.sample_action(node_scores, 
+                               dag_scores,
+                               dag_batch.ptr.numpy(),
+                               active_job_ids)
+
+        if self.mode == 'train':
+            return env_action, raw_action
+        else:
+            return env_action
+
+
+
+    def sample_action(self,
+                      node_scores, 
+                      dag_scores, 
+                      job_ptr,
+                      active_job_ids):
+        # select the next operation to schedule
+        op_sample = \
+            Categorical(logits=node_scores) \
+                .sample()
+
+        op_env, job_idx = \
+            self.translate_op(op_sample.item(), 
+                              job_ptr,
+                              active_job_ids)
+
+        # select the number of workers to schedule
+        num_workers_sample = \
+            Categorical(logits=dag_scores[job_idx]) \
+                .sample()
+        num_workers_env = 1 + num_workers_sample.item()
+
+        # action that's recorded in experience, 
+        # later used during training
+        raw_action = (op_sample, 
+                      job_idx, 
+                      num_workers_sample)
+
+        # action that gets sent to the env
+        env_action = (op_env, num_workers_env)
+
+        return env_action, raw_action
+
+
+
+    @classmethod
+    def translate_op(cls, op, job_ptr, active_jobs_ids):
+        '''Returns:
+        - `op`: translation of the policy sample so that 
+        the environment can find the corresponding operation
+        - `job_idx`: index of the job that the selected op 
+        belongs to
+        '''
+        job_idx = (op >= job_ptr).sum() - 1
+
+        job_id = active_jobs_ids[job_idx]
+        active_op_idx = op - job_ptr[job_idx]
+        
+        op = (job_id, active_op_idx)
+
+        return op, job_idx
 
 
 
@@ -15,7 +161,7 @@ class ActorNetwork(nn.Module):
                  num_node_features, 
                  num_dag_features, 
                  num_workers,
-                 dim_embed=8):
+                 dim_embed):
         super().__init__()
 
         self.encoder = \

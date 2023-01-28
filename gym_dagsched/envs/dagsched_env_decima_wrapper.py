@@ -11,15 +11,14 @@ from ..utils.pyg import construct_subbatch
 
 
 
-class DagSchedEnvAsyncWrapper:
+class DagSchedEnvDecimaWrapper:
     '''Wrapper around `DagSchedEnv`, which parses
     observations from the env into model inputs,
     and parses actions from the agent for the env
     '''
 
-    def __init__(self, rank):
-        self.env = DagSchedEnv(rank)
-        self.datagen = TPCHDataGen()
+    def __init__(self, env):
+        self.env = env
 
     @property
     def active_job_ids(self):
@@ -50,20 +49,19 @@ class DagSchedEnvAsyncWrapper:
               num_workers,
               max_wall_time):
 
-        initial_timeline = \
-            self.datagen.initial_timeline(num_init_jobs, 
-                                          num_job_arrivals, 
-                                          job_arrival_rate)
-
-        workers = self.datagen.workers(num_workers)
+        obs = self.env.reset(num_init_jobs, 
+                             num_job_arrivals, 
+                             job_arrival_rate, 
+                             num_workers,
+                             max_wall_time)
 
         self.num_workers = num_workers
 
         self.num_total_jobs = num_init_jobs + num_job_arrivals
 
-        self._reset_op_idx_map(initial_timeline)
+        self._reset_op_idx_map()
 
-        self._reset_dag_batch(initial_timeline)
+        self._reset_dag_batch()
 
         # induced subgraph of `self.dag_batch`, which
         # only contains nodes that correspond with
@@ -77,10 +75,6 @@ class DagSchedEnvAsyncWrapper:
         # but the previous one is saved just to see if the 
         # set of nodes has changed
         self.prev_active_op_mask = None
-
-        obs = self.env.reset(initial_timeline, 
-                             workers, 
-                             max_wall_time)
 
         return self._parse_obs(obs)
 
@@ -118,17 +112,9 @@ class DagSchedEnvAsyncWrapper:
 
 
 
-    def _get_all_jobs(self, initial_timeline):
-        '''initial timeline is filled with job arrival events
-        so extract the job object from each of those events
-        '''
-        return (e.job for *_, e in initial_timeline.pq)
-
-
-
-    def _reset_dag_batch(self, initial_timeline):
+    def _reset_dag_batch(self):
         data_list = []
-        for job in self._get_all_jobs(initial_timeline):
+        for job in self.env.jobs.values():
             pyg_data = from_networkx(job.dag)
             pyg_data.x = torch.zeros((len(job.ops), 5))
             data_list += [pyg_data]
@@ -137,7 +123,7 @@ class DagSchedEnvAsyncWrapper:
 
 
 
-    def _reset_op_idx_map(self, initial_timeline):
+    def _reset_op_idx_map(self):
         '''maps the 'global' index of an operation (i.e. relative 
         to all operations in the entirety of the simulation) to
         the 'local' index of that operation (i.e. relative to its 
@@ -145,7 +131,7 @@ class DagSchedEnvAsyncWrapper:
         '''
         self.op_idx_map = {}
         global_idx = 0
-        for job in self._get_all_jobs(initial_timeline):
+        for job in self.env.jobs.values():
             self.op_idx_map[job.id_] = {}
             for op in job.ops:
                 self.op_idx_map[job.id_][op.id_] = global_idx
@@ -186,8 +172,7 @@ class DagSchedEnvAsyncWrapper:
                                    source_job_id,
                                    num_source_workers)
 
-        active_job_ids = \
-            np.array([job.id_ for job in active_jobs])
+        active_job_ids = list(active_jobs.keys())
 
         self.prev_active_op_mask = active_op_mask
 
@@ -214,7 +199,7 @@ class DagSchedEnvAsyncWrapper:
             np.zeros((len(active_jobs), self.num_workers), 
                      dtype=bool)
 
-        for i, job in enumerate(active_jobs):
+        for i, job in enumerate(active_jobs.values()):
             active_job_mask[job.id_] = 1
             op_counts += [job.num_active_ops]
 
@@ -268,7 +253,7 @@ class DagSchedEnvAsyncWrapper:
         job_features_list = \
             np.split(all_node_features, ptr)
 
-        for job, job_features in zip(active_jobs, job_features_list):
+        for job, job_features in zip(active_jobs.values(), job_features_list):
             job_features[:, 2] = job.total_worker_count / self.num_workers
 
             # if not new_commitment_round:

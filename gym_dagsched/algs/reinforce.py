@@ -14,7 +14,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Batch
 from torch_scatter import segment_add_csr
 
-from ..envs.dagsched_env_async_wrapper import DagSchedEnvAsyncWrapper
+from ..envs.dagsched_env import DagSchedEnv
+from ..envs.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
@@ -26,7 +27,7 @@ from ..utils.hidden_prints import HiddenPrints
 
 
 
-def train(model,
+def train(agent,
           optim_class,
           optim_lr,
           n_sequences,
@@ -56,7 +57,7 @@ def train(model,
 
     procs, conns = \
         setup_workers(num_envs, 
-                      model,  
+                      agent,  
                       optim_class, 
                       optim_lr)
 
@@ -65,8 +66,8 @@ def train(model,
 
     for i in range(n_sequences):
         # sample the max wall duration of the current episode
-        max_time = np.random.exponential(max_time_mean)
-        # max_time = np.inf
+        # max_time = np.random.exponential(max_time_mean)
+        max_time = np.inf
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
@@ -149,7 +150,7 @@ def train(model,
 
 
 def setup_workers(num_envs, 
-                  model, 
+                  agent, 
                   optim_class,
                   optim_lr):
     procs = []
@@ -163,7 +164,7 @@ def setup_workers(num_envs,
                        args=(rank,
                              num_envs,
                              conn_sub,
-                             model,
+                             agent,
                              optim_class,
                              optim_lr))
         procs += [proc]
@@ -208,7 +209,7 @@ def cleanup_worker():
 def episode_runner(rank,
                    num_envs,
                    conn,
-                   model, 
+                   agent, 
                    optim_class,
                    optim_lr):
     '''worker target which runs episodes 
@@ -217,13 +218,16 @@ def episode_runner(rank,
     '''
     setup_worker(rank, num_envs)
 
-    env = DagSchedEnvAsyncWrapper(rank)
+    base_env = DagSchedEnv()
+    env = DagSchedEnvDecimaWrapper(base_env)
 
-    model = DDP(model.to(device), 
-                device_ids=[device])
+    agent.actor_network = \
+        DDP(agent.actor_network.to(device), 
+            device_ids=[device])
 
-    optim = optim_class(model.parameters(),
-                        lr=optim_lr)
+    optim = \
+        optim_class(agent.actor_network.parameters(),
+                    lr=optim_lr)
     
     i = 0
     while data := conn.recv():
@@ -235,7 +239,7 @@ def episode_runner(rank,
                       rank, 
                       num_envs, 
                       env, 
-                      model, 
+                      agent, 
                       optim, 
                       conn,
                       data)
@@ -249,7 +253,7 @@ def run_iteration(i,
                   rank, 
                   num_envs, 
                   env, 
-                  model, 
+                  agent, 
                   optim, 
                   conn, 
                   data):
@@ -269,12 +273,12 @@ def run_iteration(i,
     with HiddenPrints():
         experience = \
             run_episode(env,
+                        agent,
                         num_job_arrivals, 
                         num_init_jobs, 
                         job_arrival_rate, 
                         n_workers,
-                        max_wall_time,
-                        model)
+                        max_wall_time)
 
     wall_times, rewards = \
         list(zip(*[(exp.wall_time, exp.reward) 
@@ -294,7 +298,7 @@ def run_iteration(i,
     advantages = torch.from_numpy(advantages).float()
 
     action_loss, entropy_loss = \
-        learn_from_experience(model,
+        learn_from_experience(agent.actor_network,
                               optim,
                               experience,
                               advantages,
@@ -302,7 +306,9 @@ def run_iteration(i,
                               num_envs)
 
     if rank == 0 and i % 10 == 0:
-        torch.save(model.module.state_dict(), 'model.pt')
+        state_dict = \
+            agent.actor_network.module.state_dict()
+        torch.save(state_dict, 'model.pt')
 
     if prof:
         prof.disable()
@@ -333,12 +339,12 @@ class Experience:
 
 
 def run_episode(env,
+                agent,
                 num_job_arrivals,
                 num_init_jobs,
                 job_arrival_rate,
                 num_workers,
-                max_wall_time,
-                model):  
+                max_wall_time):  
 
     obs = env.reset(num_init_jobs, 
                     num_job_arrivals, 
@@ -363,7 +369,7 @@ def run_episode(env,
     
     while not done:
         # unpack the current observation
-        (did_update_dag_batch,
+        (_,
          dag_batch,
          valid_ops_mask,
          valid_prlsm_lim_mask,
@@ -371,35 +377,7 @@ def run_episode(env,
          num_source_workers,
          _) = obs
 
-        if did_update_dag_batch:
-            # the whole dag batch object was
-            # updated because the number of
-            # nodes changed, so send the new
-            # object to the GPU
-            job_ptr = dag_batch.ptr.numpy()
-            dag_batch_clone = dag_batch.clone()
-            dag_batch_clone.edge_index = None
-            dag_batch_device = dag_batch_clone \
-                .to(device, non_blocking=True)
-        else:
-            # only send new node features to
-            # the GPU
-            dag_batch_device.x = dag_batch.x \
-                .to(device, non_blocking=True)
-        
-        
-        node_scores, dag_scores = \
-            invoke_agent(model,
-                        dag_batch_device,
-                        valid_ops_mask,
-                        valid_prlsm_lim_mask)
-
-        raw_action, env_action = \
-            sample_action(node_scores, 
-                          dag_scores,
-                          job_ptr,
-                          active_job_ids)
-
+        env_action, raw_action = agent.invoke(obs)
         obs, reward, done = env.step(env_action)
 
         *_, wall_time = obs
@@ -415,84 +393,6 @@ def run_episode(env,
                         reward)]
 
     return experience
-
-
-
-
-def invoke_agent(model,
-                 dag_batch_device,
-                 valid_ops_mask,
-                 valid_prlsm_lim_mask):
-           
-    with torch.no_grad():
-        # no computational graphs needed during 
-        # the episode, only model outputs.
-        node_scores, dag_scores = \
-            model(dag_batch_device)
-
-    node_scores = node_scores.cpu()
-    node_scores[~valid_ops_mask] = float('-inf')
-
-    dag_scores = dag_scores.cpu()
-    valid_prlsm_lim_mask = \
-        torch.from_numpy(valid_prlsm_lim_mask)
-    dag_scores.masked_fill_(~valid_prlsm_lim_mask, 
-                            float('-inf'))
-
-    return node_scores, dag_scores
-
-
-
-
-def sample_action(node_scores, 
-                  dag_scores, 
-                  job_ptr,
-                  active_job_ids):
-    # select the next operation to schedule
-    op_sample = \
-        Categorical(logits=node_scores) \
-            .sample()
-
-    op_env, job_idx = \
-        translate_op(op_sample.item(), 
-                     job_ptr,
-                     active_job_ids)
-
-    # select the number of workers to schedule
-    num_workers_sample = \
-        Categorical(logits=dag_scores[job_idx]) \
-            .sample()
-    num_workers_env = 1 + num_workers_sample.item()
-
-    # action that's recorded in experience, 
-    # later used during training
-    raw_action = (op_sample, 
-                  job_idx, 
-                  num_workers_sample)
-
-    # action that gets sent to the env
-    env_action = (op_env, num_workers_env)
-
-    return raw_action, env_action
-
-
-
-
-def translate_op(op, job_ptr, active_jobs_ids):
-    '''Returns:
-    - `op`: translation of the policy sample so that 
-    the environment can find the corresponding operation
-    - `job_idx`: index of the job that the selected op 
-    belongs to
-    '''
-    job_idx = (op >= job_ptr).sum() - 1
-
-    job_id = active_jobs_ids[job_idx]
-    active_op_idx = op - job_ptr[job_idx]
-    
-    op = (job_id, active_op_idx)
-
-    return op, job_idx
 
 
 

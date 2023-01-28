@@ -7,36 +7,31 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.multiprocessing import set_start_method
 
-from gym_dagsched.policies.decima_agent import ActorNetwork
-from gym_dagsched.reinforce.reinforce_async import train
+from gym_dagsched.agents.decima_agent import DecimaAgent
+from gym_dagsched.algs.reinforce import train
 
 
 def main():
-    configure_main_process()
+    setup()
 
     num_workers = 50
 
-    model = ActorNetwork(
-        num_node_features=5, 
-        num_dag_features=3,
-        num_workers=num_workers)
-
-    # model.load_state_dict(torch.load('model.pt'))
+    decima_agent = DecimaAgent(num_workers)
 
     writer = SummaryWriter('log/train')
     # writer = None
 
-    train(model,
+    train(decima_agent,
           optim_class=torch.optim.Adam,
           optim_lr=.001,
-          n_sequences=10000,
-          num_envs=16,
+          n_sequences=1,
+          num_envs=4,
           discount=.99,
           entropy_weight_init=1.,
           entropy_weight_decay=1e-3,
           entropy_weight_min=1e-4,
-          num_job_arrivals=200,
-          num_init_jobs=1, 
+          num_job_arrivals=0,
+          num_init_jobs=20, 
           job_arrival_rate=1/25000,
           num_workers=num_workers,
           max_time_mean_init=2e6,
@@ -52,7 +47,7 @@ def main():
 
 
 
-def configure_main_process():
+def setup():
     shutil.rmtree('log/proc/', ignore_errors=True)
     os.mkdir('log/proc/')
 

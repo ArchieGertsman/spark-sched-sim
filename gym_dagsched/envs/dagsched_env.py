@@ -1,6 +1,8 @@
 import numpy as np
 
+
 from .worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_KEY
+from ..data_generation.tpch_datagen import TPCHDataGen
 from ..entities.timeline import JobArrival, TaskCompletion, WorkerArrival
 
 
@@ -14,8 +16,8 @@ class DagSchedEnv:
     MOVING_COST = 2000.
 
 
-    def __init__(self, rank):
-        self.rank = rank
+    def __init__(self):
+        self._datagen = TPCHDataGen()
         self._state = WorkerAssignmentState()
 
 
@@ -33,16 +35,27 @@ class DagSchedEnv:
 
     ## OpenAI Gym style interface - reset & step
 
-    def reset(self, initial_timeline, workers, max_wall_time):
+    def reset(self, 
+              num_init_jobs, 
+              num_job_arrivals, 
+              job_arrival_rate, 
+              num_workers,
+              max_wall_time):
+
+        self.timeline = \
+            self._datagen.initial_timeline(num_init_jobs, 
+                                           num_job_arrivals, 
+                                           job_arrival_rate)
+
+        self.workers = self._datagen.workers(num_workers)
+
         # a priority queue containing scheduling 
         # events indexed by wall time of occurance
-        self.timeline = initial_timeline
-        self.num_job_arrivals = len(initial_timeline.pq)
+        self.num_job_arrivals = len(self.timeline.pq)
         
         # list of worker objects which are to be scheduled
         # to complete tasks within the simulation
-        self.workers = workers
-        self.num_workers = len(workers)
+        self.num_workers = len(self.workers)
 
         self.max_wall_time = max_wall_time
 
@@ -53,7 +66,7 @@ class DagSchedEnv:
         # dict which maps job id to job object
         # for each job that has arrived into the
         # system
-        self.jobs = {}
+        self.jobs = {i: e.job for i, (*_, e) in enumerate(self.timeline.pq)}
 
         # list of ids of all active jobs
         self.active_job_ids = set()
@@ -139,6 +152,12 @@ class DagSchedEnv:
 
 
     def _take_action(self, action):
+        if action is None:
+            num_source_workers = self._state.num_workers_to_schedule()
+            self._state.add_commitment(num_source_workers,
+                                       GENERAL_POOL_KEY)
+            return self.schedulable_ops
+
         (job_id, op_id), num_workers = action
         print('action:', (job_id, op_id), num_workers)
 
@@ -212,11 +231,11 @@ class DagSchedEnv:
         # that the agent selected one of them
         self.schedulable_ops = schedulable_ops
 
-        active_jobs = [self.jobs[job_id] 
-                       for job_id in iter(self.active_job_ids)]
+        active_jobs = {job_id: self.jobs[job_id] 
+                       for job_id in iter(self.active_job_ids)}
 
         for job_id in self.active_job_ids:
-            self.jobs[job_id].total_worker_count = \
+            active_jobs[job_id].total_worker_count = \
                 self._state.total_worker_count(job_id)
 
         print('gen pool:', (len(self._state._pools[GENERAL_POOL_KEY]), 
@@ -257,7 +276,7 @@ class DagSchedEnv:
         print(f'job {job.id_} arrived at t={self.wall_time*1e-3:.1f}s')
         print('dag edges:', list(job.dag.edges))
 
-        self.jobs[job.id_] = job
+        # self.jobs[job.id_] = job
         self.active_job_ids.add(job.id_)
         self._state.add_job(job.id_)
         [self._state.add_op(*op.pool_key) for op in job.ops]
