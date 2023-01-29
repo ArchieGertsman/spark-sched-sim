@@ -1,24 +1,22 @@
 
-
+from gymnasium import Wrapper
 import numpy as np
 import torch
 from torch_geometric.data import Batch
 from torch_geometric.utils.convert import from_networkx
 
-from .dagsched_env import DagSchedEnv
-from ..data_generation.tpch_datagen import TPCHDataGen
 from ..utils.pyg import construct_subbatch
 
 
 
-class DagSchedEnvDecimaWrapper:
+class DagSchedEnvDecimaWrapper(Wrapper):
     '''Wrapper around `DagSchedEnv`, which parses
     observations from the env into model inputs,
     and parses actions from the agent for the env
     '''
 
     def __init__(self, env):
-        self.env = env
+        super().__init__(env)
 
     @property
     def active_job_ids(self):
@@ -42,22 +40,8 @@ class DagSchedEnvDecimaWrapper:
 
 
 
-    def reset(self, 
-              num_init_jobs, 
-              num_job_arrivals, 
-              job_arrival_rate, 
-              num_workers,
-              max_wall_time):
-
-        obs = self.env.reset(num_init_jobs, 
-                             num_job_arrivals, 
-                             job_arrival_rate, 
-                             num_workers,
-                             max_wall_time)
-
-        self.num_workers = num_workers
-
-        self.num_total_jobs = num_init_jobs + num_job_arrivals
+    def reset(self, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
 
         self._reset_op_idx_map()
 
@@ -76,19 +60,22 @@ class DagSchedEnvDecimaWrapper:
         # set of nodes has changed
         self.prev_active_op_mask = None
 
-        return self._parse_obs(obs)
+        obs = self.observation(obs)
+        return obs, info
 
 
 
     def step(self, action):
-        action = self._parse_action(action)
-        obs, reward, done = self.env.step(action)
-        obs = self._parse_obs(obs)
-        return obs, reward, done
+        action = self.action(action)
+
+        obs, *rest = self.env.step(action)
+
+        obs = self.observation(obs)
+        return obs, *rest
 
 
 
-    def _parse_action(self, action):
+    def action(self, action):
         (job_id, active_op_idx), prlsm_lim = action
 
         # parse operation
@@ -97,13 +84,12 @@ class DagSchedEnvDecimaWrapper:
         op_id = active_ops[active_op_idx].id_
 
         # parse parallelism limit
-        _, num_source_workers, source_job_id, *_ = self.last_obs
+        num_source_workers, source_job_id, *_ = self.last_obs
         worker_count = prlsm_lim - job.total_worker_count
         if job.id_ == source_job_id:
             worker_count += num_source_workers
         
-        assert 1 <= worker_count
-        # assert      worker_count <= num_source_workers
+        assert worker_count >= 1
 
         worker_count = min(worker_count, num_source_workers)
 
@@ -111,6 +97,52 @@ class DagSchedEnvDecimaWrapper:
         return action
 
 
+
+    def observation(self, obs):
+        self.last_obs = obs
+
+        (num_source_workers,
+         source_job_id, 
+         valid_ops, 
+         active_jobs,
+         wall_time) = obs
+
+        (active_job_mask, 
+         active_op_mask, 
+         op_counts, 
+         valid_ops_mask,
+         valid_prlsm_lim_mask) = \
+            self._bookkeep(active_jobs, 
+                           valid_ops,
+                           source_job_id,
+                           num_source_workers)
+
+        did_update = \
+            self._update_dag_subbatch(active_op_mask,
+                                      active_job_mask,
+                                      op_counts,
+                                      active_jobs)
+
+        self._update_node_features(active_jobs,
+                                   source_job_id,
+                                   num_source_workers)
+
+        active_job_ids = list(active_jobs.keys())
+
+        self.prev_active_op_mask = active_op_mask
+
+        return did_update, \
+               self.dag_subbatch, \
+               valid_ops_mask, \
+               valid_prlsm_lim_mask, \
+               active_job_ids, \
+               num_source_workers, \
+               wall_time
+
+
+
+    
+    # internal methods
 
     def _reset_dag_batch(self):
         data_list = []
@@ -141,62 +173,17 @@ class DagSchedEnvDecimaWrapper:
 
 
 
-    def _parse_obs(self, obs):
-        self.last_obs = obs
-
-        (new_commitment_round,
-         num_source_workers,
-         source_job_id, 
-         valid_ops, 
-         active_jobs,
-         wall_time) = obs
-
-        (active_job_mask, 
-         active_op_mask, 
-         op_counts, 
-         valid_ops_mask,
-         valid_prlsm_lim_mask) = \
-            self._bookkeep(active_jobs, 
-                           valid_ops,
-                           source_job_id,
-                           num_source_workers)
-
-        did_update = \
-            self._update_dag_subbatch(active_op_mask,
-                                      active_job_mask,
-                                      op_counts,
-                                      active_jobs)
-
-        self._update_node_features(new_commitment_round,
-                                   active_jobs,
-                                   source_job_id,
-                                   num_source_workers)
-
-        active_job_ids = list(active_jobs.keys())
-
-        self.prev_active_op_mask = active_op_mask
-
-        return did_update, \
-            self.dag_subbatch, \
-            valid_ops_mask, \
-            valid_prlsm_lim_mask, \
-            active_job_ids, \
-            num_source_workers, \
-            wall_time
-
-
-
     def _bookkeep(self, 
                   active_jobs, 
                   valid_ops,
                   source_job_id,
                   num_source_workers):
-        active_job_mask = np.zeros(self.num_total_jobs, dtype=bool)
+        active_job_mask = np.zeros(self.env.num_total_jobs, dtype=bool)
         active_op_mask = np.zeros(self.num_total_ops, dtype=bool)
         op_counts = []
         valid_ops_mask = []
         valid_prlsm_lim_mask = \
-            np.zeros((len(active_jobs), self.num_workers), 
+            np.zeros((len(active_jobs), self.env.num_workers), 
                      dtype=bool)
 
         for i, job in enumerate(active_jobs.values()):
@@ -205,13 +192,11 @@ class DagSchedEnvDecimaWrapper:
 
             # build parallelism limit mask
             min_prlsm_lim = job.total_worker_count + 1
-            # max_prlsm_lim = job.total_worker_count + num_source_workers
             if job.id_ == source_job_id:
                 min_prlsm_lim -= num_source_workers
-                # max_prlsm_lim -= num_source_workers
 
             assert 0 < min_prlsm_lim
-            assert     min_prlsm_lim <= self.num_workers + 1
+            assert     min_prlsm_lim <= self.env.num_workers + 1
 
             valid_prlsm_lim_mask[i, (min_prlsm_lim-1):] = 1
 
@@ -219,7 +204,7 @@ class DagSchedEnvDecimaWrapper:
                 # build operation masks
                 global_idx = self.op_idx_map[job.id_][op.id_]
                 active_op_mask[global_idx] = 1
-                if min_prlsm_lim > self.num_workers:
+                if min_prlsm_lim > self.env.num_workers:
                     assert op not in valid_ops
                 valid_ops_mask += [1] if op in valid_ops else [0]
 
@@ -236,7 +221,6 @@ class DagSchedEnvDecimaWrapper:
 
 
     def _update_node_features(self,
-                              new_commitment_round,
                               active_jobs,
                               source_job_id,
                               num_source_workers):
@@ -246,7 +230,7 @@ class DagSchedEnvDecimaWrapper:
         all_node_features = \
             np.zeros(self.dag_subbatch.x.shape, dtype=np.float32)
 
-        all_node_features[:, 0] = num_source_workers / self.num_workers
+        all_node_features[:, 0] = num_source_workers / self.env.num_workers
 
         ptr = self.dag_subbatch.ptr[1:].numpy()
 
@@ -254,13 +238,7 @@ class DagSchedEnvDecimaWrapper:
             np.split(all_node_features, ptr)
 
         for job, job_features in zip(active_jobs.values(), job_features_list):
-            job_features[:, 2] = job.total_worker_count / self.num_workers
-
-            # if not new_commitment_round:
-            #     # if we are in the same commitment round
-            #     # then none of the other features could
-            #     # have changed.
-            #     continue
+            job_features[:, 2] = job.total_worker_count / self.env.num_workers
 
             is_source_job = (job.id_ == source_job_id)
             job_features[:, 1] = int(is_source_job) * 4 - 2

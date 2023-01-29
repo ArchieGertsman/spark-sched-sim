@@ -1,10 +1,9 @@
 import heapq
 import itertools
 from dataclasses import dataclass
-from gym_dagsched.entities.job import Job
 
-from gym_dagsched.entities.operation import Operation
-
+from .job import Job
+from .operation import Operation
 from .task import Task
 from .worker import Worker
 

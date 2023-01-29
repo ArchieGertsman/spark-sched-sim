@@ -15,8 +15,7 @@ class DynamicPartitionAgent(BaseAgent):
 
 
     def invoke(self, obs):
-        (_,
-         num_source_workers,
+        (num_source_workers,
          source_job_id, 
          schedulable_ops, 
          active_jobs,

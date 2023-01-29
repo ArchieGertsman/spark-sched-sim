@@ -1,5 +1,3 @@
-import numpy as np
-
 from .task import Task
 
 
@@ -14,11 +12,19 @@ class Features:
 
 class Operation:
 
-    def __init__(self, id, job_id, num_tasks, task_duration, rough_duration):
+    def __init__(self, 
+                 id, 
+                 job_id, 
+                 num_tasks, 
+                 task_duration, 
+                 rough_duration, 
+                 np_random):
         self.id_ = id
         self.job_id = job_id
         self.task_duration = task_duration
         self.rough_duration = rough_duration
+        self.np_random = np_random
+
         self.most_recent_duration = rough_duration
 
         self.num_tasks = num_tasks
@@ -90,16 +96,6 @@ class Operation:
 
         # self.completed_tasks.add(task)
         self.num_completed_tasks += 1
-        
-
-
-    def check_criterion(self, criterion):
-        if criterion == 'saturated':
-            return self.saturated
-        elif criterion == 'completed':
-            return self.completed
-        else:
-            raise Exception('Operation.check_criterion: invalid criterion')
 
 
 
@@ -113,7 +109,7 @@ class Operation:
             executor_key = left_exec
 
         else:
-            rand_pt = np.random.randint(1, right_exec - left_exec + 1)
+            rand_pt = self.np_random.integers(1, right_exec - left_exec + 1)
             if rand_pt <= num_executors - left_exec:
                 executor_key = left_exec
             else:
@@ -147,13 +143,13 @@ class Operation:
                 # (1) try to directly retrieve the warmup delay from data
                 fresh_durations = \
                     self.task_duration['fresh_durations'][executor_key]
-                i = np.random.randint(len(fresh_durations))
+                i = self.np_random.integers(len(fresh_durations))
                 duration = fresh_durations[i]
             else:
                 # (2) use first wave but deliberately add in a warmup delay
                 first_wave = \
                     self.task_duration['first_wave'][executor_key]
-                i = np.random.randint(len(first_wave))
+                i = self.np_random.integers(len(first_wave))
                 duration = first_wave[i] + 1000 # args.warmup_delay
 
         elif worker.task is not None and \
@@ -162,7 +158,7 @@ class Operation:
             # executor was working on this node
             # the task duration should be retrieved from rest wave
             rest_wave = self.task_duration['rest_wave'][executor_key]
-            i = np.random.randint(len(rest_wave))
+            i = self.np_random.integers(len(rest_wave))
             duration = rest_wave[i]
         else:
             # executor is fresh to this node, use first wave
@@ -170,14 +166,14 @@ class Operation:
                 # (1) try to retrieve first wave from data
                 first_wave = \
                     self.task_duration['first_wave'][executor_key]
-                i = np.random.randint(len(first_wave))
+                i = self.np_random.integers(len(first_wave))
                 duration = first_wave[i]
             else:
                 # (2) first wave doesn't exist, use fresh durations instead
                 # (should happen very rarely)
                 fresh_durations = \
                     self.task_duration['fresh_durations'][executor_key]
-                i = np.random.randint(len(fresh_durations))
+                i = self.np_random.integers(len(fresh_durations))
                 duration = fresh_durations[i]
 
         return duration

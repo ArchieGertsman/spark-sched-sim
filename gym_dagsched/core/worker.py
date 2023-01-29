@@ -10,7 +10,7 @@ class Worker:
 
 
     @property
-    def available(self):
+    def is_free(self):
         return self.task == None
 
     

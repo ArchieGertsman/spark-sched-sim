@@ -15,7 +15,7 @@ from torch_geometric.data import Batch
 from torch_scatter import segment_add_csr
 
 from ..envs.dagsched_env import DagSchedEnv
-from ..envs.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
+from ..wrappers.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
@@ -43,6 +43,8 @@ def train(agent,
           max_time_mean_init,
           max_time_mean_growth,
           max_time_mean_ceil,
+          moving_delay,
+          reward_scale,
           writer):
     '''trains the model on different job arrival sequences. 
     Multiple episodes are run on each sequence in parallel.
@@ -76,13 +78,16 @@ def train(agent,
 
         # send episode data to each of the workers.
         for conn in conns:
-            conn.send(
-                (num_job_arrivals, 
-                 num_init_jobs, 
-                 job_arrival_rate, 
-                 num_workers, 
-                 max_time, 
-                 entropy_weight))
+            options = {
+                'num_init_jobs': num_init_jobs,
+                'num_job_arrivals': num_job_arrivals,
+                'job_arrival_rate': job_arrival_rate,
+                'num_workers': num_workers,
+                'max_wall_time': max_time,
+                'moving_delay': moving_delay,
+                'reward_scale': reward_scale
+            }
+            conn.send((options, entropy_weight))
 
         # wait for rewards and wall times
         rewards_list, wall_times_list = \
@@ -121,7 +126,7 @@ def train(agent,
                 'max wall time': max_time,
                 'completed jobs count': np.mean(completed_job_counts),
                 'avg reward per sec': \
-                    1e5 * diff_return_calc.avg_per_step_reward,
+                    diff_return_calc.avg_per_step_reward / reward_scale,
                 'avg return': \
                     np.mean([returns[0] for returns in diff_returns_list]),
                 'action loss': np.mean(action_losses),
@@ -231,8 +236,6 @@ def episode_runner(rank,
     
     i = 0
     while data := conn.recv():
-        np.random.seed(i)
-
         i += 1
         # receive episode data from parent process
         run_iteration(i, 
@@ -257,12 +260,7 @@ def run_iteration(i,
                   optim, 
                   conn, 
                   data):
-    (num_job_arrivals, 
-     num_init_jobs, 
-     job_arrival_rate, 
-     n_workers,
-     max_wall_time, 
-     entropy_weight) = data
+    options, entropy_weight = data
 
     prof = Profiler()
     # prof = None
@@ -272,13 +270,7 @@ def run_iteration(i,
 
     with HiddenPrints():
         experience = \
-            run_episode(env,
-                        agent,
-                        num_job_arrivals, 
-                        num_init_jobs, 
-                        job_arrival_rate, 
-                        n_workers,
-                        max_wall_time)
+            run_episode(env, agent, seed=i, options=options)
 
     wall_times, rewards = \
         list(zip(*[(exp.wall_time, exp.reward) 
@@ -338,29 +330,10 @@ class Experience:
 
 
 
-def run_episode(env,
-                agent,
-                num_job_arrivals,
-                num_init_jobs,
-                job_arrival_rate,
-                num_workers,
-                max_wall_time):  
-
-    obs = env.reset(num_init_jobs, 
-                    num_job_arrivals, 
-                    job_arrival_rate, 
-                    num_workers,
-                    max_wall_time)
+def run_episode(env, agent, seed, options):  
+    obs, _ = env.reset(seed, options)
 
     done = False
-
-    # maintain a cached dag batch,
-    # since graph structure doesn't
-    # always change (i.e. number of
-    # nodes may stay the same). Node
-    # features always get updated.
-    dag_batch_device = None
-    job_ptr = None
 
     # save experience from each step
     # of the episode, to later be used
@@ -378,7 +351,8 @@ def run_episode(env,
          _) = obs
 
         env_action, raw_action = agent.invoke(obs)
-        obs, reward, done = env.step(env_action)
+        obs, reward, terminated, truncated, _ = \
+            env.step(env_action)
 
         *_, wall_time = obs
 
@@ -391,6 +365,8 @@ def run_episode(env,
                         wall_time,
                         raw_action,
                         reward)]
+
+        done = (terminated or truncated)
 
     return experience
 

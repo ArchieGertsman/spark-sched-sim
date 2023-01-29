@@ -37,6 +37,8 @@ def main():
           max_time_mean_init=2e6,
           max_time_mean_growth=1.6e3,
           max_time_mean_ceil=2e7,
+          moving_delay=2000.,
+          reward_scale=1e-5,
           writer=writer)
 
     if writer:
@@ -53,13 +55,10 @@ def setup():
 
     sys.stdout = open(f'log/proc/main.out', 'a')
 
-    # torch.autograd.set_detect_anomaly(True)
     set_start_method('forkserver')
 
-    torch.manual_seed(69)
-    np.random.seed(69)
-
-    # torch.set_num_threads(1)
+    torch.manual_seed(42)
+    np.random.seed(42)
 
     print('cuda available:', torch.cuda.is_available())
 

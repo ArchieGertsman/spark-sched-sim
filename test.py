@@ -4,10 +4,10 @@ import sys
 
 import numpy as np
 import torch
+import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from gym_dagsched.envs.dagsched_env import DagSchedEnv
-from gym_dagsched.envs.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
+from gym_dagsched.wrappers.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
 from gym_dagsched.agents.decima_agent import DecimaAgent
 from gym_dagsched.agents.dynamic_partition_agent import DynamicPartitionAgent
 from gym_dagsched.utils.metrics import avg_job_duration
@@ -28,37 +28,43 @@ def main():
                     state_dict_path='model_20batch.pt',
                     device=device)
 
-    base_env = DagSchedEnv()
+    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
     wrapped_env = DagSchedEnvDecimaWrapper(base_env)
 
-    num_tests = 10
-    heuristic_results = test(base_env, heuristic_agent, num_tests, num_workers)
-    decima_results = test(wrapped_env, decima_agent, num_tests, num_workers)
+    options = {
+        'num_init_jobs': 20,
+        'num_job_arrivals': 0,
+        'job_arrival_rate': 0.,
+        'num_workers': num_workers,
+        'max_wall_time': np.inf,
+        'moving_delay': 2000.,
+        'reward_scale': 1e-5
+    }
 
-    plt.plot(np.arange(num_tests), heuristic_results, label=heuristic_agent.name)
-    plt.plot(np.arange(num_tests), decima_results, label=decima_agent.name)
-    plt.legend()
-    plt.savefig('results.png')
+    num_tests = 1
+
+    heuristic_results = test(base_env, heuristic_agent, num_tests, options)
+    print(heuristic_results)
+
+    decima_results = test(wrapped_env, decima_agent, num_tests, options)
+    print(decima_results)
+
+    # plt.plot(np.arange(num_tests), heuristic_results, label=heuristic_agent.name)
+    # plt.plot(np.arange(num_tests), decima_results, label=decima_agent.name)
+    # plt.legend()
+    # plt.savefig('results.png')
 
 
 
 
-def test(env, agent, num_tests, num_workers):
+def test(env, agent, num_tests, options):
     avg_job_durations = []
 
     for i in range(num_tests):
         print(f'{agent.name}: iteration {i+1}', flush=True)
-        np.random.seed(i)
         
         with HiddenPrints():
-            run_episode(env,
-                        agent,
-                        num_job_arrivals=0,
-                        num_init_jobs=20,
-                        job_arrival_rate=0,
-                        num_workers=num_workers,
-                        max_wall_time=np.inf)
-
+            run_episode(env, agent, i, options)
             avg_job_durations += [avg_job_duration(env)*1e-3]
 
     return avg_job_durations
@@ -66,27 +72,20 @@ def test(env, agent, num_tests, num_workers):
 
 
 
-def run_episode(env,
-                agent,
-                num_job_arrivals,
-                num_init_jobs,
-                job_arrival_rate,
-                num_workers,
-                max_wall_time):  
-
-    obs = env.reset(num_init_jobs, 
-                    num_job_arrivals, 
-                    job_arrival_rate, 
-                    num_workers,
-                    max_wall_time)
+def run_episode(env, agent, seed, options):  
+    obs, _ = env.reset(seed=seed, options=options)
 
     done = False
     rewards = []
     
     while not done:
         action = agent(obs)
-        obs, reward, done = env.step(action)
+
+        obs, reward, terminated, truncated, _ = \
+            env.step(action)
+
         rewards += [reward]
+        done = (terminated or truncated)
 
     return rewards
 
@@ -100,7 +99,6 @@ def setup():
     sys.stdout = open(f'log/proc/main.out', 'a')
 
     torch.manual_seed(0)
-    np.random.seed(0)
 
     print('cuda available:', torch.cuda.is_available())
 

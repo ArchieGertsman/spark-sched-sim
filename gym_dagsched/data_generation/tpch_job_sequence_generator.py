@@ -1,29 +1,32 @@
 
 import numpy as np
 import networkx as nx
-from torch_geometric.utils.convert import from_networkx
 
-from .datagen import DataGen
-from ..entities.job import Job
-from ..entities.operation import Operation
-
-
-class TPCHDataGen(DataGen):
+from .job_sequence_generator import JobSequenceGenerator
+from ..core.job import Job
+from ..core.operation import Operation
 
 
-    def _job(self, id, t_arrival):
-        tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
-        query_size = tpch_sizes[np.random.randint(len(tpch_sizes))]
+class TPCHJobSequenceGenerator(JobSequenceGenerator):
+    
+    def __init__(self):
+        self.query_base_path = './gym_dagsched/data_generation/tpch'
+        self.tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
+        self.num_queries = 22
+
+
+    def generate_job(self, job_id, t_arrival):
+        query_size = self.np_random.choice(self.tpch_sizes)
+        query_path = f'{self.query_base_path}/{query_size}'
+        query_num = 1 + self.np_random.integers(self.num_queries)
         
-        tpch_num = 22
-        query_idx = str(np.random.randint(tpch_num) + 1)
+        adj_matrix = \
+            np.load(f'{query_path}/adj_mat_{query_num}.npy', 
+                    allow_pickle=True)
 
-        query_path = f'./gym_dagsched/data_generation/tpch/{query_size}/'
-        
-        adj_matrix = np.load(
-            query_path + 'adj_mat_' + str(query_idx) + '.npy', allow_pickle=True)
-        task_durations = np.load(
-            query_path + 'task_duration_' + str(query_idx) + '.npy', allow_pickle=True).item()
+        task_durations = \
+            np.load(f'{query_path}/task_duration_{query_num}.npy', 
+                    allow_pickle=True).item()
         
         assert adj_matrix.shape[0] == adj_matrix.shape[1]
         assert adj_matrix.shape[0] == len(task_durations)
@@ -46,8 +49,12 @@ class TPCHDataGen(DataGen):
                 [i for l in task_duration['fresh_durations'].values() for i in l])
 
             # generate a node
-            # op = Operation(op_id, id, num_tasks, np.array([rough_duration]))
-            op = Operation(op_id, id, num_tasks, task_duration, rough_duration)
+            op = Operation(op_id, 
+                           job_id, 
+                           num_tasks, 
+                           task_duration, 
+                           rough_duration, 
+                           self.np_random)
             ops += [op]
 
         # generate DAG
@@ -55,7 +62,7 @@ class TPCHDataGen(DataGen):
             adj_matrix, create_using=nx.DiGraph)
         for _,_,d in dag.edges(data=True):
             d.clear()
-        job = Job(id_=id, ops=ops, dag=dag, t_arrival=t_arrival)
+        job = Job(id_=job_id, ops=ops, dag=dag, t_arrival=t_arrival)
         
         return job
 
@@ -86,10 +93,6 @@ class TPCHDataGen(DataGen):
 
         # swap the first wave with fresh durations removed
         task_duration['first_wave'] = clean_first_wave
-
-
-
-
 
 
 

@@ -76,10 +76,10 @@ class Job:
 
         self.frontier_ops.remove(op)
 
-        new_ops = self.find_new_frontier_ops(op, 'completed')
+        new_ops = self.find_new_frontier_ops(op)
         self.frontier_ops |= new_ops
 
-        return len(new_ops) > 0 or self.completed
+        return len(new_ops) > 0
             
 
 
@@ -89,6 +89,7 @@ class Job:
         '''
         assert len(self.frontier_ops) == 0
         self.frontier_ops |= self.source_ops()
+
 
 
     def source_ops(self):
@@ -115,14 +116,13 @@ class Job:
 
 
 
-    def find_new_frontier_ops(self, op, criterion):
+    def find_new_frontier_ops(self, op):
         '''if `op` is completed, returns all of its
         successors whose other dependencies are also 
         completed, if any exist.
         '''
-        assert criterion in ['saturated', 'completed']
 
-        if not op.check_criterion(criterion):
+        if not op.completed:
             return set()
 
         new_ops = set()
@@ -131,51 +131,23 @@ class Job:
             # if all dependencies are satisfied, then
             # add this child to the frontiers
             new_op = self.ops[suc_op_id]
-            if not new_op.check_criterion(criterion) and \
-               self.check_dependencies(suc_op_id, criterion):
+            if not new_op.completed and \
+               self.check_dependencies(suc_op_id):
                 new_ops.add(new_op)
         
         return new_ops
 
 
 
-    def check_dependencies(self, op_id, criterion):
+    def check_dependencies(self, op_id):
         '''searches to see if all the dependencies of operation 
         with id `op_id` are satisfied.
         '''
         for dep_id in self.dag.predecessors(op_id):
-            if not self.ops[dep_id].check_criterion(criterion):
+            if not self.ops[dep_id].completed:
                 return False
 
         return True
-
-
-
-    def populate_remaining_times(self):
-        '''populates the `remaining_time` field for each operation
-        within this job via BFS. The remaining time of an operation
-        is defined recursively as its expected duration plus the 
-        remaining times of each of its children.
-        '''
-        # def _populate_recursive(op):
-        #     op.remaining_time = \
-        #         op.task_duration[op.task_duration<np.inf].mean()
-
-        #     if self.dag.out_degree(op.id_) == 0:
-        #         return
-
-        #     for child_op_id in self.dag.successors(op.id_):
-        #         child_op = self.ops[child_op_id]
-        #         _populate_recursive(child_op)
-        #         op.remaining_time += child_op.remaining_time
-            
-
-        # src_ops = self.find_src_ops()
-        # # populate each connected component of the dag
-        # while len(src_ops) > 0:
-        #     op = src_ops.pop()
-        #     _populate_recursive(op)
-        pass
 
 
 

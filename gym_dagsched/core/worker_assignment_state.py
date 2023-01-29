@@ -5,9 +5,13 @@ GENERAL_POOL_KEY = (None, None)
 
 
 class WorkerAssignmentState:
-    '''Keeps track of the state of worker assignments. 
+    '''Maintains all worker assignments. These include:
+    - current location of each worker, called a 'pool' 
+    - commitments from one worker pool to another, and 
+    - the workers moving between pools.
+
     The following worker pools exist:
-    - Null pool (key `None`): not an actual pool;
+    - Placeholder pool (key `None`): not an actual pool;
       it never contains any workers. the worker source
       is set to null pool when no pool is ready to schedule 
       its workers.
@@ -23,33 +27,38 @@ class WorkerAssignmentState:
     def reset(self, num_workers):
         # worker id -> key of pool where the worker
         # currently resides
-        self._worker_locations = \
-            {worker_id: GENERAL_POOL_KEY
-             for worker_id in range(num_workers)}
+        self._worker_locations = {
+            worker_id: GENERAL_POOL_KEY
+            for worker_id in range(num_workers)
+        }
 
         # pool key -> set of id's of workers who
         # reside at this pool
-        self._pools = \
-            {None: set(),
-             GENERAL_POOL_KEY: set(range(num_workers))}
+        self._pools = {
+            None: set(),
+            GENERAL_POOL_KEY: set(range(num_workers))
+        }
 
         # pool key A -> 
         #   (pool key B -> 
         #       number of commitments from 
         #       pool A to pool B)
-        self._commitments = \
-            {None: {},
-             GENERAL_POOL_KEY: {}}
+        self._commitments = {
+            None: {},
+            GENERAL_POOL_KEY: {}
+        }
 
         # pool key -> total number of outgoing commitments
         # from this pool
-        self._num_commitments_from = \
-            {None: 0,
-             GENERAL_POOL_KEY: 0}
+        self._num_commitments_from = {
+            None: 0,
+            GENERAL_POOL_KEY: 0
+        }
 
         # op pool key -> total number of commitments to op
-        self._num_commitments_to_op = \
-            {GENERAL_POOL_KEY: 0}
+        self._num_commitments_to_op = {
+            GENERAL_POOL_KEY: 0
+        }
 
         # op pool key -> number of workers moving to op
         self._num_moving_to_op = {}
@@ -57,8 +66,9 @@ class WorkerAssignmentState:
         # job id -> size of job's pool plus the total number
         # of external commitments and moving workers to any 
         # of its operations
-        self._total_worker_count = \
-            {None: 0}
+        self._total_worker_count = {
+            None: 0
+        }
 
         # initialize worker source
         self._curr_source = GENERAL_POOL_KEY
