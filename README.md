@@ -1,6 +1,6 @@
 # gym-dagsched
 
-A dag scheduling environment in the style of [Gymnasium](https://github.com/Farama-Foundation/Gymnasium).
+A dag scheduling environment adhering to the [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) interface.
 
 What is (job) dag scheduling?
 - a job dag (directed acyclic graph) is used to represent jobs made of operations (nodes) that depend on each other (edges). A dependency A->B means that A must complete before B can begin.
@@ -10,16 +10,13 @@ What is (job) dag scheduling?
 
 Example: a cloud computing cluster is responsible for receiving jobs (aka workflows) and executing them using its resources. A machine learning workflow may consist of numerous operations, such as data preperation, training/validation, hyperparameter tuning, testing, etc. These operations depend on each other, e.g. data prep comes before training. Data prep can further be broken into identical tasks, where each task entails prepping a different shard of the data, and these tasks can easily be parallelized.
 
-This repository is a complete re-implementaion of the [Decima codebase](https://github.com/hongzimao/decima-sim) [1]. Key features of this version:
+This repository is a re-implementaion of the [Decima codebase](https://github.com/hongzimao/decima-sim) [1]. Key features of this version:
 - PyTorch is used in place of TensorFlow 1.x 
 - [PyTorch Geometric](https://github.com/pyg-team/pytorch_geometric) is used for the graph neural network part instead of coding it from scratch
-- An asynchronous training algorithm is included like in the original codebase, but an additional synchronous algorithm is also included, using techniques from [2]
 - I plan to implement other policy-gradient methods such as PPO [3], in addition to the original REINFORCE
 - I am actively attempting to improve the organization and documentation of the code
 
 [[1]](https://dl.acm.org/doi/abs/10.1145/3341302.3342080) Mao, H., Schwarzkopf, M., Venkatakrishnan, S.B., Meng, Z. and Alizadeh, M., 2019. Learning scheduling algorithms for data processing clusters. In Proceedings of the ACM special interest group on data communication (pp. 270-288).
-
-[[2]](https://arxiv.org/pdf/1803.02811.pdf) Stooke, A. and Abbeel, P., 2018. Accelerated methods for deep reinforcement learning. arXiv preprint arXiv:1803.02811.
 
 [[3]](https://arxiv.org/pdf/1707.06347.pdf) Schulman, J., Wolski, F., Dhariwal, P., Radford, A. and Klimov, O., 2017. Proximal policy optimization algorithms. arXiv preprint arXiv:1707.06347.
 

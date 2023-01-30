@@ -3,15 +3,15 @@ from gymnasium import Env, spaces
 
 from ..core.worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_KEY
 from ..core.timeline import JobArrival, TaskCompletion, WorkerArrival
-from ..core.worker import Worker
-from ..data_generation.tpch_job_sequence_generator import TPCHJobSequenceGenerator
+from ..core.entities.worker import Worker
+from ..core.data_generators.tpch_job_sequence_gen import TPCHJobSequenceGen
 
 
 
 class DagSchedEnv(Env):
 
     def __init__(self):
-        self._datagen = TPCHJobSequenceGenerator()
+        self._datagen = TPCHJobSequenceGen()
         self._state = WorkerAssignmentState()
         self.action_space = spaces.Space()
         self.observation_space = spaces.Space()
@@ -21,67 +21,46 @@ class DagSchedEnv(Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
+        self.num_workers = options['num_workers']
+        self.num_total_jobs = options['num_init_jobs'] + \
+                              options['num_job_arrivals']
+        self.max_wall_time = options['max_wall_time']
         self.reward_scale = options['reward_scale']
         self.moving_cost = options['moving_delay']
-
+        
         self.timeline = \
             self._datagen.new_timeline(self.np_random,
                                        options['num_init_jobs'], 
                                        options['num_job_arrivals'], 
                                        options['job_arrival_rate'])
 
-        self.num_workers = options['num_workers']
-
-        self.max_wall_time = options['max_wall_time']
-
-        self.num_total_jobs = \
-            options['num_init_jobs'] + options['num_job_arrivals']
-
         self.workers = [Worker(i) for i in range(self.num_workers)]
-        
-        # list of worker objects which are to be scheduled
-        # to complete tasks within the simulation
-        self.num_workers = len(self.workers)
 
-        # wall clock time, keeps increasing throughout
-        # the simulation
+        self._state.reset(self.num_workers)
+
         self.wall_time = 0.
 
-        # dict which maps job id to job object
-        # for each job that has arrived into the
-        # system
         self.jobs = {
             i: e.job 
             for i, (*_, e) in enumerate(self.timeline.pq)
         }
 
-        # list of ids of all active jobs
         self.active_job_ids = set()
 
-        # list of ids of all completed jobs
         self.completed_job_ids = set()
 
         self.executor_interval_map = \
             self._make_executor_interval_map()
 
-        self._state.reset(self.num_workers)
+        self.terminated = False
+
+        self.truncated = False
 
         self.selected_ops = set()
 
-        self.terminated = False
-        self.truncated = False
+        self._load_initial_jobs()
 
-        # load all initial jobs into the system
-        # by stepping through the timeline
-        while not self.timeline.empty:
-            wall_time, event = self.timeline.peek()
-            if wall_time > 0:
-                break
-            self.timeline.pop()
-            self._process_scheduling_event(event)
-
-        schedulable_ops = self._find_schedulable_ops()
-        obs = self._observe(schedulable_ops)
+        obs = self._observe()
         return obs, {}
 
 
@@ -95,13 +74,13 @@ class DagSchedEnv(Env):
               self._state.num_workers_to_schedule(), 
               flush=True)
 
-        schedulable_ops = self._take_action(action)
+        self._take_action(action)
 
         if self._state.num_workers_to_schedule() > 0 and \
-           len(schedulable_ops) > 0:
+           len(self.schedulable_ops) > 0:
             # there are still scheduling decisions to be made, 
             # so consult the agent again
-            obs = self._observe(schedulable_ops)
+            obs = self._observe()
             return obs, 0, False, False, {}
             
         # scheduling round has completed
@@ -114,7 +93,7 @@ class DagSchedEnv(Env):
         old_wall_time = self.wall_time
         old_active_job_ids = self.active_job_ids.copy()
 
-        schedulable_ops = self._run_simulation()
+        self._resume_simulation()
 
         reward = self._calculate_reward(old_wall_time,
                                         old_active_job_ids)
@@ -122,23 +101,37 @@ class DagSchedEnv(Env):
         self.truncated = (self.wall_time >= self.max_wall_time)
 
         if not self.done:
-            print('starting new scheduling round', flush=True)
+            print('starting new scheduling round', 
+                  flush=True)
             assert self._state.num_workers_to_schedule() > 0 and \
-                   len(schedulable_ops) > 0
+                   len(self.schedulable_ops) > 0
         else:
-            print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
+            print(f'done at {self.wall_time*1e-3:.1f}s', 
+                  flush=True)
 
         # if the episode isn't done, then start a new scheduling 
         # round at the current worker source
-        obs = self._observe(schedulable_ops)
+        obs = self._observe()
         return obs, reward, self.terminated, self.truncated, {}
+
+
+
+    def _load_initial_jobs(self):
+        while not self.timeline.empty:
+            wall_time, event = self.timeline.peek()
+            if wall_time > 0:
+                break
+            self.timeline.pop()
+            self._process_scheduling_event(event)
+
+        self.schedulable_ops = self._find_schedulable_ops()
 
 
 
     def _take_action(self, action):
         if action is None:
             self._commit_remaining_workers()
-            return self.schedulable_ops
+            return
 
         (job_id, op_id), num_workers = action
         print('action:', (job_id, op_id), num_workers)
@@ -169,13 +162,12 @@ class DagSchedEnv(Env):
         self.selected_ops.add(op)
 
         # find remaining schedulable operations
-        schedulable_ops = self._find_schedulable_ops()
-        return schedulable_ops
+        self.schedulable_ops = self._find_schedulable_ops()
 
 
 
-    def _run_simulation(self):
-        '''runs the simulation until either there are
+    def _resume_simulation(self):
+        '''resumes the simulation until either there are
         new scheduling decisions to be made, or it's done.
         '''
         assert not self.timeline.empty
@@ -199,7 +191,7 @@ class DagSchedEnv(Env):
             self._move_free_workers()
             self._state.clear_worker_source()
 
-        return schedulable_ops
+        self.schedulable_ops = schedulable_ops
 
 
 
@@ -220,13 +212,9 @@ class DagSchedEnv(Env):
         return self.terminated or self.truncated
 
 
-    def _observe(self, schedulable_ops):
+    def _observe(self):
         if not self.done:
-            assert len(schedulable_ops) > 0
-
-        # save the set of schedulable ops to later varify
-        # that the agent selected one of them
-        self.schedulable_ops = schedulable_ops
+            assert len(self.schedulable_ops) > 0
 
         active_jobs = {}
         for job_id in iter(self.active_job_ids):
@@ -244,7 +232,7 @@ class DagSchedEnv(Env):
 
         return self._state.num_workers_to_schedule(), \
                self._state.source_job_id(), \
-               schedulable_ops, \
+               self.schedulable_ops, \
                active_jobs, \
                self.wall_time
 

@@ -2,10 +2,10 @@ import heapq
 import itertools
 from dataclasses import dataclass
 
-from .job import Job
-from .operation import Operation
-from .task import Task
-from .worker import Worker
+from .entities.job import Job
+from .entities.operation import Operation
+from .entities.task import Task
+from .entities.worker import Worker
 
 
 @dataclass

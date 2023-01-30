@@ -9,7 +9,7 @@ from ..utils.pyg import construct_subbatch
 
 
 
-class DagSchedEnvDecimaWrapper(Wrapper):
+class DecimaWrapper(Wrapper):
     '''Wrapper around `DagSchedEnv`, which parses
     observations from the env into model inputs,
     and parses actions from the agent for the env
@@ -17,26 +17,6 @@ class DagSchedEnvDecimaWrapper(Wrapper):
 
     def __init__(self, env):
         super().__init__(env)
-
-    @property
-    def active_job_ids(self):
-        return self.env.active_job_ids
-
-    @property
-    def completed_job_ids(self):
-        return self.env.completed_job_ids
-
-    @property
-    def num_completed_jobs(self):
-        return self.env.num_completed_jobs
-
-    @property
-    def jobs(self):
-        return self.env.jobs
-
-    @property
-    def wall_time(self):
-        return self.env.wall_time
 
 
 
@@ -65,18 +45,18 @@ class DagSchedEnvDecimaWrapper(Wrapper):
 
 
 
-    def step(self, action):
-        action = self.action(action)
+    def step(self, act):
+        act = self.action(act)
 
-        obs, *rest = self.env.step(action)
+        obs, *rest = self.env.step(act)
 
         obs = self.observation(obs)
         return obs, *rest
 
 
 
-    def action(self, action):
-        (job_id, active_op_idx), prlsm_lim = action
+    def action(self, act):
+        (job_id, active_op_idx), prlsm_lim = act
 
         # parse operation
         job = self.env.jobs[job_id]
@@ -93,8 +73,8 @@ class DagSchedEnvDecimaWrapper(Wrapper):
 
         worker_count = min(worker_count, num_source_workers)
 
-        action = ((job_id, op_id), worker_count)
-        return action
+        act = ((job_id, op_id), worker_count)
+        return act
 
 
 
@@ -138,6 +118,28 @@ class DagSchedEnvDecimaWrapper(Wrapper):
                active_job_ids, \
                num_source_workers, \
                wall_time
+
+
+
+    @property
+    def active_job_ids(self):
+        return self.env.active_job_ids
+
+    @property
+    def completed_job_ids(self):
+        return self.env.completed_job_ids
+
+    @property
+    def num_completed_jobs(self):
+        return self.env.num_completed_jobs
+
+    @property
+    def jobs(self):
+        return self.env.jobs
+
+    @property
+    def wall_time(self):
+        return self.env.wall_time
 
 
 

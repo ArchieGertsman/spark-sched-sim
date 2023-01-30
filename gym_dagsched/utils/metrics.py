@@ -1,19 +1,23 @@
 import numpy as np
 
+
+
+
 def avg_job_duration(env):
-    durations = []
-    for job in env.jobs.values():
-        t_completed = min(job.t_completed, env.wall_time)
-        duration = t_completed - job.t_arrival
-        durations += [duration]
-    return np.mean(durations)
+    assert env.n_completed_jobs > 0
+
+    jobs = (env.jobs[job_id] 
+            for job_id in env.completed_job_ids)
+
+    return np.mean([job.t_completed - job.t_arrival 
+                    for job in jobs])
+
 
 
 def makespan(env):
     assert env.n_completed_jobs > 0
-    completion_times = np.array([
-        env.jobs[j].t_completed
-        for j in env.completed_job_ids
-    ])
-    completion_times = completion_times[completion_times<np.inf]
-    return completion_times.max()
+
+    jobs = (env.jobs[job_id] 
+            for job_id in env.completed_job_ids)
+
+    return max(job.t_completed for job in jobs)

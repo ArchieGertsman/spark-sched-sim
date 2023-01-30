@@ -2,72 +2,112 @@ import os
 import shutil
 import sys
 
+
+import pandas as pd
 import numpy as np
 import torch
+from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from gym_dagsched.wrappers.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
-from gym_dagsched.agents.decima_agent import DecimaAgent
-from gym_dagsched.agents.dynamic_partition_agent import DynamicPartitionAgent
+from gym_dagsched.wrappers.decima_wrapper import DecimaWrapper
 from gym_dagsched.utils.metrics import avg_job_duration
 from gym_dagsched.utils.hidden_prints import HiddenPrints
-from gym_dagsched.utils.device import device
+
+from gym_dagsched.agents.decima_agent import DecimaAgent
+from gym_dagsched.agents.fifo_agent import FIFOAgent
+from gym_dagsched.agents.scpt_agent import SCPTAgent
+
 
 
 
 def main():
     setup()
 
-    num_workers = 10
+    num_tests = 100
 
-    heuristic_agent = DynamicPartitionAgent(num_workers)
+    num_workers = 20
+
+    # should be greater than the number of epochs the
+    # model was trained on, so that the job sequences
+    # are unseen
+    base_seed = 500
+
+    model_dir = 'gym_dagsched/models'
+
+    fifo_agent = FIFOAgent(num_workers)
+    scpt_agent = SCPTAgent(num_workers)
+    dynamic_fifo_agent = FIFOAgent(num_workers, dynamic=True)
+    dynamic_scpt_agent = SCPTAgent(num_workers, dynamic=True)
     decima_agent = \
         DecimaAgent(num_workers,
                     mode='eval', 
-                    state_dict_path='model_20batch.pt',
-                    device=device)
+                    state_dict_path=\
+                        f'{model_dir}/model_20b_10w_150ep.pt')
 
     base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
-    wrapped_env = DagSchedEnvDecimaWrapper(base_env)
+    wrapped_env = DecimaWrapper(base_env)
 
-    options = {
+    env_options = {
+        'num_workers': num_workers,
         'num_init_jobs': 20,
         'num_job_arrivals': 0,
         'job_arrival_rate': 0.,
-        'num_workers': num_workers,
         'max_wall_time': np.inf,
         'moving_delay': 2000.,
         'reward_scale': 1e-5
     }
 
-    num_tests = 1
+    test_instances = [
+        (fifo_agent, base_env, num_tests, base_seed, env_options),
+        (scpt_agent, base_env, num_tests, base_seed, env_options),
+        (dynamic_fifo_agent, base_env, num_tests, base_seed, env_options),
+        (dynamic_scpt_agent, base_env, num_tests, base_seed, env_options),
+        (decima_agent, wrapped_env, num_tests, base_seed, env_options)
+    ]
 
-    heuristic_results = test(base_env, heuristic_agent, num_tests, options)
-    print(heuristic_results)
+    # run tests in parallel using multiprocessing
+    with Pool(len(test_instances)) as p:
+        test_results = p.map(test, test_instances)
 
-    decima_results = test(wrapped_env, decima_agent, num_tests, options)
-    print(decima_results)
+    agent_names = [agent.name for agent, *_ in test_instances]
 
-    # plt.plot(np.arange(num_tests), heuristic_results, label=heuristic_agent.name)
-    # plt.plot(np.arange(num_tests), decima_results, label=decima_agent.name)
-    # plt.legend()
-    # plt.savefig('results.png')
-
-
+    visualize_results('job_duration_cdf.png', 
+                      agent_names, 
+                      test_results, 
+                      env_options)
 
 
-def test(env, agent, num_tests, options):
+
+def test(instance):
+    sys.stdout = open(f'log/proc/main.out', 'a')
+    torch.manual_seed(42)
+    torch.set_num_threads(1)
+
+    agent, env, num_tests, base_seed, env_options = instance
+
     avg_job_durations = []
 
     for i in range(num_tests):
         print(f'{agent.name}: iteration {i+1}', flush=True)
         
         with HiddenPrints():
-            run_episode(env, agent, i, options)
+            run_episode(env, agent, base_seed + i, env_options)
             avg_job_durations += [avg_job_duration(env)*1e-3]
 
-    return avg_job_durations
+    return np.array(avg_job_durations)
+
+
+
+
+def compute_CDF(arr, num_bins=100):
+    """
+    usage: x, y = compute_CDF(arr):
+           plt.plot(x, y)
+    """
+    values, base = np.histogram(arr, bins=num_bins)
+    cumulative = np.cumsum(values)
+    return base[:-1], cumulative / float(cumulative[-1])
 
 
 
@@ -91,6 +131,36 @@ def run_episode(env, agent, seed, options):
 
 
 
+def visualize_results(out_fname, 
+                      agent_names, 
+                      test_results, 
+                      env_options):
+
+    # plot CDF's
+    for agent_name, avg_job_durations in zip(agent_names, 
+                                             test_results):
+        x, y = compute_CDF(avg_job_durations)
+        plt.plot(x, y, label=agent_name)
+
+    # display environment options in a table
+    plt.table(cellText=\
+                [[key,val] 
+                for key,val in env_options.items()],
+            colWidths=[.25, .1],
+            cellLoc='center', 
+            rowLoc='center',
+            loc='right')
+
+    plt.tight_layout()
+    plt.legend(bbox_to_anchor=(1, 1), loc='upper left')
+    plt.xlabel('Average job duration (s)')
+    plt.ylabel('CDF')
+    num_tests = len(test_results[0])
+    plt.title(f'CDF of avg. job duration over {num_tests} runs')
+    plt.savefig(out_fname, bbox_inches='tight')
+
+
+
 
 def setup():
     shutil.rmtree('log/proc/', ignore_errors=True)
@@ -98,9 +168,9 @@ def setup():
 
     sys.stdout = open(f'log/proc/main.out', 'a')
 
-    torch.manual_seed(0)
+    set_start_method('forkserver')
 
-    print('cuda available:', torch.cuda.is_available())
+    torch.manual_seed(42)
 
 
 

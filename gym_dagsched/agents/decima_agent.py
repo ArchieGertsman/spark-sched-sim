@@ -49,8 +49,11 @@ class DecimaAgent(BaseAgent):
 
 
 
-
     def invoke(self, obs):
+        '''assumes that `DecimaWrapper` is providing
+        observations of the environment and receiving
+        actions returned here.
+        '''
         (did_update_dag_batch,
          dag_batch,
          valid_ops_mask,
@@ -107,10 +110,14 @@ class DecimaAgent(BaseAgent):
                       dag_scores, 
                       job_ptr,
                       active_job_ids):
+        '''Returns a tuple `(env_action, raw_action)`, where 
+        `env_action` is the action sent to `DecimaWrapper`, and 
+        `raw_action` can be stored in experience by a training 
+        algorithm.
+        '''
         # select the next operation to schedule
         op_sample = \
-            Categorical(logits=node_scores) \
-                .sample()
+            Categorical(logits=node_scores).sample()
 
         op_env, job_idx = \
             self.translate_op(op_sample.item(), 
@@ -119,9 +126,7 @@ class DecimaAgent(BaseAgent):
 
         # select the number of workers to schedule
         num_workers_sample = \
-            Categorical(logits=dag_scores[job_idx]) \
-                .sample()
-        num_workers_env = 1 + num_workers_sample.item()
+            Categorical(logits=dag_scores[job_idx]).sample()
 
         # action that's recorded in experience, 
         # later used during training
@@ -130,6 +135,7 @@ class DecimaAgent(BaseAgent):
                       num_workers_sample)
 
         # action that gets sent to the env
+        num_workers_env = 1 + num_workers_sample.item()
         env_action = (op_env, num_workers_env)
 
         return env_action, raw_action
@@ -223,8 +229,9 @@ class ActorNetwork(nn.Module):
                                      dtype=torch.long)
             torch.cumsum(num_dags_per_obs, 0, out=obs_indptr[1:])
             
-            num_nodes_per_obs = segment_add_csr(num_nodes_per_dag, 
-                                        obs_indptr)
+            num_nodes_per_obs = \
+                segment_add_csr(num_nodes_per_dag, 
+                                obs_indptr)
 
         return obs_indptr, \
                num_nodes_per_dag, \
@@ -234,15 +241,12 @@ class ActorNetwork(nn.Module):
 
 
 
-
 def make_mlp(in_ch, out_ch, h1=16, h2=8):
-    return nn.Sequential(
-        nn.Linear(in_ch, h1),
-        nn.ReLU(inplace=True),
-        nn.Linear(h1, h2),
-        nn.ReLU(inplace=True),
-        nn.Linear(h2, out_ch)
-    )
+    return nn.Sequential(nn.Linear(in_ch, h1),
+                         nn.ReLU(inplace=True),
+                         nn.Linear(h1, h2),
+                         nn.ReLU(inplace=True),
+                         nn.Linear(h2, out_ch))
         
 
 
@@ -260,16 +264,15 @@ class GCNConv(MessagePassing):
         # lift input into a higher dimension
         x_prep = self.mlp_prep(x)
 
-        x_agg = self.propagate(edge_index, x=x_prep)
+        x_proc = self.mlp_proc(x_prep)
+        x_agg = self.propagate(edge_index, x=x_proc)
 
         x_out = x_prep + x_agg
-
         return x_out
 
 
 
     def message_and_aggregate(self, adj_t, x):
-        x = self.mlp_proc(x)
         return matmul(adj_t, x, reduce=self.aggr)
 
 
@@ -314,8 +317,8 @@ class GraphEncoderNetwork(nn.Module):
     def _compute_node_embeddings(self, dag_batch):
         '''one embedding per node, per dag'''
         assert hasattr(dag_batch, 'adj')
-        # achieve flow from leaves to roots
-        # by *not* taking transpose of `adj`
+        # achieve flow from leaves to roots by *not* taking 
+        # transpose of `adj`
         return self.graph_conv(dag_batch.x, dag_batch.adj)
     
 
@@ -393,24 +396,24 @@ class PolicyNetwork(nn.Module):
                 num_dags_per_obs):
         node_features = dag_batch.x
 
-        node_scores = self._compute_node_scores(
-            node_features, 
-            node_embeddings, 
-            dag_embeddings, 
-            global_embeddings, 
-            num_nodes_per_dag, 
-            num_nodes_per_obs)
+        node_scores = \
+            self._compute_node_scores(node_features, 
+                                      node_embeddings, 
+                                      dag_embeddings, 
+                                      global_embeddings, 
+                                      num_nodes_per_dag, 
+                                      num_nodes_per_obs)
 
         dag_idxs = dag_batch.ptr[:-1]
         dag_features = \
             node_features[dag_idxs, :self.num_dag_features]
 
-        dag_scores= self._compute_dag_scores(
-            dag_features, 
-            dag_embeddings, 
-            global_embeddings, 
-            num_dags_per_obs,
-            dag_batch.num_graphs)
+        dag_scores = \
+            self._compute_dag_scores(dag_features, 
+                                     dag_embeddings, 
+                                     global_embeddings, 
+                                     num_dags_per_obs,
+                                     dag_batch.num_graphs)
 
         return node_scores, dag_scores
 

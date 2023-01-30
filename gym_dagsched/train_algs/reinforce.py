@@ -15,7 +15,7 @@ from torch_geometric.data import Batch
 from torch_scatter import segment_add_csr
 
 from ..envs.dagsched_env import DagSchedEnv
-from ..wrappers.dagsched_env_decima_wrapper import DagSchedEnvDecimaWrapper
+from ..wrappers.decima_wrapper import DecimaWrapper
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
@@ -28,24 +28,24 @@ from ..utils.hidden_prints import HiddenPrints
 
 
 def train(agent,
-          optim_class,
-          optim_lr,
-          n_sequences,
-          num_envs,
-          discount,
-          entropy_weight_init,
-          entropy_weight_decay,
-          entropy_weight_min,
-          num_job_arrivals, 
-          num_init_jobs, 
-          job_arrival_rate,
-          num_workers,
-          max_time_mean_init,
-          max_time_mean_growth,
-          max_time_mean_ceil,
-          moving_delay,
-          reward_scale,
-          writer):
+          num_epochs=500,
+          world_size=4,
+          writer=None,
+          optim_class=torch.optim.Adam,
+          optim_lr=.001,
+          discount=.99,
+          entropy_weight_init=.5,
+          entropy_weight_decay=1e-3,
+          entropy_weight_min=1e-4,
+          num_job_arrivals=0, 
+          num_init_jobs=20,
+          job_arrival_rate=0,
+          num_workers=10,
+          max_time_mean_init=np.inf,
+          max_time_mean_growth=0,
+          max_time_mean_ceil=np.inf,
+          moving_delay=2000,
+          reward_scale=1e-5):
     '''trains the model on different job arrival sequences. 
     Multiple episodes are run on each sequence in parallel.
     '''
@@ -58,7 +58,7 @@ def train(agent,
         DifferentialReturnsCalculator(discount)
 
     procs, conns = \
-        setup_workers(num_envs, 
+        setup_workers(world_size, 
                       agent,  
                       optim_class, 
                       optim_lr)
@@ -66,10 +66,9 @@ def train(agent,
     max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
 
-    for i in range(n_sequences):
+    for i in range(num_epochs):
         # sample the max wall duration of the current episode
-        # max_time = np.random.exponential(max_time_mean)
-        max_time = np.inf
+        max_time = np.random.exponential(max_time_mean)
 
         print('training on sequence '
               f'{i+1} with max wall time = ' 
@@ -224,7 +223,7 @@ def episode_runner(rank,
     setup_worker(rank, num_envs)
 
     base_env = DagSchedEnv()
-    env = DagSchedEnvDecimaWrapper(base_env)
+    env = DecimaWrapper(base_env)
 
     agent.actor_network = \
         DDP(agent.actor_network.to(device), 
@@ -275,11 +274,6 @@ def run_iteration(i,
     wall_times, rewards = \
         list(zip(*[(exp.wall_time, exp.reward) 
                     for exp in experience]))
-
-    for i, (t, val) in enumerate(zip(wall_times, rewards)):
-        if i == 100:
-            break
-        print(f'{t}: {val:.3f}')
 
     # notify main proc that returns and wall times are ready
     conn.send((np.array(rewards), 

@@ -1,8 +1,8 @@
 
-from ..core.timeline import Timeline, JobArrival
+from ..timeline import Timeline, JobArrival
 
 
-class JobSequenceGenerator:
+class BaseJobSequenceGen:
 
     def new_timeline(self,
                      np_random,
@@ -21,7 +21,7 @@ class JobSequenceGenerator:
         for job_id in range(num_init_jobs + num_job_arrivals):
             if job_id >= num_init_jobs:
                 # sample time until next arrival
-                t += self.np_random.exponential(1/job_arrival_rate)
+                t += np_random.exponential(1/job_arrival_rate)
 
             job = self.generate_job(job_id, t)
             timeline.push(t, JobArrival(job))

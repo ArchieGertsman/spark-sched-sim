@@ -2,15 +2,15 @@
 import numpy as np
 import networkx as nx
 
-from .job_sequence_generator import JobSequenceGenerator
-from ..core.job import Job
-from ..core.operation import Operation
+from .base_job_sequence_gen import BaseJobSequenceGen
+from ..entities.job import Job
+from ..entities.operation import Operation
 
 
-class TPCHJobSequenceGenerator(JobSequenceGenerator):
+class TPCHJobSequenceGen(BaseJobSequenceGen):
     
     def __init__(self):
-        self.query_base_path = './gym_dagsched/data_generation/tpch'
+        self.query_base_path = './gym_dagsched/data/tpch'
         self.tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
         self.num_queries = 22
 
