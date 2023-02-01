@@ -16,7 +16,7 @@ from gym_dagsched.utils.hidden_prints import HiddenPrints
 
 from gym_dagsched.agents.decima_agent import DecimaAgent
 from gym_dagsched.agents.fifo_agent import FIFOAgent
-from gym_dagsched.agents.scpt_agent import SCPTAgent
+from gym_dagsched.agents.cpt_agent import CPTAgent
 
 
 
@@ -26,24 +26,23 @@ def main():
 
     num_tests = 100
 
-    num_workers = 20
+    num_workers = 25
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
     base_seed = 500
 
-    model_dir = 'gym_dagsched/models'
+    model_dir = 'gym_dagsched/data/models'
 
     fifo_agent = FIFOAgent(num_workers)
-    scpt_agent = SCPTAgent(num_workers)
-    dynamic_fifo_agent = FIFOAgent(num_workers, dynamic=True)
-    dynamic_scpt_agent = SCPTAgent(num_workers, dynamic=True)
-    decima_agent = \
-        DecimaAgent(num_workers,
-                    mode='eval', 
-                    state_dict_path=\
-                        f'{model_dir}/model_20b_10w_150ep.pt')
+    scpt_agent = CPTAgent(num_workers)
+    lcpt_agent = CPTAgent(num_workers, by_shortest=False)
+    # decima_agent = \
+    #     DecimaAgent(num_workers,
+    #                 mode='eval', 
+    #                 state_dict_path=\
+    #                     f'{model_dir}/model_1b_20s_10w_200ep.pt')
 
     base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
     wrapped_env = DecimaWrapper(base_env)
@@ -52,18 +51,17 @@ def main():
         'num_workers': num_workers,
         'num_init_jobs': 20,
         'num_job_arrivals': 0,
-        'job_arrival_rate': 0.,
+        'job_arrival_rate': 0,
         'max_wall_time': np.inf,
-        'moving_delay': 2000.,
+        'moving_delay': 0.,
         'reward_scale': 1e-5
     }
 
     test_instances = [
         (fifo_agent, base_env, num_tests, base_seed, env_options),
         (scpt_agent, base_env, num_tests, base_seed, env_options),
-        (dynamic_fifo_agent, base_env, num_tests, base_seed, env_options),
-        (dynamic_scpt_agent, base_env, num_tests, base_seed, env_options),
-        (decima_agent, wrapped_env, num_tests, base_seed, env_options)
+        (lcpt_agent, base_env, num_tests, base_seed, env_options),
+        # (decima_agent, wrapped_env, num_tests, base_seed, env_options)
     ]
 
     # run tests in parallel using multiprocessing

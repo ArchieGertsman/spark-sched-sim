@@ -12,10 +12,11 @@ class FIFOAgent(BaseAgent):
 
     def __init__(self, 
                  num_workers, 
-                 dynamic=False):
-        super().__init__(f'FIFO (dyanmic={dynamic})')
+                 fair=True):
+        name = 'FIFO ' + ('(fair)' if fair else '(greedy)')
+        super().__init__(name)
         self.num_workers = num_workers
-        self.dynamic = dynamic
+        self.fair = fair
 
 
 
@@ -26,7 +27,7 @@ class FIFOAgent(BaseAgent):
          active_jobs,
          _) = obs
 
-        if self.dynamic:
+        if self.fair:
             worker_cap = self.num_workers / max(1, len(active_jobs))
             worker_cap = int(np.ceil(worker_cap))
         else:

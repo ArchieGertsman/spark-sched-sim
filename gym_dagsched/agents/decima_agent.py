@@ -8,6 +8,7 @@ from torch_sparse import matmul
 
 from gym_dagsched.utils.device import device
 from .base_agent import BaseAgent
+from ..utils.device import device as default_device
 
 
 
@@ -29,12 +30,15 @@ class DecimaAgent(BaseAgent):
                          num_workers,
                          dim_embed)
 
+        if device is None:
+            device = default_device
+
+        self.actor_network.to(device)
+
         if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path)
+            state_dict = torch.load(state_dict_path, 
+                                    map_location=device)
             self.actor_network.load_state_dict(state_dict)
-        
-        if device is not None:
-            self.actor_network.to(device)
 
         if mode == 'train':
             self.actor_network.train()

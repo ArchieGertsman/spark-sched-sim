@@ -16,14 +16,20 @@ def main():
 
     num_workers = 10
 
-    decima_agent = DecimaAgent(num_workers)
+    decima_agent = \
+        DecimaAgent(num_workers, 
+                    device=torch.device('cpu'))
 
     writer = SummaryWriter('log/train')
     # writer = None
 
     reinforce.train(decima_agent, 
                     writer=writer, 
-                    num_epochs=150)
+                    num_epochs=200,
+                    num_init_jobs=1,
+                    num_job_arrivals=20,
+                    job_arrival_rate=1/25000,
+                    entropy_weight_init=.1)
 
     if writer:
         writer.close()

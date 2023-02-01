@@ -34,7 +34,7 @@ def train(agent,
           optim_class=torch.optim.Adam,
           optim_lr=.001,
           discount=.99,
-          entropy_weight_init=.5,
+          entropy_weight_init=1.,
           entropy_weight_decay=1e-3,
           entropy_weight_min=1e-4,
           num_job_arrivals=0, 
@@ -49,6 +49,10 @@ def train(agent,
     '''trains the model on different job arrival sequences. 
     Multiple episodes are run on each sequence in parallel.
     '''
+
+    if num_job_arrivals > 0 and job_arrival_rate == 0:
+        raise Exception('job arrival rate must be positive '
+                        'when jobs are streaming')
 
     # use torch.distributed for IPC
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -225,8 +229,10 @@ def episode_runner(rank,
     base_env = DagSchedEnv()
     env = DecimaWrapper(base_env)
 
+    agent.actor_network.to(device)
+
     agent.actor_network = \
-        DDP(agent.actor_network.to(device), 
+        DDP(agent.actor_network, 
             device_ids=[device])
 
     optim = \

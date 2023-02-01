@@ -5,20 +5,24 @@ from .base_agent import BaseAgent
 
 
 
-class SCPTAgent(BaseAgent):
-    '''Shortest-Critical-Path-Time agent. The critical path 
-    time of a node is defined as the length of the longest path 
-    from that node to any leaf, weighted by node durations. 
-    This heuristic prioritizes operations with short critical 
+class CPTAgent(BaseAgent):
+    '''Critical-Path-Time agent. The critical path time of a 
+    node is defined as the length of the longest path from that 
+    node to any leaf of its dag, weighted by node durations. 
+    This heuristic prioritizes operations based on their critical 
     path time.
     '''
 
     def __init__(self, 
                  num_workers, 
-                 dynamic=False):
-        super().__init__(f'SCPT (dyanmic={dynamic})')
+                 fair=True,
+                 by_shortest=True):
+        name = 'SCPT ' if by_shortest else 'LCPT '
+        name += '(fair)' if fair else '(greedy)'
+        super().__init__(name)
         self.num_workers = num_workers
-        self.dynamic = dynamic
+        self.fair = fair
+        self.by_shortest = by_shortest
 
 
 
@@ -29,7 +33,7 @@ class SCPTAgent(BaseAgent):
          active_jobs,
          _) = obs
 
-        if self.dynamic:
+        if self.fair:
             worker_cap = self.num_workers / max(1, len(active_jobs))
             worker_cap = int(np.ceil(worker_cap))
         else:
@@ -51,9 +55,8 @@ class SCPTAgent(BaseAgent):
         # operation over all unsaturated jobs
         cp_lens = {}
         for job in active_jobs.values():
-            if job.total_worker_count >= worker_cap:
-                continue
-            cp_lens |= self.calculate_cp_lengths(job)
+            if job.total_worker_count < worker_cap:
+                cp_lens |= self.calculate_cp_lengths(job)
 
         if cp_lens == {}:
             # all jobs are saturated
@@ -64,7 +67,9 @@ class SCPTAgent(BaseAgent):
                    if op in schedulable_ops}
 
         # sort ops based on critical path length
-        cp_lens = dict(sorted(cp_lens.items(), key=lambda item: item[1]))
+        cp_lens = dict(sorted(cp_lens.items(), 
+                              key=lambda item: item[1], 
+                              reverse=(not self.by_shortest)))
 
         # select an op with shortest critical path length,
         # prioritizing ready ops
@@ -75,6 +80,7 @@ class SCPTAgent(BaseAgent):
 
             if op in active_jobs[op.job_id].frontier_ops:
                 # found a ready op
+                selected_op = op
                 break
 
         if selected_op is None:

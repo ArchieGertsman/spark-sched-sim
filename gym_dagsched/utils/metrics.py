@@ -4,7 +4,7 @@ import numpy as np
 
 
 def avg_job_duration(env):
-    assert env.n_completed_jobs > 0
+    assert env.num_completed_jobs > 0
 
     jobs = (env.jobs[job_id] 
             for job_id in env.completed_job_ids)
@@ -15,7 +15,7 @@ def avg_job_duration(env):
 
 
 def makespan(env):
-    assert env.n_completed_jobs > 0
+    assert env.num_completed_jobs > 0
 
     jobs = (env.jobs[job_id] 
             for job_id in env.completed_job_ids)
