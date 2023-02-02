@@ -4,7 +4,7 @@ from gymnasium import Env, spaces
 from ..core.worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_KEY
 from ..core.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..core.entities.worker import Worker
-from ..core.data_generators.tpch_job_sequence_gen import TPCHJobSequenceGen
+from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 
 
 
@@ -25,7 +25,6 @@ class DagSchedEnv(Env):
         self.num_total_jobs = options['num_init_jobs'] + \
                               options['num_job_arrivals']
         self.max_wall_time = options['max_wall_time']
-        self.reward_scale = options['reward_scale']
         self.moving_cost = options['moving_delay']
         
         self.timeline = \
@@ -324,11 +323,10 @@ class DagSchedEnv(Env):
             len(self.jobs[op.job_id].local_workers)
 
         duration = \
-            op.sample_task_duration(task, 
-                                    worker, 
-                                    num_local_workers, 
-                                    self.executor_interval_map)
-
+            op.task_duration_gen.sample(task, 
+                                        worker, 
+                                        num_local_workers, 
+                                        self.executor_interval_map)
         t_completion = task.t_accepted + duration
         op.most_recent_duration = duration
 
@@ -808,7 +806,7 @@ class DagSchedEnv(Env):
             start = max(job.t_arrival, old_wall_time)
             end = min(job.t_completed, self.wall_time)
             reward -= (end - start)
-        return reward * self.reward_scale
+        return reward
 
 
     

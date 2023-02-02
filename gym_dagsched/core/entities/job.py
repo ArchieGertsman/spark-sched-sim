@@ -15,12 +15,10 @@ class Job:
         # that belong to this job
         self.ops = ops
 
-        # subset of operations which have not
-        # been completed yet
+        # all incomplete operations
         self.active_ops = set(ops)
         
-        # subset of operations whose dependencies
-        # are satisfied and are ready to start
+        # incomplete operations whose parents have completed
         self.frontier_ops = set()
 
         # networkx dag storing the operations' interdependencies
@@ -30,11 +28,10 @@ class Job:
         self.t_arrival = t_arrival
 
         # time that this job completed, i.e. when the last
-        # operation completed executing
+        # operation completed
         self.t_completed = np.inf
 
-        # set of workers that are local to this job,
-        # including idle and busy ones
+        # set of workers that are local to this job
         self.local_workers = set()
 
         self.saturated_op_count = 0
@@ -48,10 +45,12 @@ class Job:
         return (self.id_, None)
 
 
+
     @property
     def completed(self):
         '''whether or not this job has completed'''
         return self.num_active_ops == 0
+
 
 
     @property
@@ -59,9 +58,11 @@ class Job:
         return self.saturated_op_count == len(self.ops)
 
 
+
     @property
     def num_ops(self):
         return len(self.ops)
+
 
 
     @property
@@ -93,26 +94,22 @@ class Job:
 
 
     def source_ops(self):
-        return set(
-            self.ops[node]
-            for node, in_deg in self.dag.in_degree()
-            if in_deg == 0
-        )
+        return \
+            set(self.ops[node]
+                for node, in_deg in self.dag.in_degree()
+                if in_deg == 0)
 
 
 
     def children_ops(self, op):
-        return (
-            self.ops[op_id] 
-            for op_id in self.dag.successors(op.id_)
-        )
+        return (self.ops[op_id] 
+                for op_id in self.dag.successors(op.id_))
+
 
 
     def parent_ops(self, op):
-        return (
-            self.ops[op_id] 
-            for op_id in self.dag.predecessors(op.id_)
-        )
+        return (self.ops[op_id] 
+                for op_id in self.dag.predecessors(op.id_))
 
 
 
@@ -180,8 +177,7 @@ class Job:
 
     def add_task_completion(self, op, task, worker, wall_time):
         assert not op.completed
-
-        op.mark_task_completed(task)
+        op.add_task_completion()
 
         worker.task = None
         task.t_completed = wall_time

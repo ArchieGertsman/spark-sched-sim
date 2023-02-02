@@ -26,42 +26,41 @@ def main():
 
     num_tests = 100
 
-    num_workers = 25
+    num_workers = 10
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
     base_seed = 500
 
-    model_dir = 'gym_dagsched/data/models'
+    model_dir = 'gym_dagsched/results/models'
 
     fifo_agent = FIFOAgent(num_workers)
     scpt_agent = CPTAgent(num_workers)
     lcpt_agent = CPTAgent(num_workers, by_shortest=False)
-    # decima_agent = \
-    #     DecimaAgent(num_workers,
-    #                 mode='eval', 
-    #                 state_dict_path=\
-    #                     f'{model_dir}/model_1b_20s_10w_200ep.pt')
+    decima_agent = \
+        DecimaAgent(num_workers,
+                    mode='eval', 
+                    state_dict_path=\
+                        f'{model_dir}/model.pt')
 
     base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
     wrapped_env = DecimaWrapper(base_env)
 
     env_options = {
         'num_workers': num_workers,
-        'num_init_jobs': 20,
-        'num_job_arrivals': 0,
-        'job_arrival_rate': 0,
+        'num_init_jobs': 1,
+        'num_job_arrivals': 20,
+        'job_arrival_rate': 1/25000,
         'max_wall_time': np.inf,
-        'moving_delay': 0.,
-        'reward_scale': 1e-5
+        'moving_delay': 2000.
     }
 
     test_instances = [
         (fifo_agent, base_env, num_tests, base_seed, env_options),
         (scpt_agent, base_env, num_tests, base_seed, env_options),
         (lcpt_agent, base_env, num_tests, base_seed, env_options),
-        # (decima_agent, wrapped_env, num_tests, base_seed, env_options)
+        (decima_agent, wrapped_env, num_tests, base_seed, env_options)
     ]
 
     # run tests in parallel using multiprocessing
@@ -78,7 +77,7 @@ def main():
 
 
 def test(instance):
-    sys.stdout = open(f'log/proc/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc/main.out', 'a')
     torch.manual_seed(42)
     torch.set_num_threads(1)
 
@@ -161,10 +160,10 @@ def visualize_results(out_fname,
 
 
 def setup():
-    shutil.rmtree('log/proc/', ignore_errors=True)
-    os.mkdir('log/proc/')
+    shutil.rmtree('ignore/log/proc/', ignore_errors=True)
+    os.mkdir('ignore/log/proc/')
 
-    sys.stdout = open(f'log/proc/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc/main.out', 'a')
 
     set_start_method('forkserver')
 

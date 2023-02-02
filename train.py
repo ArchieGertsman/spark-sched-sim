@@ -16,16 +16,19 @@ def main():
 
     num_workers = 10
 
+    model_dir = 'gym_dagsched/data/models'
+
     decima_agent = \
         DecimaAgent(num_workers, 
                     device=torch.device('cpu'))
+                    # state_dict_path=f'{model_dir}/model_1b_20s_10w_200ep.pt')
 
-    writer = SummaryWriter('log/train')
+    writer = SummaryWriter('ignore/log/train/b')
     # writer = None
 
     reinforce.train(decima_agent, 
                     writer=writer, 
-                    num_epochs=200,
+                    num_epochs=500,
                     num_init_jobs=1,
                     num_job_arrivals=20,
                     job_arrival_rate=1/25000,
@@ -38,10 +41,10 @@ def main():
 
 
 def setup():
-    shutil.rmtree('log/proc/', ignore_errors=True)
-    os.mkdir('log/proc/')
+    shutil.rmtree('ignore/log/proc/', ignore_errors=True)
+    os.mkdir('ignore/log/proc/')
 
-    sys.stdout = open(f'log/proc/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc/main.out', 'a')
 
     set_start_method('forkserver')
 

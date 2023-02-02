@@ -44,8 +44,7 @@ def train(agent,
           max_time_mean_init=np.inf,
           max_time_mean_growth=0,
           max_time_mean_ceil=np.inf,
-          moving_delay=2000,
-          reward_scale=1e-5):
+          moving_delay=2000):
     '''trains the model on different job arrival sequences. 
     Multiple episodes are run on each sequence in parallel.
     '''
@@ -100,18 +99,20 @@ def train(agent,
             diff_return_calc.calculate(wall_times_list,
                                        rewards_list)
 
-        baselines_list = \
+        baselines_list, stds_list = \
             compute_baselines(wall_times_list,
                               diff_returns_list)
 
         value_losses = []
         # send advantages
         for (returns, 
-             baselines, 
+             baselines,
+             stds,
              conn) in zip(diff_returns_list,
                           baselines_list,
+                          stds_list,
                           conns):
-            advantages = returns - baselines
+            advantages = (returns - baselines) / (stds + 1e-8)
             value_losses += [np.sum(advantages**2)]
             conn.send(advantages)
 
@@ -191,7 +192,7 @@ def cleanup_workers(conns, procs):
 
 
 def setup_worker(rank, world_size):
-    sys.stdout = open(f'log/proc/{rank}.out', 'a')
+    sys.stdout = open(f'ignore/log/proc/{rank}.out', 'a')
 
     torch.set_num_threads(1)
 

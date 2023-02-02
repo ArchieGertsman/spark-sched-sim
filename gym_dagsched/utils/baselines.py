@@ -13,12 +13,21 @@ def compute_baselines(ts_list, ys_list):
                      for ts, ys in zip(ts_list, ys_list)])
          for t in ts_unique}
 
+    std_values = \
+        {t: np.std([pw_linear_fit(t, ts, ys)
+                    for ts, ys in zip(ts_list, ys_list)])
+         for t in ts_unique}
+
     # output baselines for each env
     baselines_list = \
         [np.array([baseline_values[t] for t in ts])
          for ts in ts_list]
 
-    return baselines_list
+    stds_list = \
+        [np.array([std_values[t] for t in ts])
+         for ts in ts_list]
+
+    return baselines_list, stds_list
 
 
 

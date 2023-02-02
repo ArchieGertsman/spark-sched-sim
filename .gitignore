@@ -2,25 +2,4 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
-
-planning.py
-scratchpad*
-gym_dagsched/data_generation/tpch
-reinforce.ipynb
-bruh*
-log
-*.pt
-*.txt
-*.png
-*.npy
-*.csv
-*.out
-
-gym_dagsched/envs/vec_dagsched_env.py
-gym_dagsched/envs/shared_obs.py
-gym_dagsched/envs/env_run.py
-gym_dagsched/policies/heuristics.py
-gym_dagsched/reinforce/reinforce_sync.py
-gym_dagsched/data_generation/random_datagen.py
-gym_dagsched/envs/state_old.py
-gym_dagsched/test
+ignore/
