@@ -4,10 +4,10 @@ class BaseAgent:
 
 
     def __call__(self, obs):
-        return self.invoke(obs)
+        return self.predict(obs)
         
 
-    def invoke(self, obs):
+    def predict(self, obs):
         '''must be implemented for every agent.
         Takes an observation of the environment,
         and returns an action.

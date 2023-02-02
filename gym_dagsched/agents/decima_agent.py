@@ -1,3 +1,5 @@
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -5,8 +7,9 @@ from torch_geometric.nn import MessagePassing
 import torch_geometric.nn as gnn
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from gym_dagsched.utils.device import device
+from ..utils.device import device
 from .base_agent import BaseAgent
 from ..utils.device import device as default_device
 
@@ -14,14 +17,16 @@ from ..utils.device import device as default_device
 
 
 class DecimaAgent(BaseAgent):
-    def __init__(self, 
+    def __init__(self,
                  num_workers,
-                 mode='train',
+                 training_mode=True,
                  state_dict_path=None,
                  device=None,
                  num_node_features=5, 
                  num_dag_features=3, 
-                 dim_embed=8):
+                 dim_embed=8,
+                 optim_class=torch.optim.Adam,
+                 optim_lr=.001):
         super().__init__('Decima')
 
         self.actor_network = \
@@ -29,6 +34,12 @@ class DecimaAgent(BaseAgent):
                          num_dag_features, 
                          num_workers,
                          dim_embed)
+
+        self.num_workers = num_workers
+
+        self.optim_class = optim_class
+
+        self.optim_lr = optim_lr
 
         if device is None:
             device = default_device
@@ -40,20 +51,27 @@ class DecimaAgent(BaseAgent):
                                     map_location=device)
             self.actor_network.load_state_dict(state_dict)
 
-        if mode == 'train':
-            self.actor_network.train()
-        elif mode == 'eval':
-            self.actor_network.eval()
-        else:
-            raise Exception('invalid mode')
+        self.actor_network.train(training_mode)
 
-        self.mode = mode
+        self.training_mode = training_mode
 
         self.cached_dag_batch = None
 
 
 
-    def invoke(self, obs):
+    def build(self, ddp=False, device=None):
+        if ddp:
+            assert device is not None
+            self.actor_network.to(device)
+            self.actor_network = DDP(self.actor_network, 
+                                    device_ids=[device])
+
+        params = self.actor_network.parameters()
+        self.optim = self.optim_class(params, self.optim_lr)
+
+
+
+    def predict(self, obs):
         '''assumes that `DecimaWrapper` is providing
         observations of the environment and receiving
         actions returned here.
@@ -87,33 +105,125 @@ class DecimaAgent(BaseAgent):
             node_scores, dag_scores = \
                 self.actor_network(self.cached_dag_batch)
 
-        node_scores = node_scores.cpu()
-        node_scores[~valid_ops_mask] = float('-inf')
-
-        dag_scores = dag_scores.cpu()
-        valid_prlsm_lim_mask = \
-            torch.from_numpy(valid_prlsm_lim_mask)
-        dag_scores.masked_fill_(~valid_prlsm_lim_mask, 
-                                float('-inf'))
+        node_scores, dag_scores = \
+            self._mask_outputs(node_scores.cpu(), 
+                               dag_scores.cpu(),
+                               torch.from_numpy(valid_ops_mask),
+                               torch.from_numpy(valid_prlsm_lim_mask))
 
         env_action, raw_action = \
-            self.sample_action(node_scores, 
-                               dag_scores,
-                               dag_batch.ptr.numpy(),
-                               active_job_ids)
+            self._sample_action(node_scores, 
+                                dag_scores,
+                                dag_batch.ptr.numpy(),
+                                active_job_ids)
 
-        if self.mode == 'train':
+        if self.training_mode:
             return env_action, raw_action
         else:
             return env_action
 
 
 
-    def sample_action(self,
-                      node_scores, 
-                      dag_scores, 
-                      job_ptr,
-                      active_job_ids):
+    def evaluate_actions(self, obsns, actions):
+        (nested_dag_batch,
+         num_dags_per_obs,
+         num_nodes_per_dag,
+         valid_ops_masks,
+         valid_prlsm_lim_masks) = obsns
+
+        # re-feed all the inputs from the entire
+        # episode back through the model, this time
+        # recording a computational graph
+        model_outputs = \
+            self.actor_network(nested_dag_batch,
+                               num_dags_per_obs)
+
+        # move model outputs to CPU
+        (node_scores_batch, 
+         dag_scores_batch, 
+         num_nodes_per_obs, 
+         obs_indptr) = \
+            [t.cpu() for t in model_outputs]
+
+        self._mask_outputs(node_scores_batch, 
+                           dag_scores_batch,
+                           valid_ops_masks,
+                           valid_prlsm_lim_masks)
+
+        (node_selections, 
+         dag_idxs, 
+         dag_selections) = \
+            [torch.tensor(lst) for lst in zip(*actions)]
+
+        (all_node_probs, 
+         node_lgprobs, 
+         node_entropies) = \
+            self._evaluate_node_actions(node_scores_batch,
+                                        node_selections,
+                                        num_nodes_per_obs)
+
+        dag_probs = self._compute_dag_probs(all_node_probs, 
+                                            num_nodes_per_dag)
+        
+        dag_lgprobs, dag_entropies = \
+            self._evaluate_dag_actions(dag_scores_batch, 
+                                       dag_idxs + obs_indptr[:-1], 
+                                       dag_selections,
+                                       dag_probs,
+                                       obs_indptr)
+
+        action_lgprobs = node_lgprobs + dag_lgprobs
+
+        action_entropies = \
+            (node_entropies + dag_entropies) * \
+            self._get_entropy_scale(num_nodes_per_obs)
+
+        return action_lgprobs, action_entropies
+
+
+
+    def update_parameters(self, loss, num_envs=None):
+        # compute gradients
+        self.optim.zero_grad()
+        loss.backward()
+
+        if num_envs is not None:
+            # we want the sum of grads over all the
+            # workers, but DDP gives average, so
+            # scale the grads back
+            for param in self.actor_network.parameters():
+                param.grad.mul_(num_envs)
+
+        # update model parameters
+        self.optim.step()
+
+
+
+    ## internal methods
+
+    @classmethod
+    def _mask_outputs(cls,
+                      node_scores,
+                      dag_scores,
+                      valid_ops_mask,
+                      valid_prlsm_lim_mask):
+        # mask node scores
+        node_scores[~valid_ops_mask] = float('-inf')
+
+        # mask dag scores
+        dag_scores.masked_fill_(~valid_prlsm_lim_mask, 
+                                float('-inf'))
+
+        return node_scores, dag_scores
+
+
+
+    @classmethod
+    def _sample_action(cls,
+                       node_scores, 
+                       dag_scores, 
+                       job_ptr,
+                       active_job_ids):
         '''Returns a tuple `(env_action, raw_action)`, where 
         `env_action` is the action sent to `DecimaWrapper`, and 
         `raw_action` can be stored in experience by a training 
@@ -124,7 +234,7 @@ class DecimaAgent(BaseAgent):
             Categorical(logits=node_scores).sample()
 
         op_env, job_idx = \
-            self.translate_op(op_sample.item(), 
+            cls._translate_op(op_sample.item(), 
                               job_ptr,
                               active_job_ids)
 
@@ -147,7 +257,7 @@ class DecimaAgent(BaseAgent):
 
 
     @classmethod
-    def translate_op(cls, op, job_ptr, active_jobs_ids):
+    def _translate_op(cls, op, job_ptr, active_jobs_ids):
         '''Returns:
         - `op`: translation of the policy sample so that 
         the environment can find the corresponding operation
@@ -162,6 +272,176 @@ class DecimaAgent(BaseAgent):
         op = (job_id, active_op_idx)
 
         return op, job_idx
+
+
+
+    @classmethod
+    def _compute_dag_probs(cls, all_node_probs, num_nodes_per_dag):
+        '''for each dag, compute the probability of it
+        being selected by summing over the probabilities
+        of each of its nodes being selected
+        '''
+        dag_indptr = num_nodes_per_dag.cumsum(0)
+        dag_indptr = torch.cat([torch.tensor([0]), dag_indptr], 0)
+        dag_probs = segment_add_csr(all_node_probs, dag_indptr)
+        return dag_probs
+
+
+
+
+    def _get_entropy_scale(self, num_nodes_per_obs):
+        entropy_norm = torch.log(self.num_workers * num_nodes_per_obs)
+        entropy_scale = 1 / torch.max(torch.tensor(1), entropy_norm)
+        return entropy_scale
+
+
+
+    @classmethod
+    def _evaluate_node_actions(cls,
+                               node_scores_batch,
+                               node_selection_batch,
+                               num_nodes_per_obs):
+        '''splits the node score/selection batches into subbatches 
+        (see subroutine below), then for each subbatch, comptues 
+        attributes (action log-probability and entropy) using 
+        vectorized computations. Finally, merges the attributes 
+        from the subbatches together. This is faster than 
+        either 
+        - separately computing attributes for each sample in the
+        batch, because vectorized computations are not utilized
+        at all, or
+        - stacking the whole batch together with padding and doing 
+        one large vectorized computation, because the backward 
+        pass becomes very expensive
+        '''
+
+        def _eval_node_actions(node_scores, node_selection):
+            c = Categorical(logits=node_scores)
+            node_lgprob = c.log_prob(node_selection)
+            node_entropy = c.entropy()
+            return c.probs, node_lgprob, node_entropy
+
+        (node_scores_subbatches, 
+        node_selection_subbatches, 
+        subbatch_node_counts) = \
+            cls._split_node_experience(node_scores_batch, 
+                                       node_selection_batch, 
+                                       num_nodes_per_obs)
+
+        # for each subbatch, compute the node
+        # action attributes, vectorized
+        all_node_probs = []
+        node_lgprobs = []
+        node_entropies = []
+
+        for (node_scores_subbatch, 
+            node_selection_subbatch,
+            node_count) in zip(node_scores_subbatches,
+                            node_selection_subbatches,
+                            subbatch_node_counts):
+            node_scores_subbatch = \
+                node_scores_subbatch.view(-1, node_count)
+
+            node_probs, node_lgprob_subbatch, node_entropy_subbatch = \
+                _eval_node_actions(node_scores_subbatch,
+                                   node_selection_subbatch)
+
+            all_node_probs += [torch.flatten(node_probs)]
+            node_lgprobs += [node_lgprob_subbatch]
+            node_entropies += [node_entropy_subbatch]
+
+        ## concatenate the subbatch attributes together
+
+        # for each node ever seen, records the probability
+        # that that node is selected out of all the
+        # nodes within its observation
+        all_node_probs = torch.cat(all_node_probs)
+
+        # for each observation, records the log probability
+        # of its node selection
+        node_lgprobs = torch.cat(node_lgprobs)
+
+        # for each observation, records its node entropy
+        node_entropies = torch.cat(node_entropies)
+
+        return all_node_probs, node_lgprobs, node_entropies
+
+
+
+    @classmethod
+    def _split_node_experience(cls,
+                               node_scores_batch, 
+                               node_selection_batch, 
+                               num_nodes_per_obs):
+        '''splits the node score/selection batches into
+        subbatches, where each each sample within a subbatch
+        has the same node count.
+        '''
+        batch_size = len(num_nodes_per_obs)
+
+        # find indices where op count changes
+        op_count_change_mask = \
+            num_nodes_per_obs[:-1] != num_nodes_per_obs[1:]
+        ptr = 1 + op_count_change_mask.nonzero().squeeze()
+        if ptr.shape == torch.Size():
+            # ptr is zero-dimentional; not allowed in torch.cat
+            ptr = ptr.unsqueeze(0)
+        ptr = torch.cat([torch.tensor([0]), 
+                        ptr, 
+                        torch.tensor([batch_size])])
+
+        # unique op count within each subbatch
+        subbatch_node_counts = num_nodes_per_obs[ptr[:-1]]
+
+        # number of samples in each subbatch
+        subbatch_sizes = ptr[1:] - ptr[:-1]
+
+        # split node scores into subbatches
+        node_scores_split = \
+            torch.split(node_scores_batch, 
+                        list(subbatch_node_counts * subbatch_sizes))
+
+        # split node selections into subbatches
+        node_selection_split = \
+            torch.split(node_selection_batch, 
+                        list(subbatch_sizes))
+
+        return node_scores_split, \
+               node_selection_split, \
+               subbatch_node_counts
+
+
+
+    @classmethod
+    def _evaluate_dag_actions(cls,
+                              dag_scores_batch, 
+                              dag_idx_batch, 
+                              dag_selection_batch,
+                              dag_probs,
+                              obs_indptr):
+        dag_lgprob_batch = \
+            Categorical(logits=dag_scores_batch[dag_idx_batch]) \
+                .log_prob(dag_selection_batch)
+
+        # can't have rows where all the entries are
+        # -inf when computing entropy, so for all such 
+        # rows, set the first entry to be 0. then the 
+        # entropy for these rows becomes 0.
+        inf_counts = torch.isinf(dag_scores_batch).sum(1)
+        allinf_rows = (inf_counts == dag_scores_batch.shape[1])
+        # dag_scores_batch[allinf_rows, 0] = 0
+        dag_scores_batch[allinf_rows] = 0
+
+        # compute expected entropy over dags for each obs.
+        # each dag is weighted by the probability of it 
+        # being selected. sum is segmented over observations.
+        entropy_per_dag = \
+            Categorical(logits=dag_scores_batch).entropy()
+        dag_entropy_batch = \
+            segment_add_csr(dag_probs * entropy_per_dag, 
+                            obs_indptr)
+        
+        return dag_lgprob_batch, dag_entropy_batch
 
 
 

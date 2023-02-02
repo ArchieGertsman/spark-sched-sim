@@ -40,9 +40,9 @@ def main():
     lcpt_agent = CPTAgent(num_workers, by_shortest=False)
     decima_agent = \
         DecimaAgent(num_workers,
-                    mode='eval', 
+                    training_mode=False, 
                     state_dict_path=\
-                        f'{model_dir}/model.pt')
+                        f'{model_dir}/model_1b_20s_10w_500ep.pt')
 
     base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
     wrapped_env = DecimaWrapper(base_env)

@@ -26,7 +26,7 @@ class CPTAgent(BaseAgent):
 
 
 
-    def invoke(self, obs):
+    def predict(self, obs):
         (num_source_workers,
          source_job_id, 
          schedulable_ops, 
