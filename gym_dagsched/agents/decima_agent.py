@@ -3,15 +3,18 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+from torch_geometric.data import Batch
 from torch_geometric.nn import MessagePassing
 import torch_geometric.nn as gnn
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
 from torch.nn.parallel import DistributedDataParallel as DDP
+import numpy as np
 
-from ..utils.device import device
 from .base_agent import BaseAgent
+from ..utils.device import device
 from ..utils.device import device as default_device
+from ..utils.pyg import add_adj
 
 
 
@@ -76,12 +79,11 @@ class DecimaAgent(BaseAgent):
         observations of the environment and receiving
         actions returned here.
         '''
-        (did_update_dag_batch,
-         dag_batch,
-         valid_ops_mask,
-         valid_prlsm_lim_mask,
-         active_job_ids, 
-         *_) = obs
+        (dag_batch,
+         schedulable_ops_mask,
+         valid_prlsm_lim_mask) = obs
+
+        did_update_dag_batch = True
 
         if did_update_dag_batch:
             # the whole dag batch object was
@@ -108,19 +110,14 @@ class DecimaAgent(BaseAgent):
         node_scores, dag_scores = \
             self._mask_outputs(node_scores.cpu(), 
                                dag_scores.cpu(),
-                               torch.from_numpy(valid_ops_mask),
+                               torch.from_numpy(schedulable_ops_mask),
                                torch.from_numpy(valid_prlsm_lim_mask))
 
-        env_action, raw_action = \
-            self._sample_action(node_scores, 
-                                dag_scores,
-                                dag_batch.ptr.numpy(),
-                                active_job_ids)
+        action = self._sample_action(node_scores, 
+                                     dag_scores,
+                                     dag_batch.batch)
 
-        if self.training_mode:
-            return env_action, raw_action
-        else:
-            return env_action
+        return action
 
 
 
@@ -222,37 +219,20 @@ class DecimaAgent(BaseAgent):
     def _sample_action(cls,
                        node_scores, 
                        dag_scores, 
-                       job_ptr,
-                       active_job_ids):
+                       batch):
         '''Returns a tuple `(env_action, raw_action)`, where 
         `env_action` is the action sent to `DecimaWrapper`, and 
         `raw_action` can be stored in experience by a training 
         algorithm.
         '''
         # select the next operation to schedule
-        op_sample = \
-            Categorical(logits=node_scores).sample()
-
-        op_env, job_idx = \
-            cls._translate_op(op_sample.item(), 
-                              job_ptr,
-                              active_job_ids)
+        op_idx = Categorical(logits=node_scores).sample()
 
         # select the number of workers to schedule
-        num_workers_sample = \
-            Categorical(logits=dag_scores[job_idx]).sample()
+        job_idx = batch[op_idx]
+        prlsm_lim = Categorical(logits=dag_scores[job_idx]).sample()
 
-        # action that's recorded in experience, 
-        # later used during training
-        raw_action = (op_sample, 
-                      job_idx, 
-                      num_workers_sample)
-
-        # action that gets sent to the env
-        num_workers_env = 1 + num_workers_sample.item()
-        env_action = (op_env, num_workers_env)
-
-        return env_action, raw_action
+        return op_idx, job_idx, prlsm_lim
 
 
 

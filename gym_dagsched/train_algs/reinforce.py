@@ -13,8 +13,9 @@ from torch.multiprocessing import Pipe, Process
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.data import Batch
 from torch_scatter import segment_add_csr
+import gymnasium as gym
 
-from .common import generate_rollout, construct_nested_dag_batch
+from .common import collect_rollout, construct_nested_dag_batch
 from ..envs.dagsched_env import DagSchedEnv
 from ..wrappers.decima_wrapper import DecimaWrapper
 from ..utils.metrics import avg_job_duration
@@ -59,8 +60,16 @@ def train(agent,
     diff_return_calc = \
         DifferentialReturnsCalculator(discount)
 
+    env_kwargs = {
+        'num_workers': num_workers,
+        'num_init_jobs': num_init_jobs,
+        'num_job_arrivals': num_job_arrivals,
+        'job_arrival_rate': job_arrival_rate,
+        'moving_delay': moving_delay
+    }
+
     procs, conns = \
-        setup_workers(world_size, agent)
+        setup_workers(world_size, agent, env_kwargs)
 
     max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
@@ -76,15 +85,7 @@ def train(agent,
 
         # send episode data to each of the workers.
         for conn in conns:
-            options = {
-                'num_init_jobs': num_init_jobs,
-                'num_job_arrivals': num_job_arrivals,
-                'job_arrival_rate': job_arrival_rate,
-                'num_workers': num_workers,
-                'max_wall_time': max_time,
-                'moving_delay': moving_delay
-            }
-            conn.send((options, entropy_weight))
+            conn.send((max_time, entropy_weight))
 
         # wait for rewards and wall times
         rewards_list, wall_times_list = \
@@ -150,7 +151,7 @@ def train(agent,
 
 
 
-def setup_workers(num_envs, agent):
+def setup_workers(num_envs, agent, env_kwargs):
     procs = []
     conns = []
 
@@ -162,7 +163,8 @@ def setup_workers(num_envs, agent):
                        args=(rank,
                              num_envs,
                              conn_sub,
-                             agent))
+                             agent,
+                             env_kwargs))
         procs += [proc]
         proc.start()
 
@@ -201,15 +203,15 @@ def cleanup_worker():
 
 
 
-def trainer(rank, num_envs, conn, agent):
+def trainer(rank, num_envs, conn, agent, env_kwargs):
     '''worker target which runs episodes 
     and trains the model by communicating 
     with the main process and other workers
     '''
     setup_worker(rank, num_envs)
 
-    base_env = DagSchedEnv()
-    env = DecimaWrapper(base_env)
+    env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
+    # env = DecimaWrapper(base_env)
     agent.build(ddp=True, device=device)
     
     epoch = 0
@@ -217,12 +219,7 @@ def trainer(rank, num_envs, conn, agent):
         prof = Profiler()
         prof.enable()
 
-        # receive episode data from parent process
-        stats = run_epoch(env, 
-                          agent, 
-                          data,
-                          epoch,
-                          conn)
+        stats = run_epoch(env, agent, data, epoch, conn)
 
         prof.disable()
 
@@ -240,11 +237,13 @@ def trainer(rank, num_envs, conn, agent):
 
 
 def run_epoch(env, agent, data, seed, conn):
-    options, entropy_weight = data
+    max_wall_time, entropy_weight = data
 
     with HiddenPrints():
-        rollout = \
-            generate_rollout(env, agent, seed=seed, options=options)
+        rollout = collect_rollout(env, 
+                                agent, 
+                                seed=seed, 
+                                options={'max_wall_time': max_wall_time})
 
     wall_times, rewards = \
         zip(*[(obs.wall_time, obs.reward) for obs in rollout])

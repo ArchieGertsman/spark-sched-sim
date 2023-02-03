@@ -8,11 +8,9 @@ from ..entities.operation import Operation
 
 
 class TPCHJobSequenceGen(BaseJobSequenceGen):
-    
-    def __init__(self):
-        self.query_base_path = './gym_dagsched/datasets/tpch'
-        self.tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
-        self.num_queries = 22
+    query_base_path = './gym_dagsched/datasets/tpch'
+    tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
+    num_queries = 22
 
 
     def generate_job(self, job_id, t_arrival):

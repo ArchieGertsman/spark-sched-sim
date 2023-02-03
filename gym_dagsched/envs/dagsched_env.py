@@ -1,5 +1,7 @@
 import numpy as np
-from gymnasium import Env, spaces
+from gymnasium import Env
+from gymnasium.spaces import *
+import networkx as nx
 
 from ..core.worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_KEY
 from ..core.timeline import JobArrival, TaskCompletion, WorkerArrival
@@ -10,32 +12,73 @@ from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 
 class DagSchedEnv(Env):
 
-    def __init__(self):
-        self._datagen = TPCHJobSequenceGen()
-        self._state = WorkerAssignmentState()
-        self.action_space = spaces.Space()
-        self.observation_space = spaces.Space()
+    def __init__(self,
+                 num_workers,
+                 num_init_jobs,
+                 num_job_arrivals,
+                 job_arrival_rate,
+                 moving_delay):
+
+        num_total_jobs = num_init_jobs + num_job_arrivals
+
+        self.num_workers = num_workers
+        self.num_total_jobs = num_total_jobs
+        self.moving_cost = moving_delay
+
+        self._datagen = \
+            TPCHJobSequenceGen(num_init_jobs,
+                               num_job_arrivals,
+                               job_arrival_rate)
+
+        self._state = WorkerAssignmentState(num_workers)
+
+        # self.action_space = MultiDiscrete([1, num_workers])
+        self.action_space = Dict({
+            'op_idx': Discrete(1),
+            'prlsm_lim': Discrete(num_workers, start=1)
+        })
+
+        self.observation_space = Dict({
+            # shape: (num active ops) x (2 features)
+            # op features: num remaining tasks, most recent task duration
+            'graph': Graph(node_space=Box(0, np.inf, (2,)), edge_space=Discrete(1)),
+
+            # length: num active ops
+            # `batch[i]` = job index of operation `i`
+            'batch': Sequence(Discrete(num_total_jobs)),
+
+            # length: num active ops
+            # `mask[i]` = 1 if op `i` is schedulable, 0 otherwise
+            'schedulable_op_mask': Sequence(Discrete(2)),
+
+            # integer that represents how many workers need to be scheduled
+            'num_workers_to_schedule': Discrete(num_workers+1),
+
+            # index of job who is releasing workers, if any.
+            # set to `self.num_total_jobs` if source is general pool.
+            'source_job_idx': Discrete(num_total_jobs+1),
+
+            # length: num active jobs
+            # count of workers associated with each active job
+            'worker_counts': Sequence(Discrete(2*num_workers))
+        })
 
 
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.num_workers = options['num_workers']
-        self.num_total_jobs = options['num_init_jobs'] + \
-                              options['num_job_arrivals']
-        self.max_wall_time = options['max_wall_time']
-        self.moving_cost = options['moving_delay']
+        try:
+            self.max_wall_time = options['max_wall_time']
+        except:
+            self.max_wall_time = np.inf
         
         self.timeline = \
-            self._datagen.new_timeline(self.np_random,
-                                       options['num_init_jobs'], 
-                                       options['num_job_arrivals'], 
-                                       options['job_arrival_rate'])
+            self._datagen.new_timeline(self.np_random)
 
         self.workers = [Worker(i) for i in range(self.num_workers)]
 
-        self._state.reset(self.num_workers)
+        self._state.reset()
 
         self.wall_time = 0.
 
@@ -57,10 +100,13 @@ class DagSchedEnv(Env):
 
         self.selected_ops = set()
 
+        self.op_selection_map = {}
+
         self._load_initial_jobs()
 
         obs = self._observe()
-        return obs, {}
+        info = {'wall_time': self.wall_time}
+        return obs, info
 
 
 
@@ -80,7 +126,8 @@ class DagSchedEnv(Env):
             # there are still scheduling decisions to be made, 
             # so consult the agent again
             obs = self._observe()
-            return obs, 0, False, False, {}
+            info = {'wall_time': self.wall_time}
+            return obs, 0, False, False, info
             
         # scheduling round has completed
         self._commit_remaining_workers()
@@ -111,7 +158,12 @@ class DagSchedEnv(Env):
         # if the episode isn't done, then start a new scheduling 
         # round at the current worker source
         obs = self._observe()
-        return obs, reward, self.terminated, self.truncated, {}
+        info = {'wall_time': self.wall_time}
+        return obs, \
+               reward, \
+               self.terminated, \
+               self.truncated, \
+               info
 
 
 
@@ -128,33 +180,34 @@ class DagSchedEnv(Env):
 
 
     def _take_action(self, action):
-        if action is None:
-            self._commit_remaining_workers()
-            return
+        # if not self.action_space.contains(action):
+        #     print('invalid action', flush=True)
+        #     self._commit_remaining_workers()
+        #     return
+        assert self.action_space.contains(action)
 
-        (job_id, op_id), num_workers = action
-        print('action:', (job_id, op_id), num_workers)
-
-        assert num_workers <= \
-               self._state.num_workers_to_schedule()
-
-        assert job_id in self.active_job_ids
-        job = self.jobs[job_id]
-
-        assert op_id < len(job.ops)
-        op = job.ops[op_id]
-
+        op = self.op_selection_map[action['op_idx']]
         assert op in self.schedulable_ops
 
+        job_worker_count = self._state.total_worker_count(op.job_id)
+        num_workers_to_schedule = self._state.num_workers_to_schedule()
+        source_job_id = self._state.source_job_id()
+
+        num_workers = action['prlsm_lim'] - job_worker_count
+        if op.job_id == source_job_id:
+            num_workers += num_workers_to_schedule
+        assert num_workers >= 1
+
+        print('action:', op.pool_key, num_workers)
+
         # agent may have requested more workers than
-        # are actually needed
+        # are actually needed or available
         num_workers = \
             self.adjust_num_workers(num_workers, op)
 
         print(f'committing {num_workers} workers '
               f'to {op.pool_key}')
-        self._state.add_commitment(num_workers, 
-                                   op.pool_key)
+        self._state.add_commitment(num_workers, op.pool_key)
 
         # mark op as selected so that it doesn't get
         # selected again during this scheduling round
@@ -211,29 +264,60 @@ class DagSchedEnv(Env):
         return self.terminated or self.truncated
 
 
+
     def _observe(self):
-        if not self.done:
-            assert len(self.schedulable_ops) > 0
+        self.op_selection_map.clear()
+        
+        nodes = []
+        edge_links = []
+        batch = []
+        schedulable_op_mask = []
+        worker_counts = []
+        source_job_idx = len(self.active_job_ids)
 
-        active_jobs = {}
-        for job_id in iter(self.active_job_ids):
+        num_nodes_traversed = 0
+        base_op_idx = 0
+        for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
-            job.total_worker_count = \
-                self._state.total_worker_count(job_id)
-            active_jobs[job_id] = job
+            if job_id == self._state.source_job_id():
+                source_job_idx = i
 
-        print('gen pool:', (len(self._state._pools[GENERAL_POOL_KEY]), 
-                            self._state._total_worker_count[None]),
-              {job_id: self.jobs[job_id].total_worker_count 
-               for job_id in self.active_job_ids})
+            worker_counts += [self._state.total_worker_count(job_id)]
 
-        print('POOLS', self._state._pools)
+            batch += [i] * job.num_active_ops
 
-        return self._state.num_workers_to_schedule(), \
-               self._state.source_job_id(), \
-               self.schedulable_ops, \
-               active_jobs, \
-               self.wall_time
+            active_op_ids = []
+            for op in iter(job.active_ops):
+                self.op_selection_map[num_nodes_traversed] = op
+                active_op_ids += [op.id_]
+                nodes += [(op.num_remaining_tasks, op.most_recent_duration)]
+                schedulable_op_mask += [1] if op in self.schedulable_ops else [0]
+                num_nodes_traversed += 1
+
+            subdag = job.dag.subgraph(active_op_ids)
+            subdag = nx.convert_node_labels_to_integers(subdag, first_label=base_op_idx)
+            edge_links += list(subdag.edges)
+
+            base_op_idx += job.num_active_ops
+
+        nodes = np.vstack(nodes).astype(np.float32) if len(nodes) > 0 else np.zeros((0,2), dtype=np.float32)
+        edges = np.zeros(len(edge_links), dtype=int) if len(edge_links) > 0 else np.zeros((0,), dtype=int)
+        edge_links = np.vstack(edge_links) if len(edge_links) > 0 else np.zeros((0,2), dtype=int)
+
+        obs = {
+            'graph': GraphInstance(nodes, edges, edge_links),
+            'batch': batch,
+            'schedulable_op_mask': schedulable_op_mask,
+            'num_workers_to_schedule': self._state.num_workers_to_schedule(),
+            'source_job_idx': source_job_idx,
+            'worker_counts': worker_counts
+        }
+
+        assert self.observation_space.contains(obs)
+
+        self.action_space['op_idx'].n = len(nodes)
+
+        return obs
 
 
 
@@ -463,8 +547,11 @@ class DagSchedEnv(Env):
         to `op` to the op's demand, if it's larger
         '''
         worker_demand = self.get_worker_demand(op)
+        num_source_workers = self._state.num_workers_to_schedule()
 
-        num_workers_adjusted = min(num_workers, worker_demand)
+        num_workers_adjusted = \
+            min(num_workers, worker_demand, num_source_workers)
+
         assert num_workers_adjusted > 0
 
         print('num_workers adjustment:',

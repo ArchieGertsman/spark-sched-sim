@@ -23,12 +23,12 @@ def main():
                     device=torch.device('cpu'))
                     # state_dict_path=f'{model_dir}/model_1b_20s_10w_200ep.pt')
 
-    writer = SummaryWriter('ignore/log/train/b')
-    # writer = None
+    # writer = SummaryWriter('ignore/log/train/b')
+    writer = None
 
-    reinforce.train(decima_agent, 
+    reinforce.train(decima_agent,
                     writer=writer, 
-                    num_epochs=500,
+                    num_epochs=10,
                     num_init_jobs=1,
                     num_job_arrivals=20,
                     job_arrival_rate=1/25000,

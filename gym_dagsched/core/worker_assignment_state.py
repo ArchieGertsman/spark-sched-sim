@@ -24,19 +24,24 @@ class WorkerAssignmentState:
       workers at an operation, including idle and busy
     '''
 
-    def reset(self, num_workers):
+    def __init__(self, num_workers):
+        self.num_workers = num_workers
+
+
+
+    def reset(self):
         # worker id -> key of pool where the worker
         # currently resides
         self._worker_locations = {
             worker_id: GENERAL_POOL_KEY
-            for worker_id in range(num_workers)
+            for worker_id in range(self.num_workers)
         }
 
         # pool key -> set of id's of workers who
         # reside at this pool
         self._pools = {
             None: set(),
-            GENERAL_POOL_KEY: set(range(num_workers))
+            GENERAL_POOL_KEY: set(range(self.num_workers))
         }
 
         # pool key A -> 

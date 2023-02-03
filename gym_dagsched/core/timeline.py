@@ -1,6 +1,6 @@
 import heapq
 import itertools
-from dataclasses import dataclass
+from typing import NamedTuple
 
 from .entities.job import Job
 from .entities.operation import Operation
@@ -8,23 +8,22 @@ from .entities.task import Task
 from .entities.worker import Worker
 
 
-@dataclass
-class JobArrival(object):
+class JobArrival(NamedTuple):
     job: Job
+    
 
-@dataclass
-class TaskCompletion(object):
+class TaskCompletion(NamedTuple):
     op: Operation
     task: Task
 
-@dataclass
-class WorkerArrival(object):
+
+class WorkerArrival(NamedTuple):
     worker: Worker
     op: Operation
 
 
 
-class Timeline(object):
+class Timeline:
     def __init__(self):
         # priority queue
         self.pq = []
