@@ -5,7 +5,7 @@ import torch
 from torch_geometric.data import Batch
 from torch_geometric.utils.convert import from_networkx
 
-from ..utils.pyg import construct_subbatch
+from ..utils.graph import construct_subbatch
 
 
 

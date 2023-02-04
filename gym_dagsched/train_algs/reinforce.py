@@ -22,7 +22,7 @@ from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
 from ..utils.baselines import compute_baselines
-from ..utils.pyg import add_adj
+from ..utils.graph import add_adj
 from ..utils.diff_returns import DifferentialReturnsCalculator
 from ..utils.hidden_prints import HiddenPrints
 

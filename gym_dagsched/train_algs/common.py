@@ -4,7 +4,7 @@ import torch
 from torch_geometric.data import Batch
 import numpy as np
 
-from ..utils.pyg import add_adj
+from ..utils.graph import add_adj
 
 
 

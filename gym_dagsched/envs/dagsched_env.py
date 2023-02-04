@@ -7,6 +7,7 @@ from ..core.worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_K
 from ..core.timeline import JobArrival, TaskCompletion, WorkerArrival
 from ..core.entities.worker import Worker
 from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
+from ..utils.graph import subgraph
 
 
 
@@ -87,6 +88,13 @@ class DagSchedEnv(Env):
             for i, (*_, e) in enumerate(self.timeline.pq)
         }
 
+        # the fastest way to obtain the edge links for an
+        # observation is to start out with all of them in
+        # a big array, and then to induce a subgraph from
+        # the set of currently active nodes
+        self.all_edge_links, self.num_total_ops = \
+            self._reset_edge_links()
+
         self.active_job_ids = set()
 
         self.completed_job_ids = set()
@@ -107,6 +115,28 @@ class DagSchedEnv(Env):
         obs = self._observe()
         info = {'wall_time': self.wall_time}
         return obs, info
+
+
+
+    def _reset_edge_links(self):
+        edge_links = []
+        base_node_label = 0
+        for job in self.jobs.values():
+            edge_links += [base_node_label + np.vstack(job.dag.edges)]
+            base_node_label += job.num_ops
+        return np.vstack(edge_links), base_node_label
+
+
+
+    def _load_initial_jobs(self):
+        while not self.timeline.empty:
+            wall_time, event = self.timeline.peek()
+            if wall_time > 0:
+                break
+            self.timeline.pop()
+            self._process_scheduling_event(event)
+
+        self.schedulable_ops = self._find_schedulable_ops()
 
 
 
@@ -167,24 +197,12 @@ class DagSchedEnv(Env):
 
 
 
-    def _load_initial_jobs(self):
-        while not self.timeline.empty:
-            wall_time, event = self.timeline.peek()
-            if wall_time > 0:
-                break
-            self.timeline.pop()
-            self._process_scheduling_event(event)
-
-        self.schedulable_ops = self._find_schedulable_ops()
-
-
-
     def _take_action(self, action):
         # if not self.action_space.contains(action):
         #     print('invalid action', flush=True)
         #     self._commit_remaining_workers()
         #     return
-        assert self.action_space.contains(action)
+        # assert self.action_space.contains(action)
 
         op = self.op_selection_map[action['op_idx']]
         assert op in self.schedulable_ops
@@ -269,16 +287,16 @@ class DagSchedEnv(Env):
         self.op_selection_map.clear()
         
         nodes = []
-        edge_links = []
         batch = []
         schedulable_op_mask = []
+        active_op_mask = np.zeros(self.num_total_ops, dtype=bool)
         worker_counts = []
         source_job_idx = len(self.active_job_ids)
 
-        num_nodes_traversed = 0
         base_op_idx = 0
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
+
             if job_id == self._state.source_job_id():
                 source_job_idx = i
 
@@ -286,23 +304,27 @@ class DagSchedEnv(Env):
 
             batch += [i] * job.num_active_ops
 
-            active_op_ids = []
             for op in iter(job.active_ops):
-                self.op_selection_map[num_nodes_traversed] = op
-                active_op_ids += [op.id_]
+                self.op_selection_map[len(nodes)] = op
+                
                 nodes += [(op.num_remaining_tasks, op.most_recent_duration)]
+                
                 schedulable_op_mask += [1] if op in self.schedulable_ops else [0]
-                num_nodes_traversed += 1
 
-            subdag = job.dag.subgraph(active_op_ids)
-            subdag = nx.convert_node_labels_to_integers(subdag, first_label=base_op_idx)
-            edge_links += list(subdag.edges)
+                active_op_mask[base_op_idx + op.id_] = 1
 
-            base_op_idx += job.num_active_ops
+            base_op_idx += job.num_ops
 
-        nodes = np.vstack(nodes).astype(np.float32) if len(nodes) > 0 else np.zeros((0,2), dtype=np.float32)
-        edges = np.zeros(len(edge_links), dtype=int) if len(edge_links) > 0 else np.zeros((0,), dtype=int)
-        edge_links = np.vstack(edge_links) if len(edge_links) > 0 else np.zeros((0,2), dtype=int)
+        try:
+            nodes = np.vstack(nodes).astype(np.float32)
+        except:
+            # no nodes
+            nodes = np.zeros((0,2), dtype=np.float32)
+
+        edge_links = subgraph(self.all_edge_links, active_op_mask)
+
+        # we aren't using any edge data, so this array is always zeros
+        edges = np.zeros(len(edge_links), dtype=int)
 
         obs = {
             'graph': GraphInstance(nodes, edges, edge_links),
@@ -312,8 +334,6 @@ class DagSchedEnv(Env):
             'source_job_idx': source_job_idx,
             'worker_counts': worker_counts
         }
-
-        assert self.observation_space.contains(obs)
 
         self.action_space['op_idx'].n = len(nodes)
 

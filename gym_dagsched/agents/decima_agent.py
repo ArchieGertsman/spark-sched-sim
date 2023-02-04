@@ -14,7 +14,7 @@ import numpy as np
 from .base_agent import BaseAgent
 from ..utils.device import device
 from ..utils.device import device as default_device
-from ..utils.pyg import add_adj
+from ..utils.graph import add_adj
 
 
 

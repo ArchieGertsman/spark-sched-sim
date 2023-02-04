@@ -28,7 +28,8 @@ def main():
 
     reinforce.train(decima_agent,
                     writer=writer, 
-                    num_epochs=10,
+                    world_size=1,
+                    num_epochs=1,
                     num_init_jobs=1,
                     num_job_arrivals=20,
                     job_arrival_rate=1/25000,

@@ -1,7 +1,6 @@
 import numpy as np
 
 
-
 class Job:
     '''An object representing a job in the system, containing
     a set of operations with interdependencies, stored as a dag.
