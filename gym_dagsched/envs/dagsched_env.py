@@ -1,10 +1,24 @@
 import numpy as np
 from gymnasium import Env
-from gymnasium.spaces import *
-import networkx as nx
+from gymnasium.spaces import (
+    Discrete,
+    MultiBinary,
+    Dict,
+    Box,
+    Sequence,
+    Graph,
+    GraphInstance
+)
 
-from ..core.worker_assignment_state import WorkerAssignmentState, GENERAL_POOL_KEY
-from ..core.timeline import JobArrival, TaskCompletion, WorkerArrival
+from ..core.worker_assignment_state import (
+    WorkerAssignmentState, 
+    GENERAL_POOL_KEY
+)
+from ..core.timeline import (
+    JobArrival, 
+    TaskCompletion, 
+    WorkerArrival
+)
 from ..core.entities.worker import Worker
 from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 from ..utils.graph import subgraph
@@ -33,24 +47,35 @@ class DagSchedEnv(Env):
 
         self._state = WorkerAssignmentState(num_workers)
 
-        # self.action_space = MultiDiscrete([1, num_workers])
         self.action_space = Dict({
+            # operation selection
+            # Note: upper bound of this space is dynamic, equal to 
+            # the number of active operations. Initialized to 1.
             'op_idx': Discrete(1),
+
+            # parallelism limit selection
             'prlsm_lim': Discrete(num_workers, start=1)
         })
 
         self.observation_space = Dict({
-            # shape: (num active ops) x (2 features)
-            # op features: num remaining tasks, most recent task duration
-            'graph': Graph(node_space=Box(0, np.inf, (2,)), edge_space=Discrete(1)),
+            'dag_batch': Dict({
+                # shape: (num active ops) x (2 features)
+                # op features: num remaining tasks, most recent task duration
+                'data': Graph(node_space=Box(0, np.inf, (2,)), 
+                              edge_space=Discrete(1)),
 
-            # length: num active ops
-            # `batch[i]` = job index of operation `i`
-            'batch': Sequence(Discrete(num_total_jobs)),
+                # shape: num active jobs
+                # `ptr[job_idx]` returns the index of the first operation
+                # associated with that job. E.g., the range of operation
+                # indices for a job is given by `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
+                'ptr': Sequence(Discrete(1)),
+            }),
 
             # length: num active ops
             # `mask[i]` = 1 if op `i` is schedulable, 0 otherwise
             'schedulable_op_mask': Sequence(Discrete(2)),
+
+            'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_workers)),
 
             # integer that represents how many workers need to be scheduled
             'num_workers_to_schedule': Discrete(num_workers+1),
@@ -60,9 +85,28 @@ class DagSchedEnv(Env):
             'source_job_idx': Discrete(num_total_jobs+1),
 
             # length: num active jobs
-            # count of workers associated with each active job
+            # count of workers associated with each active job,
+            # including moving workers and commitments from other jobs
             'worker_counts': Sequence(Discrete(2*num_workers))
         })
+
+
+
+    @property
+    def all_jobs_complete(self):
+        return self.num_completed_jobs == self.num_total_jobs
+
+
+
+    @property
+    def num_completed_jobs(self):
+        return len(self.completed_job_ids)
+
+
+
+    @property
+    def done(self):
+        return self.terminated or self.truncated
 
 
 
@@ -198,11 +242,11 @@ class DagSchedEnv(Env):
 
 
     def _take_action(self, action):
-        # if not self.action_space.contains(action):
-        #     print('invalid action', flush=True)
-        #     self._commit_remaining_workers()
-        #     return
-        # assert self.action_space.contains(action)
+        print('raw action', action)
+        
+        if not self.action_space.contains(action):
+            self._commit_remaining_workers()
+            return
 
         op = self.op_selection_map[action['op_idx']]
         assert op in self.schedulable_ops
@@ -232,7 +276,10 @@ class DagSchedEnv(Env):
         self.selected_ops.add(op)
 
         # find remaining schedulable operations
-        self.schedulable_ops = self._find_schedulable_ops()
+        job = self.jobs[op.job_id]
+        self.schedulable_ops -= job.active_ops
+        self.schedulable_ops |= \
+            self._find_schedulable_ops([op.job_id])
 
 
 
@@ -265,33 +312,18 @@ class DagSchedEnv(Env):
 
 
 
-    ## Observations
-
-    @property
-    def all_jobs_complete(self):
-        return self.num_completed_jobs == self.num_total_jobs
-
-
-    @property
-    def num_completed_jobs(self):
-        return len(self.completed_job_ids)
-
-
-    @property
-    def done(self):
-        return self.terminated or self.truncated
-
-
-
     def _observe(self):
         self.op_selection_map.clear()
         
         nodes = []
-        batch = []
+        ptr = []
         schedulable_op_mask = []
         active_op_mask = np.zeros(self.num_total_ops, dtype=bool)
         worker_counts = []
         source_job_idx = len(self.active_job_ids)
+
+        for op in iter(self.schedulable_ops):
+            op.schedulable = True
 
         base_op_idx = 0
         for i, job_id in enumerate(self.active_job_ids):
@@ -302,18 +334,21 @@ class DagSchedEnv(Env):
 
             worker_counts += [self._state.total_worker_count(job_id)]
 
-            batch += [i] * job.num_active_ops
+            ptr += [len(nodes)]
 
             for op in iter(job.active_ops):
                 self.op_selection_map[len(nodes)] = op
                 
                 nodes += [(op.num_remaining_tasks, op.most_recent_duration)]
                 
-                schedulable_op_mask += [1] if op in self.schedulable_ops else [0]
+                schedulable_op_mask += [1] if op.schedulable else [0]
+                op.schedulable = False
 
                 active_op_mask[base_op_idx + op.id_] = 1
 
             base_op_idx += job.num_ops
+
+        ptr += [len(nodes)]
 
         try:
             nodes = np.vstack(nodes).astype(np.float32)
@@ -326,15 +361,35 @@ class DagSchedEnv(Env):
         # we aren't using any edge data, so this array is always zeros
         edges = np.zeros(len(edge_links), dtype=int)
 
+        num_workers_to_schedule = self._state.num_workers_to_schedule()
+
+        valid_prlsm_lim_masks = []
+        for i, worker_count in enumerate(worker_counts):
+            min_prlsm_lim = worker_count + 1
+            if i == source_job_idx:
+                min_prlsm_lim -= num_workers_to_schedule
+
+            assert 0 < min_prlsm_lim
+            assert     min_prlsm_lim <= self.num_workers + 1
+
+            valid_prlsm_lim_mask = np.zeros(self.num_workers, dtype=bool)
+            valid_prlsm_lim_mask[(min_prlsm_lim-1):] = 1
+            valid_prlsm_lim_masks += [valid_prlsm_lim_mask]
+
         obs = {
-            'graph': GraphInstance(nodes, edges, edge_links),
-            'batch': batch,
+            'dag_batch': {
+                'data': GraphInstance(nodes, edges, edge_links),
+                'ptr': ptr
+            },
             'schedulable_op_mask': schedulable_op_mask,
-            'num_workers_to_schedule': self._state.num_workers_to_schedule(),
+            'valid_prlsm_lim_mask': valid_prlsm_lim_masks,
+            'num_workers_to_schedule': num_workers_to_schedule,
             'source_job_idx': source_job_idx,
             'worker_counts': worker_counts
         }
 
+        # update op action space to reflect the current number of active ops
+        self.observation_space['dag_batch']['ptr'].feature_space.n = len(nodes)+1
         self.action_space['op_idx'].n = len(nodes)
 
         return obs
@@ -863,7 +918,8 @@ class DagSchedEnv(Env):
         self._state.move_worker_to_pool(
             worker.id_, op.pool_key)
 
-        if op in self.jobs[op.job_id].frontier_ops:
+        job = self.jobs[op.job_id]
+        if op in job.frontier_ops:
             # op's dependencies are satisfied, so 
             # start working on it.
             self._work_on_op(worker, op)

@@ -10,12 +10,12 @@ from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from gym_dagsched.wrappers.decima_wrapper import DecimaWrapper
+from gym_dagsched.wrappers.decima_wrapper_old import DecimaWrapper
 from gym_dagsched.utils.metrics import avg_job_duration
 from gym_dagsched.utils.hidden_prints import HiddenPrints
 
 from gym_dagsched.agents.decima_agent import DecimaAgent
-from gym_dagsched.agents.fifo_agent import FIFOAgent
+from gym_dagsched.agents.fifo_agent_old import FIFOAgent
 from gym_dagsched.agents.cpt_agent import CPTAgent
 
 
@@ -24,7 +24,7 @@ from gym_dagsched.agents.cpt_agent import CPTAgent
 def main():
     setup()
 
-    num_tests = 100
+    num_tests = 10
 
     num_workers = 10
 
@@ -57,9 +57,9 @@ def main():
     }
 
     test_instances = [
-        (fifo_agent, base_env, num_tests, base_seed, env_options),
-        (scpt_agent, base_env, num_tests, base_seed, env_options),
-        (lcpt_agent, base_env, num_tests, base_seed, env_options),
+        # (fifo_agent, base_env, num_tests, base_seed, env_options),
+        # (scpt_agent, base_env, num_tests, base_seed, env_options),
+        # (lcpt_agent, base_env, num_tests, base_seed, env_options),
         (decima_agent, wrapped_env, num_tests, base_seed, env_options)
     ]
 

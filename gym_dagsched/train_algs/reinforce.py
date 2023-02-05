@@ -6,23 +6,23 @@ import os
 
 import numpy as np
 import torch
-from torch.distributions import Categorical
 import torch.profiler
 import torch.distributed as dist
 from torch.multiprocessing import Pipe, Process
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch_geometric.data import Batch
-from torch_scatter import segment_add_csr
 import gymnasium as gym
 
-from .common import collect_rollout, construct_nested_dag_batch
-from ..envs.dagsched_env import DagSchedEnv
-from ..wrappers.decima_wrapper import DecimaWrapper
+from .common import (
+    collect_rollout, 
+    stack_obsns
+)
+from ..wrappers.decima_wrappers import (
+    DecimaObsWrapper,
+    DecimaActWrapper
+)
 from ..utils.metrics import avg_job_duration
 from ..utils.device import device
 from ..utils.profiler import Profiler
 from ..utils.baselines import compute_baselines
-from ..utils.graph import add_adj
 from ..utils.diff_returns import DifferentialReturnsCalculator
 from ..utils.hidden_prints import HiddenPrints
 
@@ -210,8 +210,8 @@ def trainer(rank, num_envs, conn, agent, env_kwargs):
     '''
     setup_worker(rank, num_envs)
 
-    env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
-    # env = DecimaWrapper(base_env)
+    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
+    env = DecimaActWrapper(DecimaObsWrapper(base_env))
     agent.build(ddp=True, device=device)
     
     epoch = 0
@@ -239,20 +239,24 @@ def trainer(rank, num_envs, conn, agent, env_kwargs):
 def run_epoch(env, agent, data, seed, conn):
     max_wall_time, entropy_weight = data
 
-    with HiddenPrints():
-        rollout = collect_rollout(env, 
-                                agent, 
-                                seed=seed, 
-                                options={'max_wall_time': max_wall_time})
+    env_options = {'max_wall_time': max_wall_time}
 
-    wall_times, rewards = \
-        zip(*[(obs.wall_time, obs.reward) for obs in rollout])
+    # with HiddenPrints():
+    rollout_buffer = \
+        collect_rollout(env, agent, seed=seed, options=env_options)
 
-    # notify main proc that returns and wall times are ready
-    conn.send((np.array(rewards), 
-               np.array(wall_times)))
+    (obsns,
+     actions,
+     wall_times, 
+     rewards) = \
+        zip(*((exp.obs, 
+               exp.action, 
+               exp.wall_time, 
+               exp.reward) 
+              for exp in rollout_buffer))
 
-    # wait for main proc to compute advantages
+    conn.send((np.array(rewards), np.array(wall_times)))
+
     advantages = conn.recv()
     advantages = torch.from_numpy(advantages).float()
 
@@ -260,48 +264,27 @@ def run_epoch(env, agent, data, seed, conn):
      action_loss,
      entropy_loss) = \
         compute_loss(agent,
-                     rollout,
+                     obsns,
+                     actions,
                      advantages,
                      entropy_weight)
     
     agent.update_parameters(total_loss, dist.get_world_size())
 
     return action_loss, \
-           entropy_loss / len(rollout), \
+           entropy_loss / len(rollout_buffer), \
            avg_job_duration(env) * 1e-3, \
            env.num_completed_jobs
 
 
 
 def compute_loss(agent,
-                 rollout,
+                 obsns,
+                 actions,
                  advantages,
                  entropy_weight):
-    (dag_batches, 
-     num_dags_per_obs,
-     valid_ops_masks, 
-     valid_prlsm_lim_masks,
-     actions) = \
-        zip(*[(obs.dag_batch, 
-               obs.num_jobs,
-               obs.valid_ops_mask,
-               obs.valid_prlsm_lim_mask,
-               obs.action)
-              for obs in rollout])
-                   
-    nested_dag_batch, num_nodes_per_dag = \
-        construct_nested_dag_batch(dag_batches, 
-                                   num_dags_per_obs)
 
-    valid_ops_masks = np.concatenate(valid_ops_masks)
-    valid_prlsm_lim_masks = \
-        torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
-
-    obsns = (nested_dag_batch.to(device),
-             torch.tensor(num_dags_per_obs),
-             num_nodes_per_dag,
-             valid_ops_masks,
-             valid_prlsm_lim_masks)
+    obsns = stack_obsns(obsns)
 
     # calculate attributes of the actions
     # which will be used to construct loss

@@ -1,19 +1,15 @@
 from typing import NamedTuple
 
 import torch
-from torch_geometric.data import Batch
+from torch_geometric.data import Data, Batch
 import numpy as np
 
-from ..utils.graph import add_adj
+from ..utils.graph import make_adj
 
 
 
-class Observation(NamedTuple):
-    dag_batch: object
-    valid_ops_mask: object
-    valid_prlsm_lim_mask: object
-    num_jobs: int
-    num_source_workers: int
+class Experience(NamedTuple):
+    obs: object
     wall_time: float
     action: object
     reward: float
@@ -22,104 +18,83 @@ class Observation(NamedTuple):
 
 def collect_rollout(env, agent, seed, options):  
     obs, info = env.reset(seed=seed, options=options)
-
     done = False
 
-    # save rollout from each step
-    # of the episode, to later be used
-    # in leaning
     rollout_buffer = []
-    
+
     while not done:
-        # unpack the current observation
-        obs = preprocess_obs(obs, agent.num_workers)
+        action = agent(obs)
 
-        (dag_batch,
-         schedulable_ops_mask,
-         valid_prlsm_lim_mask) = obs
-
-        raw_action = agent(obs)
-
-        op_idx, _, prlsm_lim = raw_action
-        env_action = {
-            'op_idx': op_idx.item(),
-            'prlsm_lim': 1 + prlsm_lim.item()
-        }
-
-        obs, reward, terminated, truncated, info = \
-            env.step(env_action)
-
-        rollout_buffer += \
-            [Observation(dag_batch.clone(),
-                         schedulable_ops_mask,
-                         valid_prlsm_lim_mask,
-                         dag_batch.num_graphs,
-                         obs['num_workers_to_schedule'],
-                         info['wall_time'],
-                         raw_action,
-                         reward)]
+        new_obs, reward, terminated, truncated, info = \
+            env.step(action)
 
         done = (terminated or truncated)
 
+        exp = Experience(obs, info['wall_time'], action, reward)
+        rollout_buffer += [exp]
+
+        obs = new_obs
+    
     return rollout_buffer
 
 
 
-def preprocess_obs(obs, num_workers):
-    num_active_jobs = len(obs['worker_counts'])
-    num_active_nodes = obs['graph'].nodes.shape[0]
-    num_nodes_per_dag = np.bincount(obs['batch'])
-    ptr = np.zeros(num_active_jobs + 1, dtype=int)
-    np.cumsum(num_nodes_per_dag, out=ptr[1:])
-
-    x = np.zeros((num_active_nodes, 5), dtype=np.float32)
-    x[:, :2] = obs['graph'].nodes
-    x[:, 2] = obs['num_workers_to_schedule']
-    x[:, 3] = np.repeat(obs['worker_counts'], num_nodes_per_dag)
-    if obs['source_job_idx'] < num_active_jobs:
-        i = obs['source_job_idx']
-        x[ptr[i]:ptr[i+1], 4] = 1
-
-    x = torch.from_numpy(x)
-    edge_index = torch.from_numpy(obs['graph'].edge_links.T)
-    dag_batch = Batch(x=x, edge_index=edge_index)
-    dag_batch.batch = torch.tensor(obs['batch'])
-    dag_batch._num_graphs = num_active_jobs
-    dag_batch.ptr = torch.from_numpy(ptr)
-    add_adj(dag_batch)
-
-    schedulable_ops_mask = np.array(obs['schedulable_op_mask'], dtype=bool)
-
-    valid_prlsm_lim_mask = np.zeros((num_active_jobs, num_workers), dtype=bool)
-
-    for i, worker_count in enumerate(obs['worker_counts']):
-        min_prlsm_lim = worker_count + 1
-        if i == obs['source_job_idx']:
-            min_prlsm_lim -= obs['num_workers_to_schedule']
-
-        assert 0 < min_prlsm_lim
-        assert     min_prlsm_lim <= num_workers + 1
-
-        valid_prlsm_lim_mask[i, (min_prlsm_lim-1):] = 1
-
-    return dag_batch, \
-           schedulable_ops_mask, \
-           valid_prlsm_lim_mask
-
-
-
-def construct_nested_dag_batch(dag_batch_list, 
-                               num_dags_per_obs):
+def construct_nested_dag_batch(dag_batches):
     '''extracts the inputs to the model from each
     step of the episode, then stacks them into a
     large batch.
     '''
-    nested_dag_batch = Batch.from_data_list(dag_batch_list)
-    num_nodes_per_dag = nested_dag_batch.batch.bincount()
+    to_pyg = lambda raw_data: \
+        Data(x=torch.from_numpy(raw_data.nodes), 
+             edge_index=torch.from_numpy(raw_data.edge_links.T))
+
+    def get_num_nodes_per_dag(ptr):
+        ptr = np.array(ptr)
+        return ptr[1:] - ptr[:-1]
+
+    data_list, num_dags_per_obs, num_nodes_per_dag = \
+        zip(*((to_pyg(dag_batch['data']), 
+               len(dag_batch['ptr'])-1,
+               get_num_nodes_per_dag(dag_batch['ptr']))
+              for dag_batch in dag_batches))
+
+    num_dags_per_obs = torch.tensor(num_dags_per_obs)
+    num_nodes_per_dag = torch.from_numpy(np.concatenate(num_nodes_per_dag))
+    total_num_dags = num_dags_per_obs.sum()
+
+    nested_dag_batch = Batch.from_data_list(data_list)
+    nested_dag_batch.batch = \
+        torch.arange(total_num_dags) \
+             .repeat_interleave(num_nodes_per_dag)
     ptr = num_nodes_per_dag.cumsum(dim=0)
     nested_dag_batch.ptr = \
         torch.cat([torch.tensor([0]), ptr], dim=0)
-    nested_dag_batch._num_graphs = sum(num_dags_per_obs)
-    add_adj(nested_dag_batch)
+    nested_dag_batch._num_graphs = total_num_dags
+    nested_dag_batch.adj = \
+        make_adj(nested_dag_batch.edge_index, 
+                 nested_dag_batch.x.shape[0])
 
-    return nested_dag_batch, num_nodes_per_dag
+    return nested_dag_batch, num_dags_per_obs, num_nodes_per_dag
+
+
+
+def stack_obsns(obsns):
+    (dag_batches,
+     valid_ops_masks, 
+     valid_prlsm_lim_masks) = \
+        zip(*((obs['dag_batch'], 
+               obs['schedulable_op_mask'], 
+               obs['valid_prlsm_lim_mask']) 
+              for obs in obsns))
+
+    nested_dag_batch, num_dags_per_obs, num_nodes_per_dag = \
+        construct_nested_dag_batch(dag_batches)
+
+    valid_ops_masks = np.concatenate(valid_ops_masks).astype(bool)
+    valid_prlsm_lim_masks = torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
+
+    return nested_dag_batch, \
+           num_dags_per_obs, \
+           num_nodes_per_dag, \
+           valid_ops_masks, \
+           valid_prlsm_lim_masks

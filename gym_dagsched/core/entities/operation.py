@@ -45,6 +45,8 @@ class Operation:
 
         self.saturated = False
 
+        self.schedulable = False
+
 
 
     def __hash__(self):

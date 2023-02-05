@@ -1,11 +1,9 @@
-from collections.abc import Iterable
-
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
-from torch_geometric.data import Batch
 from torch_geometric.nn import MessagePassing
 import torch_geometric.nn as gnn
+from torch_geometric.data import Batch
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -14,7 +12,7 @@ import numpy as np
 from .base_agent import BaseAgent
 from ..utils.device import device
 from ..utils.device import device as default_device
-from ..utils.graph import add_adj
+from ..utils.graph import make_adj
 
 
 
@@ -67,7 +65,7 @@ class DecimaAgent(BaseAgent):
             assert device is not None
             self.actor_network.to(device)
             self.actor_network = DDP(self.actor_network, 
-                                    device_ids=[device])
+                                     device_ids=[device])
 
         params = self.actor_network.parameters()
         self.optim = self.optim_class(params, self.optim_lr)
@@ -79,9 +77,9 @@ class DecimaAgent(BaseAgent):
         observations of the environment and receiving
         actions returned here.
         '''
-        (dag_batch,
-         schedulable_ops_mask,
-         valid_prlsm_lim_mask) = obs
+        dag_batch = self._to_pyg(obs['dag_batch'])
+        schedulable_ops_mask = torch.tensor(obs['schedulable_op_mask'], dtype=bool)
+        valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
 
         did_update_dag_batch = True
 
@@ -110,8 +108,8 @@ class DecimaAgent(BaseAgent):
         node_scores, dag_scores = \
             self._mask_outputs(node_scores.cpu(), 
                                dag_scores.cpu(),
-                               torch.from_numpy(schedulable_ops_mask),
-                               torch.from_numpy(valid_prlsm_lim_mask))
+                               schedulable_ops_mask,
+                               valid_prlsm_lim_mask)
 
         action = self._sample_action(node_scores, 
                                      dag_scores,
@@ -127,6 +125,8 @@ class DecimaAgent(BaseAgent):
          num_nodes_per_dag,
          valid_ops_masks,
          valid_prlsm_lim_masks) = obsns
+
+        nested_dag_batch.to(default_device)
 
         # re-feed all the inputs from the entire
         # episode back through the model, this time
@@ -150,7 +150,7 @@ class DecimaAgent(BaseAgent):
         (node_selections, 
          dag_idxs, 
          dag_selections) = \
-            [torch.tensor(lst) for lst in zip(*actions)]
+            [torch.tensor(lst) for lst in zip(*(act.values() for act in actions))]
 
         (all_node_probs, 
          node_lgprobs, 
@@ -198,6 +198,28 @@ class DecimaAgent(BaseAgent):
 
     ## internal methods
 
+    def _to_pyg(self, raw_dag_batch):
+        ptr = np.array(raw_dag_batch['ptr'])
+        num_nodes_per_dag = ptr[1:] - ptr[:-1]
+        num_active_nodes = raw_dag_batch['data'].nodes.shape[0]
+        num_active_jobs = len(num_nodes_per_dag)
+
+        # construct PyG `Batch` object
+        x = raw_dag_batch['data'].nodes
+        edge_index = torch.from_numpy(raw_dag_batch['data'].edge_links.T)
+        batch = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
+        adj = make_adj(edge_index, num_active_nodes)
+        dag_batch = Batch(x=torch.from_numpy(x), 
+                          edge_index=edge_index, 
+                          batch=torch.from_numpy(batch), 
+                          ptr=torch.from_numpy(ptr),
+                          adj=adj)
+        dag_batch._num_graphs = num_active_jobs
+
+        return dag_batch
+
+
+
     @classmethod
     def _mask_outputs(cls,
                       node_scores,
@@ -232,7 +254,11 @@ class DecimaAgent(BaseAgent):
         job_idx = batch[op_idx]
         prlsm_lim = Categorical(logits=dag_scores[job_idx]).sample()
 
-        return op_idx, job_idx, prlsm_lim
+        return {
+            'op_idx': op_idx.item(),
+            'job_idx': job_idx.item(),
+            'prlsm_lim': prlsm_lim.item()
+        }
 
 
 
