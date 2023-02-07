@@ -20,14 +20,16 @@ class DecimaObsWrapper(ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
 
+        self.num_workers = env.num_workers
+
         self.observation_space = Dict({
             'dag_batch': Dict({
-                'data': Graph(node_space=Box(0, np.inf, (5,)),
+                'data': Graph(node_space=Box(-np.inf, np.inf, (5,)),
                               edge_space=Discrete(1)),
                 'ptr': Sequence(Discrete(1))
             }),
             'schedulable_op_mask': Sequence(Discrete(2)),
-            'valid_prlsm_lim_mask': Sequence(MultiBinary(env.num_workers))
+            'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_workers))
         })
 
 
@@ -41,12 +43,26 @@ class DecimaObsWrapper(ObservationWrapper):
 
         # build node features
         nodes = np.zeros((num_active_nodes, 5), dtype=np.float32)
-        nodes[:, :2] = obs['dag_batch']['data'].nodes
-        nodes[:, 2] = obs['num_workers_to_schedule']
-        nodes[:, 3] = np.repeat(worker_counts, num_nodes_per_dag)
+        # nodes[:, :2] = obs['dag_batch']['data'].nodes
+        # nodes[:, 2] = obs['num_workers_to_schedule']
+        # nodes[:, 3] = np.repeat(worker_counts, num_nodes_per_dag)
+        # if obs['source_job_idx'] < num_active_jobs:
+        #     i = obs['source_job_idx']
+        #     nodes[ptr[i]:ptr[i+1], 4] = 1
+
+        nodes[:, 0] = obs['num_workers_to_schedule'] / self.num_workers
+
+        nodes[:, 1] = -2
         if obs['source_job_idx'] < num_active_jobs:
             i = obs['source_job_idx']
-            nodes[ptr[i]:ptr[i+1], 4] = 1
+            nodes[ptr[i]:ptr[i+1], 1] = 2
+
+        nodes[:, 2] = np.repeat(worker_counts, num_nodes_per_dag) / self.num_workers
+
+        num_remaining_tasks = obs['dag_batch']['data'].nodes[:, 0]
+        most_recent_duration = obs['dag_batch']['data'].nodes[:, 1]
+        nodes[:, 3] = num_remaining_tasks / 200
+        nodes[:, 4] = most_recent_duration * num_remaining_tasks * 1e-5
 
         # update op action space to reflect the current number of active ops
         self.observation_space['dag_batch']['ptr'].feature_space.n = num_active_nodes+1

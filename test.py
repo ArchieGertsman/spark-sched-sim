@@ -10,23 +10,23 @@ from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from gym_dagsched.wrappers.decima_wrapper_old import DecimaWrapper
+from gym_dagsched.wrappers.decima_wrappers import (
+    DecimaObsWrapper,
+    DecimaActWrapper
+)
 from gym_dagsched.utils.metrics import avg_job_duration
 from gym_dagsched.utils.hidden_prints import HiddenPrints
-
 from gym_dagsched.agents.decima_agent import DecimaAgent
-from gym_dagsched.agents.fifo_agent_old import FIFOAgent
+from gym_dagsched.agents.fifo_agent import FIFOAgent
 from gym_dagsched.agents.cpt_agent import CPTAgent
-
-
 
 
 def main():
     setup()
 
-    num_tests = 10
+    num_tests = 100
 
-    num_workers = 10
+    num_workers = 50
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
@@ -42,25 +42,24 @@ def main():
         DecimaAgent(num_workers,
                     training_mode=False, 
                     state_dict_path=\
-                        f'{model_dir}/model_1b_20s_10w_500ep.pt')
+                        f'{model_dir}/model.pt')
 
-    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0')
-    wrapped_env = DecimaWrapper(base_env)
-
-    env_options = {
+    env_kwargs = {
         'num_workers': num_workers,
         'num_init_jobs': 1,
         'num_job_arrivals': 20,
         'job_arrival_rate': 1/25000,
-        'max_wall_time': np.inf,
         'moving_delay': 2000.
     }
 
+    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
+    wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
+
     test_instances = [
-        # (fifo_agent, base_env, num_tests, base_seed, env_options),
-        # (scpt_agent, base_env, num_tests, base_seed, env_options),
-        # (lcpt_agent, base_env, num_tests, base_seed, env_options),
-        (decima_agent, wrapped_env, num_tests, base_seed, env_options)
+        (fifo_agent, base_env, num_tests, base_seed),
+        (scpt_agent, base_env, num_tests, base_seed),
+        (lcpt_agent, base_env, num_tests, base_seed),
+        (decima_agent, wrapped_env, num_tests, base_seed)
     ]
 
     # run tests in parallel using multiprocessing
@@ -71,8 +70,8 @@ def main():
 
     visualize_results('job_duration_cdf.png', 
                       agent_names, 
-                      test_results, 
-                      env_options)
+                      test_results,
+                      **env_kwargs)
 
 
 
@@ -81,7 +80,7 @@ def test(instance):
     torch.manual_seed(42)
     torch.set_num_threads(1)
 
-    agent, env, num_tests, base_seed, env_options = instance
+    agent, env, num_tests, base_seed = instance
 
     avg_job_durations = []
 
@@ -89,7 +88,7 @@ def test(instance):
         print(f'{agent.name}: iteration {i+1}', flush=True)
         
         with HiddenPrints():
-            run_episode(env, agent, base_seed + i, env_options)
+            run_episode(env, agent, base_seed + i)
             avg_job_durations += [avg_job_duration(env)*1e-3]
 
     return np.array(avg_job_durations)
@@ -109,8 +108,9 @@ def compute_CDF(arr, num_bins=100):
 
 
 
-def run_episode(env, agent, seed, options):  
-    obs, _ = env.reset(seed=seed, options=options)
+def run_episode(env, agent, seed): 
+    env_options = {'max_wall_time': np.inf} 
+    obs, _ = env.reset(seed=seed, options=env_options)
 
     done = False
     rewards = []
@@ -130,8 +130,8 @@ def run_episode(env, agent, seed, options):
 
 def visualize_results(out_fname, 
                       agent_names, 
-                      test_results, 
-                      env_options):
+                      test_results,
+                      **env_kwargs):
 
     # plot CDF's
     for agent_name, avg_job_durations in zip(agent_names, 
@@ -142,7 +142,7 @@ def visualize_results(out_fname,
     # display environment options in a table
     plt.table(cellText=\
                 [[key,val] 
-                for key,val in env_options.items()],
+                for key,val in env_kwargs.items()],
             colWidths=[.25, .1],
             cellLoc='center', 
             rowLoc='center',

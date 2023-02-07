@@ -241,9 +241,9 @@ def run_epoch(env, agent, data, seed, conn):
 
     env_options = {'max_wall_time': max_wall_time}
 
-    # with HiddenPrints():
-    rollout_buffer = \
-        collect_rollout(env, agent, seed=seed, options=env_options)
+    with HiddenPrints():
+        rollout_buffer = \
+            collect_rollout(env, agent, seed=seed, options=env_options)
 
     (obsns,
      actions,

@@ -136,10 +136,12 @@ class DagSchedEnv(Env):
         # observation is to start out with all of them in
         # a big array, and then to induce a subgraph from
         # the set of currently active nodes
-        self.all_edge_links, self.num_total_ops = \
+        self.all_edge_links, self.all_job_ptr = \
             self._reset_edge_links()
 
-        self.active_job_ids = set()
+        self.num_total_ops = self.all_job_ptr[-1]
+
+        self.active_job_ids = []
 
         self.completed_job_ids = set()
 
@@ -164,11 +166,12 @@ class DagSchedEnv(Env):
 
     def _reset_edge_links(self):
         edge_links = []
-        base_node_label = 0
+        job_ptr = [0]
         for job in self.jobs.values():
-            edge_links += [base_node_label + np.vstack(job.dag.edges)]
-            base_node_label += job.num_ops
-        return np.vstack(edge_links), base_node_label
+            base_op_idx = job_ptr[-1]
+            edge_links += [base_op_idx + np.vstack(job.dag.edges)]
+            job_ptr += [base_op_idx + job.num_ops]
+        return np.vstack(edge_links), np.array(job_ptr)
 
 
 
@@ -277,7 +280,7 @@ class DagSchedEnv(Env):
 
         # find remaining schedulable operations
         job = self.jobs[op.job_id]
-        self.schedulable_ops -= job.active_ops
+        self.schedulable_ops -= set(job.active_ops)
         self.schedulable_ops |= \
             self._find_schedulable_ops([op.job_id])
 
@@ -316,7 +319,7 @@ class DagSchedEnv(Env):
         self.op_selection_map.clear()
         
         nodes = []
-        ptr = []
+        ptr = [0]
         schedulable_op_mask = []
         active_op_mask = np.zeros(self.num_total_ops, dtype=bool)
         worker_counts = []
@@ -325,7 +328,6 @@ class DagSchedEnv(Env):
         for op in iter(self.schedulable_ops):
             op.schedulable = True
 
-        base_op_idx = 0
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
 
@@ -333,8 +335,6 @@ class DagSchedEnv(Env):
                 source_job_idx = i
 
             worker_counts += [self._state.total_worker_count(job_id)]
-
-            ptr += [len(nodes)]
 
             for op in iter(job.active_ops):
                 self.op_selection_map[len(nodes)] = op
@@ -344,11 +344,9 @@ class DagSchedEnv(Env):
                 schedulable_op_mask += [1] if op.schedulable else [0]
                 op.schedulable = False
 
-                active_op_mask[base_op_idx + op.id_] = 1
+                active_op_mask[self.all_job_ptr[job_id] + op.id_] = 1
 
-            base_op_idx += job.num_ops
-
-        ptr += [len(nodes)]
+            ptr += [len(nodes)]
 
         try:
             nodes = np.vstack(nodes).astype(np.float32)
@@ -418,8 +416,8 @@ class DagSchedEnv(Env):
         print(f'job {job.id_} arrived at t={self.wall_time*1e-3:.1f}s')
         print('dag edges:', list(job.dag.edges))
 
-        # self.jobs[job.id_] = job
-        self.active_job_ids.add(job.id_)
+        # self.active_job_ids.add(job.id_)
+        self.active_job_ids += [job.id_]
         self._state.add_job(job.id_)
         [self._state.add_op(*op.pool_key) for op in job.ops]
 
@@ -960,7 +958,7 @@ class DagSchedEnv(Env):
 
         # include jobs that completed and arrived
         # during the most recent simulation run
-        job_ids = old_active_job_ids | self.active_job_ids
+        job_ids = set(old_active_job_ids) | set(self.active_job_ids)
 
         print('calc reward', len(job_ids), old_wall_time, self.wall_time)
 

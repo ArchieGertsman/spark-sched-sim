@@ -16,9 +16,9 @@ def make_adj(edge_index, num_nodes):
 
 
 def subgraph(edge_index, node_mask):
-    '''numpy version of `torch_geometric.utils.subgraph`, with 
-    features unneeded in this project omitted. Note: assumes
-    that `edge_index` is of shape (num_nodes, 2)
+    '''numpy version of `torch_geometric.utils.subgraph`, omitting 
+    features that are unneeded in this project. Note: assumes
+    that `edge_index` is of shape (num_edges, 2)
     '''
     edge_mask = node_mask[edge_index[:,0]] & node_mask[edge_index[:,1]]
     edge_index = edge_index[edge_mask]

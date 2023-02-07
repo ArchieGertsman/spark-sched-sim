@@ -15,7 +15,7 @@ class Job:
         self.ops = ops
 
         # all incomplete operations
-        self.active_ops = set(ops)
+        self.active_ops = ops.copy()
         
         # incomplete operations whose parents have completed
         self.frontier_ops = set()

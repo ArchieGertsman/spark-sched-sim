@@ -14,7 +14,7 @@ import gym_dagsched.train_algs.reinforce as reinforce
 def main():
     setup()
 
-    num_workers = 10
+    num_workers = 50
 
     model_dir = 'gym_dagsched/data/models'
 
@@ -23,13 +23,14 @@ def main():
                     device=torch.device('cpu'))
                     # state_dict_path=f'{model_dir}/model_1b_20s_10w_200ep.pt')
 
-    # writer = SummaryWriter('ignore/log/train/b')
-    writer = None
+    writer = SummaryWriter('ignore/log/train/c')
+    # writer = None
 
     reinforce.train(decima_agent,
                     writer=writer, 
-                    world_size=1,
-                    num_epochs=1,
+                    world_size=4,
+                    num_epochs=500,
+                    num_workers=num_workers,
                     num_init_jobs=1,
                     num_job_arrivals=20,
                     job_arrival_rate=1/25000,

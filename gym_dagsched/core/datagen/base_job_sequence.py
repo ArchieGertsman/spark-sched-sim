@@ -1,8 +1,9 @@
+from abc import ABC, abstractmethod
 
 from ..timeline import Timeline, JobArrival
 
 
-class BaseJobSequenceGen:
+class BaseJobSequenceGen(ABC):
 
     def __init__(self, 
                  num_init_jobs, 
@@ -36,5 +37,6 @@ class BaseJobSequenceGen:
 
 
 
+    @abstractmethod
     def generate_job(self, job_id, t_arrival):
-        raise NotImplementedError
+        pass
