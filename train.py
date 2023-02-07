@@ -16,25 +16,27 @@ def main():
 
     num_workers = 50
 
-    model_dir = 'gym_dagsched/data/models'
+    # model_dir = 'gym_dagsched/data/models'
+    # state_dict_path = f'{model_dir}/model_1b_20s_10w_200ep.pt'
+    state_dict_path = None
 
-    decima_agent = \
-        DecimaAgent(num_workers, 
-                    device=torch.device('cpu'))
-                    # state_dict_path=f'{model_dir}/model_1b_20s_10w_200ep.pt')
+    decima_agent = DecimaAgent(num_workers,
+                               state_dict_path=state_dict_path)
 
-    writer = SummaryWriter('ignore/log/train/c')
-    # writer = None
+    # writer = SummaryWriter('ignore/log/train/c')
+    writer = None
 
-    reinforce.train(decima_agent,
-                    writer=writer, 
-                    world_size=4,
-                    num_epochs=500,
-                    num_workers=num_workers,
-                    num_init_jobs=1,
-                    num_job_arrivals=20,
-                    job_arrival_rate=1/25000,
-                    entropy_weight_init=.1)
+    reinforce.train(
+        decima_agent,
+        writer=writer, 
+        world_size=4,
+        num_epochs=2,
+        num_workers=num_workers,
+        num_init_jobs=1,
+        num_job_arrivals=20,
+        job_arrival_rate=1/25000,
+        entropy_weight_init=.1
+    )
 
     if writer:
         writer.close()

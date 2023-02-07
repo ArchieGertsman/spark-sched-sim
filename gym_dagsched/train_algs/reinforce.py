@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from typing import NamedTuple
 
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 import os
@@ -11,19 +11,15 @@ import torch.distributed as dist
 from torch.multiprocessing import Pipe, Process
 import gymnasium as gym
 
-from .common import (
-    collect_rollout, 
-    stack_obsns
-)
 from ..wrappers.decima_wrappers import (
     DecimaObsWrapper,
     DecimaActWrapper
 )
-from ..utils.metrics import avg_job_duration
+from ..utils import metrics
 from ..utils.device import device
 from ..utils.profiler import Profiler
 from ..utils.baselines import compute_baselines
-from ..utils.diff_returns import DifferentialReturnsCalculator
+from ..utils.returns_calculator import ReturnsCalculator
 from ..utils.hidden_prints import HiddenPrints
 
 
@@ -57,8 +53,8 @@ def train(agent,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '29500'
 
-    diff_return_calc = \
-        DifferentialReturnsCalculator(discount)
+    # computes differential returns by default
+    return_calc = ReturnsCalculator(discount)
 
     env_kwargs = {
         'num_workers': num_workers,
@@ -69,72 +65,56 @@ def train(agent,
     }
 
     procs, conns = \
-        setup_workers(world_size, agent, env_kwargs)
+        start_rollout_workers(world_size, agent, env_kwargs)
 
     max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
 
-    for i in range(num_epochs):
+    for epoch in range(num_epochs):
         # sample the max wall duration of the current episode
         max_time = np.random.exponential(max_time_mean)
 
         print('training on sequence '
-              f'{i+1} with max wall time = ' 
+              f'{epoch+1} with max wall time = ' 
               f'{max_time*1e-3:.1f}s',
               flush=True)
 
-        # send episode data to each of the workers.
-        for conn in conns:
-            conn.send((max_time, entropy_weight))
+        # send episode data
+        [conn.send((max_time, entropy_weight)) for conn in conns]
 
-        # wait for rewards and wall times
+        # rewards and wall times
         rewards_list, wall_times_list = \
             zip(*[conn.recv() for conn in conns])
 
-        diff_returns_list = \
-            diff_return_calc.calculate(wall_times_list,
-                                       rewards_list)
+        returns_list = \
+            return_calc.calculate(rewards_list, wall_times_list)
 
         baselines_list, stds_list = \
-            compute_baselines(wall_times_list,
-                              diff_returns_list)
+            compute_baselines(wall_times_list, returns_list)
 
-        value_losses = []
         # send advantages
-        for (returns, 
-             baselines,
-             stds,
-             conn) in zip(diff_returns_list,
-                          baselines_list,
-                          stds_list,
-                          conns):
+        gen = zip(returns_list,
+                  baselines_list,
+                  stds_list,
+                  conns)
+        for returns, baselines, stds, conn in gen:
             advantages = (returns - baselines) / (stds + 1e-8)
-            value_losses += [np.sum(advantages**2)]
             conn.send(advantages)
 
-        # wait for model update
-        (action_losses,
-         entropies,
-         avg_job_durations, 
-         completed_job_counts) = \
-            zip(*[conn.recv() for conn in conns])
+        # receive rollout stats
+        rollout_stats_list = [conn.recv() for conn in conns]
 
         if writer:
-            # log episode stats to tensorboard
-            episode_stats = {
-                'avg job duration': np.mean(avg_job_durations),
-                'max wall time': max_time,
-                'completed jobs count': np.mean(completed_job_counts),
-                'avg reward per sec': diff_return_calc.avg_per_step_reward,
-                'avg return': np.mean([returns[0] for returns in diff_returns_list]),
-                'action loss': np.mean(action_losses),
-                'entropy': np.mean(entropies),
-                'value loss': np.mean(value_losses),
-                'episode length': np.mean([len(rewards) for rewards in rewards_list])
-            }
-
-            for name, stat in episode_stats.items():
-                writer.add_scalar(name, stat, i)
+            ep_lens = [len(rewards) for rewards in rewards_list]
+            write_stats(
+                writer,
+                epoch,
+                rollout_stats_list,
+                returns_list,
+                ep_lens,
+                max_time,
+                return_calc.avg_per_step_reward()
+            )
 
         # increase the mean episode duration
         max_time_mean = \
@@ -146,12 +126,11 @@ def train(agent,
             max(entropy_weight - entropy_weight_decay, 
                 entropy_weight_min)
 
-    cleanup_workers(conns, procs)
+    end_rollout_workers(conns, procs)
 
 
 
-
-def setup_workers(num_envs, agent, env_kwargs):
+def start_rollout_workers(num_envs, agent, env_kwargs):
     procs = []
     conns = []
 
@@ -159,7 +138,7 @@ def setup_workers(num_envs, agent, env_kwargs):
         conn_main, conn_sub = Pipe()
         conns += [conn_main]
 
-        proc = Process(target=trainer, 
+        proc = Process(target=rollout_worker, 
                        args=(rank,
                              num_envs,
                              conn_sub,
@@ -172,13 +151,42 @@ def setup_workers(num_envs, agent, env_kwargs):
 
 
 
-
-def cleanup_workers(conns, procs):
+def end_rollout_workers(conns, procs):
     [conn.send(None) for conn in conns]
     [proc.join() for proc in procs]
 
 
 
+def write_stats(writer,
+                epoch,
+                rollout_stats_list, 
+                returns_list,
+                ep_lens,
+                max_time,
+                avg_per_step_reward):
+    (action_losses,
+     entropies,
+     avg_job_durations, 
+     completed_job_counts) = zip(*rollout_stats_list)
+
+    episode_stats = {
+        'avg job duration': np.mean(avg_job_durations),
+        'max wall time': max_time,
+        'completed jobs count': np.mean(completed_job_counts),
+        'avg reward per sec': avg_per_step_reward,
+        'avg return': np.mean([returns[0] for returns in returns_list]),
+        'action loss': np.mean(action_losses),
+        'entropy': np.mean(entropies),
+        'episode length': np.mean(ep_lens)
+    }
+
+    for name, stat in episode_stats.items():
+        writer.add_scalar(name, stat, epoch)
+
+
+
+
+## rollout workers
 
 def setup_worker(rank, world_size):
     sys.stdout = open(f'ignore/log/proc/{rank}.out', 'a')
@@ -196,30 +204,29 @@ def setup_worker(rank, world_size):
 
 
 
-
 def cleanup_worker():
     dist.destroy_process_group()
 
 
 
-
-def trainer(rank, num_envs, conn, agent, env_kwargs):
+def rollout_worker(rank, num_envs, conn, agent, env_kwargs):
     '''worker target which runs episodes 
     and trains the model by communicating 
     with the main process and other workers
     '''
     setup_worker(rank, num_envs)
 
-    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
+    env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
+    base_env = gym.make(env_id, **env_kwargs)
     env = DecimaActWrapper(DecimaObsWrapper(base_env))
-    agent.build(ddp=True, device=device)
+    agent.build(device=device, ddp=True)
     
     epoch = 0
     while data := conn.recv():
         prof = Profiler()
         prof.enable()
 
-        stats = run_epoch(env, agent, data, epoch, conn)
+        stats = run_epoch(env, agent, data, conn, seed=epoch)
 
         prof.disable()
 
@@ -235,24 +242,26 @@ def trainer(rank, num_envs, conn, agent, env_kwargs):
 
 
 
-
-def run_epoch(env, agent, data, seed, conn):
+def run_epoch(env, agent, data, conn, seed=42):
     max_wall_time, entropy_weight = data
 
     env_options = {'max_wall_time': max_wall_time}
 
     with HiddenPrints():
         rollout_buffer = \
-            collect_rollout(env, agent, seed=seed, options=env_options)
+            collect_rollout(env, 
+                            agent, 
+                            seed=seed, 
+                            options=env_options)
 
-    (obsns,
-     actions,
-     wall_times, 
-     rewards) = \
-        zip(*((exp.obs, 
-               exp.action, 
-               exp.wall_time, 
-               exp.reward) 
+    (wall_times, 
+     rewards,
+     obsns,
+     actions) = \
+        zip(*((exp.wall_time, 
+               exp.reward,
+               exp.obs,
+               exp.action) 
               for exp in rollout_buffer))
 
     conn.send((np.array(rewards), np.array(wall_times)))
@@ -273,25 +282,47 @@ def run_epoch(env, agent, data, seed, conn):
 
     return action_loss, \
            entropy_loss / len(rollout_buffer), \
-           avg_job_duration(env) * 1e-3, \
+           metrics.avg_job_duration(env) * 1e-3, \
            env.num_completed_jobs
+    
 
 
 
-def compute_loss(agent,
-                 obsns,
-                 actions,
-                 advantages,
-                 entropy_weight):
+class Experience(NamedTuple):
+    obs: object
+    wall_time: float
+    action: object
+    reward: float
 
-    obsns = stack_obsns(obsns)
 
-    # calculate attributes of the actions
-    # which will be used to construct loss
+
+def collect_rollout(env, agent, seed, options):  
+    obs, info = env.reset(seed=seed, options=options)
+    done = False
+
+    rollout_buffer = []
+
+    while not done:
+        action = agent(obs)
+
+        new_obs, reward, terminated, truncated, info = \
+            env.step(action)
+
+        done = (terminated or truncated)
+
+        exp = Experience(obs, info['wall_time'], action, reward)
+        rollout_buffer += [exp]
+
+        obs = new_obs
+
+    return rollout_buffer
+
+
+
+def compute_loss(agent, obsns, actions, advantages, entropy_weight):
     action_lgprobs, action_entropies = \
         agent.evaluate_actions(obsns, actions)
 
-    # compute loss
     action_loss = -advantages @ action_lgprobs
     entropy_loss = action_entropies.sum()
     total_loss = action_loss + entropy_weight * entropy_loss

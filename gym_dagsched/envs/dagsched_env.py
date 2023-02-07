@@ -49,7 +49,7 @@ class DagSchedEnv(Env):
 
         self.action_space = Dict({
             # operation selection
-            # Note: upper bound of this space is dynamic, equal to 
+            # NOTE: upper bound of this space is dynamic, equal to 
             # the number of active operations. Initialized to 1.
             'op_idx': Discrete(1),
 
@@ -61,13 +61,17 @@ class DagSchedEnv(Env):
             'dag_batch': Dict({
                 # shape: (num active ops) x (2 features)
                 # op features: num remaining tasks, most recent task duration
+                # edge features: none
                 'data': Graph(node_space=Box(0, np.inf, (2,)), 
                               edge_space=Discrete(1)),
 
-                # shape: num active jobs
+                # length: num active jobs
                 # `ptr[job_idx]` returns the index of the first operation
                 # associated with that job. E.g., the range of operation
-                # indices for a job is given by `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
+                # indices for a job is given by 
+                # `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
+                # NOTE: upper bound of this space is dynamic, equal to 
+                # the number of active operations. Initialized to 1.
                 'ptr': Sequence(Discrete(1)),
             }),
 
@@ -75,6 +79,9 @@ class DagSchedEnv(Env):
             # `mask[i]` = 1 if op `i` is schedulable, 0 otherwise
             'schedulable_op_mask': Sequence(Discrete(2)),
 
+            # shape: (num active jobs, num workers)
+            # `mask[job_idx][l]` = 1 if parallism limit `l` is valid
+            # for that job
             'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_workers)),
 
             # integer that represents how many workers need to be scheduled
@@ -117,16 +124,22 @@ class DagSchedEnv(Env):
             self.max_wall_time = options['max_wall_time']
         except:
             self.max_wall_time = np.inf
+
+        self.wall_time = 0.
+
+        self.terminated = False
+
+        self.truncated = False
         
-        self.timeline = \
-            self._datagen.new_timeline(self.np_random)
+        # priority queue of scheduling events, indexed by wall time
+        self.timeline = self._datagen.new_timeline(self.np_random)
 
         self.workers = [Worker(i) for i in range(self.num_workers)]
 
         self._state.reset()
 
-        self.wall_time = 0.
-
+        # timeline is initially filled with all the job arrival
+        # events, so extract all the job objects from there
         self.jobs = {
             i: e.job 
             for i, (*_, e) in enumerate(self.timeline.pq)
@@ -134,8 +147,8 @@ class DagSchedEnv(Env):
 
         # the fastest way to obtain the edge links for an
         # observation is to start out with all of them in
-        # a big array, and then to induce a subgraph from
-        # the set of currently active nodes
+        # a big array, and then to induce a subgraph based
+        # on the current set of active nodes
         self.all_edge_links, self.all_job_ptr = \
             self._reset_edge_links()
 
@@ -148,12 +161,13 @@ class DagSchedEnv(Env):
         self.executor_interval_map = \
             self._make_executor_interval_map()
 
-        self.terminated = False
-
-        self.truncated = False
-
+        # during a scheduling round, maintains the operations
+        # that have already been selected so that they don't
+        # get selected again
         self.selected_ops = set()
 
+        # active op index -> op object
+        # used to trace an action to its corresponding operation
         self.op_selection_map = {}
 
         self._load_initial_jobs()
@@ -161,29 +175,6 @@ class DagSchedEnv(Env):
         obs = self._observe()
         info = {'wall_time': self.wall_time}
         return obs, info
-
-
-
-    def _reset_edge_links(self):
-        edge_links = []
-        job_ptr = [0]
-        for job in self.jobs.values():
-            base_op_idx = job_ptr[-1]
-            edge_links += [base_op_idx + np.vstack(job.dag.edges)]
-            job_ptr += [base_op_idx + job.num_ops]
-        return np.vstack(edge_links), np.array(job_ptr)
-
-
-
-    def _load_initial_jobs(self):
-        while not self.timeline.empty:
-            wall_time, event = self.timeline.peek()
-            if wall_time > 0:
-                break
-            self.timeline.pop()
-            self._process_scheduling_event(event)
-
-        self.schedulable_ops = self._find_schedulable_ops()
 
 
 
@@ -224,13 +215,11 @@ class DagSchedEnv(Env):
         self.truncated = (self.wall_time >= self.max_wall_time)
 
         if not self.done:
-            print('starting new scheduling round', 
-                  flush=True)
+            print('starting new scheduling round', flush=True)
             assert self._state.num_workers_to_schedule() > 0 and \
                    len(self.schedulable_ops) > 0
         else:
-            print(f'done at {self.wall_time*1e-3:.1f}s', 
-                  flush=True)
+            print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
 
         # if the episode isn't done, then start a new scheduling 
         # round at the current worker source
@@ -241,6 +230,31 @@ class DagSchedEnv(Env):
                self.terminated, \
                self.truncated, \
                info
+
+
+
+    ## internal methods
+
+    def _reset_edge_links(self):
+        edge_links = []
+        job_ptr = [0]
+        for job in self.jobs.values():
+            base_op_idx = job_ptr[-1]
+            edge_links += [base_op_idx + np.vstack(job.dag.edges)]
+            job_ptr += [base_op_idx + job.num_ops]
+        return np.vstack(edge_links), np.array(job_ptr)
+
+
+
+    def _load_initial_jobs(self):
+        while not self.timeline.empty:
+            wall_time, event = self.timeline.peek()
+            if wall_time > 0:
+                break
+            self.timeline.pop()
+            self._process_scheduling_event(event)
+
+        self.schedulable_ops = self._find_schedulable_ops()
 
 
 
@@ -268,7 +282,7 @@ class DagSchedEnv(Env):
         # agent may have requested more workers than
         # are actually needed or available
         num_workers = \
-            self.adjust_num_workers(num_workers, op)
+            self._adjust_num_workers(num_workers, op)
 
         print(f'committing {num_workers} workers '
               f'to {op.pool_key}')
@@ -615,11 +629,11 @@ class DagSchedEnv(Env):
 
 
 
-    def adjust_num_workers(self, num_workers, op):
+    def _adjust_num_workers(self, num_workers, op):
         '''truncates the numer of worker assigned
         to `op` to the op's demand, if it's larger
         '''
-        worker_demand = self.get_worker_demand(op)
+        worker_demand = self._get_worker_demand(op)
         num_source_workers = self._state.num_workers_to_schedule()
 
         num_workers_adjusted = \
@@ -634,7 +648,7 @@ class DagSchedEnv(Env):
 
 
 
-    def get_worker_demand(self, op):
+    def _get_worker_demand(self, op):
         '''an operation's worker demand is the
         number of workers that it can accept
         in addition to the workers currently
@@ -661,7 +675,7 @@ class DagSchedEnv(Env):
         '''an operation is saturated if it
         doesn't need any more workers.
         '''
-        return self.get_worker_demand(op) <= 0
+        return self._get_worker_demand(op) <= 0
             
 
 
@@ -766,7 +780,7 @@ class DagSchedEnv(Env):
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
-        print('job completion', job.id_)
+        print(f'job {job.id_} completed at time {self.wall_time*1e-3:.1f}s')
         
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids.add(job.id_)

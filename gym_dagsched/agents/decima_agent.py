@@ -3,13 +3,12 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributions import Categorical
 from torch_geometric.nn import MessagePassing, global_add_pool
-from torch_geometric.data import Batch
+from torch_geometric.data import Data, Batch
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
 import numpy as np
 
 from .base_agent import BaseAgent
-from ..utils.device import device as default_device
 from ..utils.graph import make_adj
 
 
@@ -20,7 +19,6 @@ class DecimaAgent(BaseAgent):
                  num_workers,
                  training_mode=True,
                  state_dict_path=None,
-                 device=None,
                  num_node_features=5, 
                  num_dag_features=3, 
                  dim_embed=8,
@@ -40,16 +38,8 @@ class DecimaAgent(BaseAgent):
 
         self.optim_lr = optim_lr
 
-        if device is None:
-            device = default_device
-
-        self.device = device
-
-        self.actor_network.to(device)
-
         if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path, 
-                                    map_location=device)
+            state_dict = torch.load(state_dict_path)
             self.actor_network.load_state_dict(state_dict)
 
         self.actor_network.train(training_mode)
@@ -58,11 +48,21 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def build(self, ddp=False, device=None):
+    @property
+    def device(self):
+        try:
+            return self.actor_network.device
+        except:
+            return torch.device('cpu')
+
+
+
+    def build(self, device=None, ddp=False):
+        if device is not None:
+            self.actor_network.to(device)
+
         if ddp:
             assert device is not None
-            self.device = device
-            self.actor_network.to(device)
             self.actor_network = DDP(self.actor_network, 
                                      device_ids=[device])
 
@@ -83,11 +83,11 @@ class DecimaAgent(BaseAgent):
         with torch.no_grad():
             # no computational graphs needed during 
             # the episode, only model outputs.
-            node_scores, dag_scores = \
-                self.actor_network(dag_batch)
+            node_scores, dag_scores = self.actor_network(dag_batch)
 
         schedulable_op_mask = \
             torch.tensor(obs['schedulable_op_mask'], dtype=bool)
+
         valid_prlsm_lim_mask = \
             torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
 
@@ -108,9 +108,9 @@ class DecimaAgent(BaseAgent):
          num_dags_per_obs,
          num_nodes_per_dag,
          schedulable_op_masks,
-         valid_prlsm_lim_masks) = obsns
+         valid_prlsm_lim_masks) = self._stack_obsns(obsns)
 
-        nested_dag_batch.to(default_device)
+        nested_dag_batch.to(self.device)
 
         # re-feed all the inputs from the entire
         # episode back through the model, this time
@@ -131,10 +131,12 @@ class DecimaAgent(BaseAgent):
                            schedulable_op_masks,
                            valid_prlsm_lim_masks)
 
+        action_values = zip(*(act.values() for act in actions))
+
         (node_selections, 
          dag_idxs, 
          dag_selections) = \
-            [torch.tensor(lst) for lst in zip(*(act.values() for act in actions))]
+            [torch.tensor(lst) for lst in action_values]
 
         (all_node_probs, 
          node_lgprobs, 
@@ -148,16 +150,15 @@ class DecimaAgent(BaseAgent):
         
         dag_lgprobs, dag_entropies = \
             self._evaluate_dag_actions(dag_scores_batch, 
-                                       dag_idxs + obs_indptr[:-1], 
+                                       dag_idxs, 
                                        dag_selections,
                                        dag_probs,
                                        obs_indptr)
 
         action_lgprobs = node_lgprobs + dag_lgprobs
 
-        action_entropies = \
-            (node_entropies + dag_entropies) * \
-            self._get_entropy_scale(num_nodes_per_obs)
+        action_entropies = (node_entropies + dag_entropies) * \
+                           self._get_entropy_scale(num_nodes_per_obs)
 
         return action_lgprobs, action_entropies
 
@@ -169,7 +170,7 @@ class DecimaAgent(BaseAgent):
         loss.backward()
 
         if num_envs is not None:
-            # DDP averages grads, however we want their
+            # DDP averages grads while we want their
             # sum, so scale them back
             for param in self.actor_network.parameters():
                 param.grad.mul_(num_envs)
@@ -181,15 +182,15 @@ class DecimaAgent(BaseAgent):
 
     ## internal methods
 
-    def _to_pyg(self, raw_dag_batch):
-        ptr = np.array(raw_dag_batch['ptr'])
+    def _to_pyg(self, obs_dag_batch):
+        '''construct PyG `Batch` object from `obs['dag_batch']`'''
+        ptr = np.array(obs_dag_batch['ptr'])
         num_nodes_per_dag = ptr[1:] - ptr[:-1]
-        num_active_nodes = raw_dag_batch['data'].nodes.shape[0]
+        num_active_nodes = obs_dag_batch['data'].nodes.shape[0]
         num_active_jobs = len(num_nodes_per_dag)
 
-        # construct PyG `Batch` object
-        x = raw_dag_batch['data'].nodes
-        edge_index = torch.from_numpy(raw_dag_batch['data'].edge_links.T)
+        x = obs_dag_batch['data'].nodes
+        edge_index = torch.from_numpy(obs_dag_batch['data'].edge_links.T)
         adj = make_adj(edge_index, num_active_nodes)
         batch = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
         dag_batch = Batch(x=torch.from_numpy(x), 
@@ -234,6 +235,69 @@ class DecimaAgent(BaseAgent):
             'job_idx': job_idx.item(),
             'prlsm_lim': prlsm_lim.item()
         }
+
+
+
+    @classmethod
+    def _stack_obsns(cls, obsns):
+        (dag_batches,
+         valid_ops_masks, 
+         valid_prlsm_lim_masks) = \
+            zip(*((obs['dag_batch'], 
+                   obs['schedulable_op_mask'], 
+                   obs['valid_prlsm_lim_mask']) 
+                  for obs in obsns))
+
+        nested_dag_batch, num_dags_per_obs, num_nodes_per_dag = \
+            cls._nest_dag_batches(dag_batches)
+
+        valid_ops_masks = np.concatenate(valid_ops_masks).astype(bool)
+        valid_prlsm_lim_masks = torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
+
+        return nested_dag_batch, \
+               num_dags_per_obs, \
+               num_nodes_per_dag, \
+               valid_ops_masks, \
+               valid_prlsm_lim_masks
+
+
+    
+    @classmethod
+    def _nest_dag_batches(cls, dag_batches):
+        '''nests the dag batches from each observation into 
+        one large dag batch
+        '''
+        _to_pyg = lambda raw_data: \
+            Data(x=torch.from_numpy(raw_data.nodes), 
+                 edge_index=torch.from_numpy(raw_data.edge_links.T))
+
+        def _get_num_nodes_per_dag(ptr):
+            ptr = np.array(ptr)
+            return ptr[1:] - ptr[:-1]
+
+        data_list, num_dags_per_obs, num_nodes_per_dag = \
+            zip(*((_to_pyg(dag_batch['data']), 
+                    len(dag_batch['ptr'])-1,
+                    _get_num_nodes_per_dag(dag_batch['ptr']))
+                  for dag_batch in dag_batches))
+
+        num_dags_per_obs = torch.tensor(num_dags_per_obs)
+        num_nodes_per_dag = torch.from_numpy(np.concatenate(num_nodes_per_dag))
+        total_num_dags = num_dags_per_obs.sum()
+
+        nested_dag_batch = Batch.from_data_list(data_list)
+        nested_dag_batch.batch = \
+            torch.arange(total_num_dags) \
+                .repeat_interleave(num_nodes_per_dag)
+        ptr = num_nodes_per_dag.cumsum(dim=0)
+        nested_dag_batch.ptr = \
+            torch.cat([torch.tensor([0]), ptr], dim=0)
+        nested_dag_batch._num_graphs = total_num_dags
+        nested_dag_batch.adj = \
+            make_adj(nested_dag_batch.edge_index, 
+                     nested_dag_batch.x.shape[0])
+
+        return nested_dag_batch, num_dags_per_obs, num_nodes_per_dag
 
 
 
@@ -382,13 +446,16 @@ class DecimaAgent(BaseAgent):
     @classmethod
     def _evaluate_dag_actions(cls,
                               dag_scores_batch, 
-                              dag_idx_batch, 
-                              dag_selection_batch,
+                              dag_idxs, 
+                              dag_selections,
                               dag_probs,
                               obs_indptr):
+
+        dag_idxs += obs_indptr[:-1]
+
         dag_lgprob_batch = \
-            Categorical(logits=dag_scores_batch[dag_idx_batch]) \
-                .log_prob(dag_selection_batch)
+            Categorical(logits=dag_scores_batch[dag_idxs]) \
+                .log_prob(dag_selections)
 
         # can't have rows where all the entries are
         # -inf when computing entropy, so for all such 

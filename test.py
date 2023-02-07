@@ -24,14 +24,14 @@ from gym_dagsched.agents.cpt_agent import CPTAgent
 def main():
     setup()
 
-    num_tests = 100
+    num_tests = 1
 
-    num_workers = 50
+    num_workers = 10
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
-    base_seed = 500
+    base_seed = 503 # NOTE: model does awful on 503
 
     model_dir = 'gym_dagsched/results/models'
 
@@ -52,7 +52,8 @@ def main():
         'moving_delay': 2000.
     }
 
-    base_env = gym.make('gym_dagsched:gym_dagsched/DagSchedEnv-v0', **env_kwargs)
+    env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
+    base_env = gym.make(env_id, **env_kwargs)
     wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
 
     test_instances = [
@@ -71,13 +72,12 @@ def main():
     visualize_results('job_duration_cdf.png', 
                       agent_names, 
                       test_results,
-                      **env_kwargs)
+                      env_kwargs)
 
 
 
 def test(instance):
     sys.stdout = open(f'ignore/log/proc/main.out', 'a')
-    torch.manual_seed(42)
     torch.set_num_threads(1)
 
     agent, env, num_tests, base_seed = instance
@@ -85,11 +85,14 @@ def test(instance):
     avg_job_durations = []
 
     for i in range(num_tests):
-        print(f'{agent.name}: iteration {i+1}', flush=True)
-        
-        with HiddenPrints():
-            run_episode(env, agent, base_seed + i)
-            avg_job_durations += [avg_job_duration(env)*1e-3]
+        torch.manual_seed(42)
+
+        # with HiddenPrints():
+        run_episode(env, agent, base_seed + i)
+
+        result = avg_job_duration(env)*1e-3
+        avg_job_durations += [result]
+        print(f'{agent.name}: test {i+1}, avj={result:.1f}s', flush=True)
 
     return np.array(avg_job_durations)
 
@@ -131,7 +134,7 @@ def run_episode(env, agent, seed):
 def visualize_results(out_fname, 
                       agent_names, 
                       test_results,
-                      **env_kwargs):
+                      env_kwargs):
 
     # plot CDF's
     for agent_name, avg_job_durations in zip(agent_names, 

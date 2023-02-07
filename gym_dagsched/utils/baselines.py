@@ -4,34 +4,39 @@ import numpy as np
 
 
 def compute_baselines(ts_list, ys_list):
-    '''piecewise linear fit baseline'''
+    '''piecewise linear fit baseline
+
+    args:
+    - `ts_list`: list of wall time arrays (len: num envs)
+    - 'ys_list': list of value (e.g. return) arrays (len: num envs)
+    
+    returns: list of basline arrays and list of std arrays
+    (both len: num envs)
+    '''
     ts_unique = np.unique(np.hstack(ts_list))
 
-    # find baseline value at each unique time point
-    baseline_values = \
-        {t: np.mean([pw_linear_fit(t, ts, ys)
-                     for ts, ys in zip(ts_list, ys_list)])
-         for t in ts_unique}
+    # find baseline and std at each unique time point
+    baselines = {}
+    stds = {}
+    for t in ts_unique:
+        values = [_pw_linear_fit(t, ts, ys) 
+                  for ts, ys in zip(ts_list, ys_list)]
+        baselines[t] = np.mean(values)
+        stds[t] = np.std(values)
 
-    std_values = \
-        {t: np.std([pw_linear_fit(t, ts, ys)
-                    for ts, ys in zip(ts_list, ys_list)])
-         for t in ts_unique}
-
-    # output baselines for each env
     baselines_list = \
-        [np.array([baseline_values[t] for t in ts])
+        [np.array([baselines[t] for t in ts])
          for ts in ts_list]
 
     stds_list = \
-        [np.array([std_values[t] for t in ts])
+        [np.array([stds[t] for t in ts])
          for ts in ts_list]
 
     return baselines_list, stds_list
 
 
 
-def pw_linear_fit(t, ts, ys):
+def _pw_linear_fit(t, ts, ys):
     '''approximates `y(t)` according to a piecewise 
     linear fit on (ts, ys)
     '''
