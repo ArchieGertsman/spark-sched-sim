@@ -2,6 +2,9 @@
 
 A dag scheduling environment adhering to the [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) interface.
 
+![ezgif com-optimize](https://user-images.githubusercontent.com/20342690/217447704-5f5a6ad2-4d16-4e2b-9515-99b2ee1e70b0.gif)
+
+
 What is (job) dag scheduling?
 - a job dag (directed acyclic graph) is used to represent jobs made of operations (nodes) that depend on each other (edges). A dependency A->B means that A must complete before B can begin.
 - scheduling job dags means assigning resources to process them, according to some set of rules. If A is an operation whose dependencies are all satisfied, and X is an idle worker, then X can be assigned to A.
