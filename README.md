@@ -2,7 +2,7 @@
 
 A job dag scheduling [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) environment.
 
-| ![ezgif com-optimize](https://user-images.githubusercontent.com/20342690/217447704-5f5a6ad2-4d16-4e2b-9515-99b2ee1e70b0.gif)| 
+| ![ezgif com-video-to-gif](https://user-images.githubusercontent.com/20342690/217462386-ceb6ea2e-f51f-4b78-8251-24672c382371.gif)| 
 |:--:| 
 | *10 workers processing jobs of different colors in parallel across the vertical axis* |
 
