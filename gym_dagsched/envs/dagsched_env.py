@@ -9,6 +9,7 @@ from gymnasium.spaces import (
     Graph,
     GraphInstance
 )
+import pygame
 
 from ..core.worker_assignment_state import (
     WorkerAssignmentState, 
@@ -22,17 +23,20 @@ from ..core.timeline import (
 from ..core.entities.worker import Worker
 from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 from ..utils.graph import subgraph
+from ..utils import metrics
 
 
 
 class DagSchedEnv(Env):
+    metadata = {'render_modes': ['human'], 'render_fps': 10}
 
     def __init__(self,
                  num_workers,
                  num_init_jobs,
                  num_job_arrivals,
                  job_arrival_rate,
-                 moving_delay):
+                 moving_delay,
+                 render_mode=None):
 
         num_total_jobs = num_init_jobs + num_job_arrivals
 
@@ -97,6 +101,12 @@ class DagSchedEnv(Env):
             'worker_counts': Sequence(Discrete(2*num_workers))
         })
 
+        # rendering attributes
+        self.render_mode = render_mode
+        self.window = None
+        self.clock = None
+        self.window_size = 512
+
 
 
     @property
@@ -135,6 +145,8 @@ class DagSchedEnv(Env):
         self.timeline = self._datagen.new_timeline(self.np_random)
 
         self.workers = [Worker(i) for i in range(self.num_workers)]
+        for worker in self.workers:
+            worker.add_history(0., -1)
 
         self._state.reset()
 
@@ -221,6 +233,9 @@ class DagSchedEnv(Env):
         else:
             print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
 
+        if self.render_mode == 'human':
+            self._render_frame()
+
         # if the episode isn't done, then start a new scheduling 
         # round at the current worker source
         obs = self._observe()
@@ -233,7 +248,101 @@ class DagSchedEnv(Env):
 
 
 
+    def close(self):
+        if self.window is not None:
+            pygame.image.save(self.window, "screenshot.png")
+            pygame.display.quit()
+            pygame.quit()
+
+
+
+
     ## internal methods
+
+    def _render_frame(self):
+        assert self.render_mode == 'human'
+
+        if self.window is None:
+            pygame.init()
+            pygame.display.init()
+            self.window = pygame.display.set_mode(
+                (self.window_size, self.window_size)
+            )
+            self.font = pygame.font.SysFont('couriernew', 20)
+
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+
+        canvas = pygame.Surface((self.window_size, self.window_size))
+        canvas.fill((255, 255, 255))
+
+        HEIGHT = np.ceil(self.window_size / self.num_workers)
+
+        for i, worker in enumerate(self.workers):
+            y = i * HEIGHT
+            x = 0
+            for i in range(len(worker.history)):
+                t, job_id = worker.history[i]
+                if i > 0:
+                    t_prev = worker.history[i-1][0]
+                    assert t_prev is not None
+                else:
+                    t_prev = 0
+
+                if t is None:
+                    t = self.wall_time
+
+                width = np.ceil(self.window_size * ((t-t_prev) / self.wall_time))
+
+                r = 255 * ((job_id+1) / self.num_total_jobs)
+
+                pygame.draw.rect(
+                    canvas,
+                    (0, r, r),
+                    pygame.Rect(
+                        (x, y),
+                        (width, HEIGHT),
+                    ),
+                )
+
+                x += width
+
+        # indicate job completions with red markers
+        for job_id in self.completed_job_ids:
+            job = self.jobs[job_id]
+            x = self.window_size * (job.t_completed / self.wall_time)
+
+            pygame.draw.rect(
+                canvas,
+                (255, 0, 0),
+                pygame.Rect(
+                    (x, 0),
+                    (2, self.window_size)
+                )
+            )
+
+        # print current average job duration
+        avg_job_duration = int(metrics.avg_job_duration(self) * 1e-3)
+        wall_time = int(self.wall_time * 1e-3)
+        time_text_surface = self.font.render(f'Wall time: {wall_time}s', False, (255,)*3)
+        ajd_text_surface = self.font.render(f'Avg job duration: {avg_job_duration}s', False, (255,)*3)
+        naj_text_surface = self.font.render(f'Num active jobs: {len(self.active_job_ids)}', False, (255,)*3)
+        njc_text_surface = self.font.render(f'Num jobs completed: {self.num_completed_jobs}', False, (255,)*3)
+    
+        # The following line copies our drawings from `canvas` to the visible window
+        self.window.blit(canvas, canvas.get_rect())
+        self.window.blit(time_text_surface, (0,0))
+        self.window.blit(ajd_text_surface, (0,20))
+        self.window.blit(naj_text_surface, (0,40))
+        self.window.blit(njc_text_surface, (0,60))
+        pygame.event.pump()
+        pygame.display.update()
+
+        # We need to ensure that human-rendering occurs at the predefined framerate.
+        # The following line will automatically add a delay to keep the framerate stable.
+        self.clock.tick(self.metadata['render_fps'])
+
+
 
     def _reset_edge_links(self):
         edge_links = []
@@ -464,6 +573,7 @@ class DagSchedEnv(Env):
         job = self.jobs[op.job_id]
 
         job.add_local_worker(worker)
+        worker.add_history(self.wall_time, job.id_)
 
         self._state.count_worker_arrival(op.pool_key)
 
@@ -889,6 +999,9 @@ class DagSchedEnv(Env):
               f'{src_pool_key} to {dst_pool_key}')
 
         for worker_id in worker_ids:
+            worker = self.workers[worker_id]
+            if dst_pool_key == GENERAL_POOL_KEY:
+                worker.add_history(self.wall_time, -1)
             self._state.move_worker_to_pool(worker_id, 
                                             dst_pool_key)
 
@@ -914,6 +1027,9 @@ class DagSchedEnv(Env):
         job = self.jobs[worker.job_id]
         dst_pool_key = GENERAL_POOL_KEY if job.completed else (worker.job_id, None)
         self._state.move_worker_to_pool(worker.id_, dst_pool_key)
+
+        if dst_pool_key == GENERAL_POOL_KEY:
+            worker.add_history(self.wall_time, -1)
 
 
 

@@ -7,6 +7,17 @@ class Worker:
     task = None
     job_id = None
     op_id = None
+    history = None
+
+
+    def add_history(self, wall_time, job_id):
+        if self.history is None:
+            self.history = []
+
+        if len(self.history) > 0:
+            self.history[-1][0] = wall_time
+        
+        self.history += [[None, job_id]]
 
 
     @property

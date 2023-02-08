@@ -39,7 +39,7 @@ class DecimaAgent(BaseAgent):
         self.optim_lr = optim_lr
 
         if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path)
+            state_dict = torch.load(state_dict_path, map_location=self.device)
             self.actor_network.load_state_dict(state_dict)
 
         self.actor_network.train(training_mode)
