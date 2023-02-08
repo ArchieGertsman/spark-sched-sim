@@ -1,11 +1,12 @@
 # gym-dagsched
 
-A dag scheduling environment adhering to the [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) interface.
+A job dag scheduling [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) environment.
 
-![ezgif com-optimize](https://user-images.githubusercontent.com/20342690/217447704-5f5a6ad2-4d16-4e2b-9515-99b2ee1e70b0.gif)
+| ![ezgif com-optimize](https://user-images.githubusercontent.com/20342690/217447704-5f5a6ad2-4d16-4e2b-9515-99b2ee1e70b0.gif)| 
+|:--:| 
+| *10 workers processing jobs of different colors in parallel across the vertical axis* |
 
-
-What is (job) dag scheduling?
+What is job dag scheduling?
 - a job dag (directed acyclic graph) is used to represent jobs made of operations (nodes) that depend on each other (edges). A dependency A->B means that A must complete before B can begin.
 - scheduling job dags means assigning resources to process them, according to some set of rules. If A is an operation whose dependencies are all satisfied, and X is an idle worker, then X can be assigned to A.
 - dag scheduling is important. A smarter scheduling algorithm can result in faster job turnaround time.
