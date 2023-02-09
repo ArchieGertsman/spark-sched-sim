@@ -3,20 +3,21 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import networkx as nx
+from gymnasium.core import ObsType, ActType
 
 
 
 class BaseAgent(ABC):
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
 
 
-    def __call__(self, obs):
+    def __call__(self, obs: ObsType) -> ActType:
         return self.predict(obs)
         
 
     @abstractmethod
-    def predict(self, obs):
+    def predict(self, obs: ObsType) -> ActType:
         '''must be implemented for every agent.
         Takes an observation of the environment,
         and returns an action.

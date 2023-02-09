@@ -1,20 +1,31 @@
 import numpy as np
+import networkx as nx
+
+from .operation import Operation
 
 
 class Job:
     '''An object representing a job in the system, containing
-    a set of operations with interdependencies, stored as a dag.
+    a set of operations with dependencies stored in a dag.
     '''
 
-    def __init__(self, id_, ops, dag, t_arrival):
+    def __init__(
+        self, 
+        id_: int, 
+        ops: list[Operation], 
+        dag: nx.DiGraph, 
+        t_arrival: float
+    ):
         # unique identifier of this job
         self.id_ = id_
 
         # list of objects of all the operations
         # that belong to this job
+        # TODO: use ordered set
         self.ops = ops
 
         # all incomplete operations
+        # TODO: use ordered set
         self.active_ops = ops.copy()
         
         # incomplete operations whose parents have completed
@@ -33,9 +44,8 @@ class Job:
         # set of workers that are local to this job
         self.local_workers = set()
 
+        # count of operations who have no remaining tasks
         self.saturated_op_count = 0
-
-        self.total_worker_count = 0
 
 
 

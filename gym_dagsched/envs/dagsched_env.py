@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 from gymnasium import Env
 from gymnasium.spaces import (
@@ -9,7 +11,6 @@ from gymnasium.spaces import (
     Graph,
     GraphInstance
 )
-import pygame
 
 from ..core.worker_assignment_state import (
     WorkerAssignmentState, 
@@ -24,19 +25,40 @@ from ..core.entities.worker import Worker
 from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 from ..utils.graph import subgraph
 from ..utils import metrics
+from ..utils.render import Renderer
 
 
 
 class DagSchedEnv(Env):
-    metadata = {'render_modes': ['human'], 'render_fps': 10}
+    '''Gymnasium environment that simulates job dag scheduling'''
 
-    def __init__(self,
-                 num_workers,
-                 num_init_jobs,
-                 num_job_arrivals,
-                 job_arrival_rate,
-                 moving_delay,
-                 render_mode=None):
+    metadata = {'render_modes': ['human'], 'render_fps': 30}
+
+    def __init__(
+        self,
+        num_workers: int,
+        num_init_jobs: int,
+        num_job_arrivals: int,
+        job_arrival_rate: float,
+        moving_delay: float,
+        render_mode: Optional[str] = None
+    ):
+        '''
+        Args:
+            num_workers (int): number of simulated workers. More workers
+                means a higher possible level of parallelism.
+            num_init_jobs (int): number of jobs in the system at time t=0
+            num_job_arrivals: (int): number of jobs that arrive throughout
+                the simulation, according to a Poisson process
+            job_arrival_rate (float): non-negative number that controls how
+                quickly new jobs arrive into the system. This is the parameter
+                of an exponential distributions, and so its inverse is the
+                mean job inter-arrival time in ms.
+            moving_delay (float): time in ms it takes for a worker to move
+                between jobs
+            render_mode (optional str): if set to 'human', then a visualization
+                of the simulation is rendred in real time
+        '''
 
         num_total_jobs = num_init_jobs + num_job_arrivals
 
@@ -50,6 +72,14 @@ class DagSchedEnv(Env):
                                job_arrival_rate)
 
         self._state = WorkerAssignmentState(num_workers)
+
+        self.render_mode = render_mode
+
+        if render_mode == 'human':
+            self._renderer = \
+                Renderer(self.num_workers, self.num_total_jobs)
+        else:
+            self._renderer = None
 
         self.action_space = Dict({
             # operation selection
@@ -101,12 +131,6 @@ class DagSchedEnv(Env):
             'worker_counts': Sequence(Discrete(2*num_workers))
         })
 
-        # rendering attributes
-        self.render_mode = render_mode
-        self.window = None
-        self.clock = None
-        self.window_size = 512
-
 
 
     @property
@@ -122,8 +146,20 @@ class DagSchedEnv(Env):
 
 
     @property
+    def num_active_jobs(self):
+        return len(self.active_job_ids)
+
+
+
+    @property
     def done(self):
         return self.terminated or self.truncated
+
+
+
+    @property
+    def info(self):
+        return {'wall_time': self.wall_time}
 
 
 
@@ -135,6 +171,7 @@ class DagSchedEnv(Env):
         except:
             self.max_wall_time = np.inf
 
+        # simulation wall time in ms
         self.wall_time = 0.
 
         self.terminated = False
@@ -145,8 +182,6 @@ class DagSchedEnv(Env):
         self.timeline = self._datagen.new_timeline(self.np_random)
 
         self.workers = [Worker(i) for i in range(self.num_workers)]
-        for worker in self.workers:
-            worker.add_history(0., -1)
 
         self._state.reset()
 
@@ -166,6 +201,8 @@ class DagSchedEnv(Env):
 
         self.num_total_ops = self.all_job_ptr[-1]
 
+        # must be ordered
+        # TODO: use ordered set
         self.active_job_ids = []
 
         self.completed_job_ids = set()
@@ -184,9 +221,7 @@ class DagSchedEnv(Env):
 
         self._load_initial_jobs()
 
-        obs = self._observe()
-        info = {'wall_time': self.wall_time}
-        return obs, info
+        return self._observe(), self.info
 
 
 
@@ -205,9 +240,7 @@ class DagSchedEnv(Env):
            len(self.schedulable_ops) > 0:
             # there are still scheduling decisions to be made, 
             # so consult the agent again
-            obs = self._observe()
-            info = {'wall_time': self.wall_time}
-            return obs, 0, False, False, info
+            return self._observe(), 0, False, False, self.info
             
         # scheduling round has completed
         self._commit_remaining_workers()
@@ -238,21 +271,17 @@ class DagSchedEnv(Env):
 
         # if the episode isn't done, then start a new scheduling 
         # round at the current worker source
-        obs = self._observe()
-        info = {'wall_time': self.wall_time}
-        return obs, \
+        return self._observe(), \
                reward, \
                self.terminated, \
                self.truncated, \
-               info
+               self.info
 
 
 
     def close(self):
-        if self.window is not None:
-            pygame.image.save(self.window, "screenshot.png")
-            pygame.display.quit()
-            pygame.quit()
+        self._renderer.close()
+
 
 
 
@@ -260,87 +289,19 @@ class DagSchedEnv(Env):
     ## internal methods
 
     def _render_frame(self):
-        assert self.render_mode == 'human'
+        worker_histories = (worker.history for worker in self.workers)
+        job_completion_times = (self.jobs[job_id].t_completed 
+                                for job_id in iter(self.completed_job_ids))
+        average_job_duration = int(metrics.avg_job_duration(self) * 1e-3)
 
-        if self.window is None:
-            pygame.init()
-            pygame.display.init()
-            self.window = pygame.display.set_mode(
-                (self.window_size, self.window_size)
-            )
-            self.font = pygame.font.SysFont('couriernew', 20)
-
-        if self.clock is None:
-            self.clock = pygame.time.Clock()
-
-        canvas = pygame.Surface((self.window_size, self.window_size))
-        canvas.fill((255, 255, 255))
-
-        HEIGHT = np.ceil(self.window_size / self.num_workers)
-
-        for i, worker in enumerate(self.workers):
-            y = i * HEIGHT
-            x = 0
-            for i in range(len(worker.history)):
-                t, job_id = worker.history[i]
-                if i > 0:
-                    t_prev = worker.history[i-1][0]
-                    assert t_prev is not None
-                else:
-                    t_prev = 0
-
-                if t is None:
-                    t = self.wall_time
-
-                width = np.ceil(self.window_size * ((t-t_prev) / self.wall_time))
-
-                r = 255 * ((job_id+1) / self.num_total_jobs)
-
-                pygame.draw.rect(
-                    canvas,
-                    (0, r, r),
-                    pygame.Rect(
-                        (x, y),
-                        (width, HEIGHT),
-                    ),
-                )
-
-                x += width
-
-        # indicate job completions with red markers
-        for job_id in self.completed_job_ids:
-            job = self.jobs[job_id]
-            x = self.window_size * (job.t_completed / self.wall_time)
-
-            pygame.draw.rect(
-                canvas,
-                (255, 0, 0),
-                pygame.Rect(
-                    (x, 0),
-                    (2, self.window_size)
-                )
-            )
-
-        # print current average job duration
-        avg_job_duration = int(metrics.avg_job_duration(self) * 1e-3)
-        wall_time = int(self.wall_time * 1e-3)
-        time_text_surface = self.font.render(f'Wall time: {wall_time}s', False, (255,)*3)
-        ajd_text_surface = self.font.render(f'Avg job duration: {avg_job_duration}s', False, (255,)*3)
-        naj_text_surface = self.font.render(f'Num active jobs: {len(self.active_job_ids)}', False, (255,)*3)
-        njc_text_surface = self.font.render(f'Num jobs completed: {self.num_completed_jobs}', False, (255,)*3)
-    
-        # The following line copies our drawings from `canvas` to the visible window
-        self.window.blit(canvas, canvas.get_rect())
-        self.window.blit(time_text_surface, (0,0))
-        self.window.blit(ajd_text_surface, (0,20))
-        self.window.blit(naj_text_surface, (0,40))
-        self.window.blit(njc_text_surface, (0,60))
-        pygame.event.pump()
-        pygame.display.update()
-
-        # We need to ensure that human-rendering occurs at the predefined framerate.
-        # The following line will automatically add a delay to keep the framerate stable.
-        self.clock.tick(self.metadata['render_fps'])
+        self._renderer.render_frame(
+            worker_histories, 
+            job_completion_times,
+            self.wall_time,
+            average_job_duration,
+            self.num_active_jobs,
+            self.num_completed_jobs
+        )
 
 
 

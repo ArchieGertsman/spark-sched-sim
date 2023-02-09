@@ -15,12 +15,14 @@ class Features:
 
 class Operation:
 
-    def __init__(self, 
-                 id, 
-                 job_id, 
-                 num_tasks, 
-                 task_duration_data, 
-                 np_random):
+    def __init__(
+        self, 
+        id: int, 
+        job_id: int, 
+        num_tasks: int, 
+        task_duration_data: object, 
+        np_random: np.random.RandomState
+    ):
         self.id_ = id
 
         self.job_id = job_id

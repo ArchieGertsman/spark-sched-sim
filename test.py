@@ -24,16 +24,17 @@ from gym_dagsched.agents.cpt_agent import CPTAgent
 def main():
     setup()
 
-    num_tests = 1
+    num_tests = 10
 
     num_workers = 10
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
-    base_seed = 503 # NOTE: model does awful on 503
+    base_seed = 500 # NOTE: model does awful on 503
 
     model_dir = 'gym_dagsched/results/models'
+    model_name = 'model_1b_20s_10w_500ep.pt'
 
     fifo_agent = FIFOAgent(num_workers)
     scpt_agent = CPTAgent(num_workers)
@@ -42,7 +43,7 @@ def main():
         DecimaAgent(num_workers,
                     training_mode=False, 
                     state_dict_path=\
-                        f'{model_dir}/model.pt')
+                        f'{model_dir}/{model_name}')
 
     env_kwargs = {
         'num_workers': num_workers,
@@ -87,8 +88,8 @@ def test(instance):
     for i in range(num_tests):
         torch.manual_seed(42)
 
-        # with HiddenPrints():
-        run_episode(env, agent, base_seed + i)
+        with HiddenPrints():
+            run_episode(env, agent, base_seed + i)
 
         result = avg_job_duration(env)*1e-3
         avg_job_durations += [result]

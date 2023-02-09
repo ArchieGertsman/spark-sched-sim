@@ -1,5 +1,5 @@
 import sys
-from typing import NamedTuple
+from typing import List, Tuple, NamedTuple, Optional
 
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 import os
@@ -9,8 +9,11 @@ import torch
 import torch.profiler
 import torch.distributed as dist
 from torch.multiprocessing import Pipe, Process
+from multiprocessing.connection import Connection
+from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 
+from ..agents.decima_agent import DecimaAgent
 from ..wrappers.decima_wrappers import (
     DecimaObsWrapper,
     DecimaActWrapper
@@ -25,25 +28,33 @@ from ..utils.hidden_prints import HiddenPrints
 
 
 
-def train(agent,
-          num_epochs=500,
-          world_size=4,
-          writer=None,
-          discount=.99,
-          entropy_weight_init=1.,
-          entropy_weight_decay=1e-3,
-          entropy_weight_min=1e-4,
-          num_job_arrivals=0, 
-          num_init_jobs=20,
-          job_arrival_rate=0,
-          num_workers=10,
-          max_time_mean_init=np.inf,
-          max_time_mean_growth=0,
-          max_time_mean_ceil=np.inf,
-          moving_delay=2000):
+def train(
+    agent: DecimaAgent,
+    num_epochs: int = 500,
+    world_size: int = 4,
+    writer: Optional[SummaryWriter] = None,
+    discount: float = .99,
+    entropy_weight_init: float = 1.,
+    entropy_weight_decay: float = 1e-3,
+    entropy_weight_min: float = 1e-4,
+    num_job_arrivals: int = 0, 
+    num_init_jobs: int = 20,
+    job_arrival_rate: int = 0,
+    num_workers: int = 10,
+    max_time_mean_init: float = np.inf,
+    max_time_mean_growth: float = 0.,
+    max_time_mean_ceil: float = np.inf,
+    moving_delay: float = 2000
+) -> None:
     '''trains the model on different job arrival sequences. 
-    Multiple episodes are run on each sequence in parallel.
+    For each job sequence, 
+    - multiple rollouts are collected in parallel, asynchronously
+    - the rollouts are gathered at the center to compute advantages, and
+    - the advantages are scattered and models are updated using DDP
     '''
+
+    if not torch.cuda.is_available():
+        raise Exception('at least one GPU is needed for DDP')
 
     if num_job_arrivals > 0 and job_arrival_rate == 0:
         raise Exception('job arrival rate must be positive '
@@ -130,7 +141,12 @@ def train(agent,
 
 
 
-def start_rollout_workers(num_envs, agent, env_kwargs):
+def start_rollout_workers(
+    num_envs: int, 
+    agent: DecimaAgent, 
+    env_kwargs: dict
+) -> Tuple[List[Process], List[Connection]]:
+
     procs = []
     conns = []
 
@@ -151,19 +167,26 @@ def start_rollout_workers(num_envs, agent, env_kwargs):
 
 
 
-def end_rollout_workers(conns, procs):
+def end_rollout_workers(
+    conns: List[Connection], 
+    procs: List[Process]
+) -> None:
+
     [conn.send(None) for conn in conns]
     [proc.join() for proc in procs]
 
 
 
-def write_stats(writer,
-                epoch,
-                rollout_stats_list, 
-                returns_list,
-                ep_lens,
-                max_time,
-                avg_per_step_reward):
+def write_stats(
+    writer: SummaryWriter,
+    epoch: int,
+    rollout_stats_list: List[dict], 
+    returns_list: List[np.ndarray],
+    ep_lens: List[int],
+    max_time: float,
+    avg_per_step_reward: float
+) -> None:
+
     (action_losses,
      entropies,
      avg_job_durations, 
@@ -188,7 +211,7 @@ def write_stats(writer,
 
 ## rollout workers
 
-def setup_worker(rank, world_size):
+def setup_worker(rank: int, world_size: int) -> None:
     sys.stdout = open(f'ignore/log/proc/{rank}.out', 'a')
 
     torch.set_num_threads(1)
@@ -199,19 +222,24 @@ def setup_worker(rank, world_size):
 
     # IMPORTANT! Each worker needs to produce 
     # unique rollouts, which are determined
-    # by the rng seeds.
+    # by the rng seed
     torch.manual_seed(rank)
 
 
 
-def cleanup_worker():
+def cleanup_worker() -> None:
     dist.destroy_process_group()
 
 
 
-def rollout_worker(rank, num_envs, conn, agent, env_kwargs):
-    '''worker target which runs episodes 
-    and trains the model by communicating 
+def rollout_worker(
+    rank: int, 
+    num_envs: int, 
+    conn: Connection, 
+    agent: DecimaAgent, 
+    env_kwargs: dict
+) -> None:
+    '''collects rollouts and trains the model by communicating 
     with the main process and other workers
     '''
     setup_worker(rank, num_envs)
@@ -242,7 +270,14 @@ def rollout_worker(rank, num_envs, conn, agent, env_kwargs):
 
 
 
-def run_epoch(env, agent, data, conn, seed=42):
+def run_epoch(
+    env, 
+    agent: DecimaAgent, 
+    data: Tuple[float, float], 
+    conn: Connection,
+    seed: int = 42
+) -> None:
+
     max_wall_time, entropy_weight = data
 
     env_options = {'max_wall_time': max_wall_time}
@@ -296,7 +331,13 @@ class Experience(NamedTuple):
 
 
 
-def collect_rollout(env, agent, seed, options):  
+def collect_rollout(
+    env, 
+    agent: DecimaAgent, 
+    seed: int, 
+    options: dict
+) -> List[Experience]:
+
     obs, info = env.reset(seed=seed, options=options)
     done = False
 
@@ -319,7 +360,14 @@ def collect_rollout(env, agent, seed, options):
 
 
 
-def compute_loss(agent, obsns, actions, advantages, entropy_weight):
+def compute_loss(
+    agent: DecimaAgent, 
+    obsns: List[dict], 
+    actions: List[dict], 
+    advantages: torch.Tensor, 
+    entropy_weight: float
+) -> Tuple[torch.Tensor, float, float]:
+
     action_lgprobs, action_entropies = \
         agent.evaluate_actions(obsns, actions)
 

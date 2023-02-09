@@ -1,21 +1,26 @@
 from abc import ABC, abstractmethod
 
+import numpy as np
+
 from ..timeline import Timeline, JobArrival
+from ..entities.job import Job
 
 
 class BaseJobSequenceGen(ABC):
 
-    def __init__(self, 
-                 num_init_jobs, 
-                 num_job_arrivals, 
-                 job_arrival_rate):
+    def __init__(
+        self, 
+        num_init_jobs: int, 
+        num_job_arrivals: int, 
+        job_arrival_rate: float
+    ):
         self.num_init_jobs = num_init_jobs
         self.num_job_arrivals = num_job_arrivals
         self.job_arrival_rate = job_arrival_rate
 
 
 
-    def new_timeline(self, np_random):
+    def new_timeline(self, np_random: np.random.RandomState) -> Timeline:
         '''Fills timeline with job arrivals, which follow a
         Poisson process parameterized by `job_arrival_rate`
         '''
@@ -38,5 +43,5 @@ class BaseJobSequenceGen(ABC):
 
 
     @abstractmethod
-    def generate_job(self, job_id, t_arrival):
+    def generate_job(self, job_id: int, t_arrival: float) -> Job:
         pass

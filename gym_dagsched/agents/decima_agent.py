@@ -7,6 +7,7 @@ from torch_geometric.data import Data, Batch
 from torch_scatter import segment_add_csr
 from torch_sparse import matmul
 import numpy as np
+from gymnasium.core import ObsType, ActType
 
 from .base_agent import BaseAgent
 from ..utils.graph import make_adj
@@ -15,15 +16,18 @@ from ..utils.graph import make_adj
 
 
 class DecimaAgent(BaseAgent):
-    def __init__(self,
-                 num_workers,
-                 training_mode=True,
-                 state_dict_path=None,
-                 num_node_features=5, 
-                 num_dag_features=3, 
-                 dim_embed=8,
-                 optim_class=torch.optim.Adam,
-                 optim_lr=.001):
+
+    def __init__(
+        self,
+        num_workers: int,
+        training_mode: bool = True,
+        state_dict_path: str = None,
+        num_node_features: int = 5, 
+        num_dag_features: int = 3, 
+        dim_embed: int = 8,
+        optim_class: torch.optim.Optimizer = torch.optim.Adam,
+        optim_lr: float = .001
+    ):
         super().__init__('Decima')
 
         self.actor_network = \
@@ -57,7 +61,7 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def build(self, device=None, ddp=False):
+    def build(self, device: torch.device = None, ddp: bool = False):
         if device is not None:
             self.actor_network.to(device)
 
@@ -71,7 +75,7 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def predict(self, obs):
+    def predict(self, obs: ObsType) -> ActType:
         '''assumes that `DecimaObsWrapper` is providing
         observations of the environment and `DecimaActWrapper` 
         is receiving actions returned from here.
@@ -103,7 +107,12 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def evaluate_actions(self, obsns, actions):
+    def evaluate_actions(
+        self, 
+        obsns: list[ObsType], 
+        actions: list[ActType]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
         (nested_dag_batch,
          num_dags_per_obs,
          num_nodes_per_dag,
@@ -164,7 +173,12 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def update_parameters(self, loss, num_envs=None):
+    def update_parameters(
+        self, 
+        loss: torch.Tensor, 
+        num_envs: int = None
+    ) -> None:
+    
         # compute gradients
         self.optim.zero_grad()
         loss.backward()
