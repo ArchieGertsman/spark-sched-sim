@@ -54,10 +54,7 @@ class DecimaAgent(BaseAgent):
 
     @property
     def device(self):
-        try:
-            return self.actor_network.device
-        except:
-            return torch.device('cpu')
+        return next(self.actor_network.parameters()).device
 
 
 
@@ -119,14 +116,12 @@ class DecimaAgent(BaseAgent):
          schedulable_op_masks,
          valid_prlsm_lim_masks) = self._stack_obsns(obsns)
 
-        nested_dag_batch.to(self.device)
-
         # re-feed all the inputs from the entire
         # episode back through the model, this time
         # recording a computational graph
         model_outputs = \
-            self.actor_network(nested_dag_batch,
-                               num_dags_per_obs)
+            self.actor_network(nested_dag_batch.to(self.device),
+                               num_dags_per_obs.to(self.device))
 
         # move model outputs to CPU
         (node_scores_batch, 

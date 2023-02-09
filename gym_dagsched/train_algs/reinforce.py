@@ -12,6 +12,7 @@ from torch.multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
+from gymnasium.core import ObsType, ActType
 
 from ..agents.decima_agent import DecimaAgent
 from ..wrappers.decima_wrappers import (
@@ -30,7 +31,7 @@ from ..utils.hidden_prints import HiddenPrints
 
 def train(
     agent: DecimaAgent,
-    num_epochs: int = 500,
+    num_iterations: int = 500,
     world_size: int = 4,
     writer: Optional[SummaryWriter] = None,
     discount: float = .99,
@@ -76,26 +77,45 @@ def train(
     }
 
     procs, conns = \
-        start_rollout_workers(world_size, agent, env_kwargs)
+        start_rollout_workers(world_size, env_kwargs)
+
+    agent.build(device)
 
     max_time_mean = max_time_mean_init
     entropy_weight = entropy_weight_init
 
-    for epoch in range(num_epochs):
+    for iteration in range(num_iterations):
         # sample the max wall duration of the current episode
         max_time = np.random.exponential(max_time_mean)
 
         print('training on sequence '
-              f'{epoch+1} with max wall time = ' 
+              f'{iteration+1} with max wall time = ' 
               f'{max_time*1e-3:.1f}s',
               flush=True)
 
         # send episode data
-        [conn.send((max_time, entropy_weight)) for conn in conns]
+        state_dict = agent.actor_network.state_dict()
+        [conn.send((state_dict, max_time)) for conn in conns]
 
         # rewards and wall times
-        rewards_list, wall_times_list = \
+        (rollout_buffers,
+         avg_job_durations,
+         completed_job_counts) = \
             zip(*[conn.recv() for conn in conns])
+
+
+        prof = Profiler()
+        prof.enable()
+
+
+        (obsns_list,
+         wall_times_list,
+         actions_list,
+         rewards_list) = zip(*((buff.obsns, 
+                                buff.wall_times, 
+                                buff.actions, 
+                                buff.rewards)
+                               for buff in rollout_buffers))
 
         returns_list = \
             return_calc.calculate(rewards_list, wall_times_list)
@@ -103,24 +123,37 @@ def train(
         baselines_list, stds_list = \
             compute_baselines(wall_times_list, returns_list)
 
-        # send advantages
-        gen = zip(returns_list,
-                  baselines_list,
-                  stds_list,
-                  conns)
-        for returns, baselines, stds, conn in gen:
-            advantages = (returns - baselines) / (stds + 1e-8)
-            conn.send(advantages)
+        advantages_list = []
+        gen = zip(returns_list, baselines_list, stds_list)
+        advantages_list = [(returns - baselines) / (stds + 1e-8)
+                           for returns, baselines, stds in gen]
 
-        # receive rollout stats
-        rollout_stats_list = [conn.recv() for conn in conns]
+        # flatten rollout data from all the workers
+        all_obsns = [obs for obsns in obsns_list for obs in obsns]
+        all_actions = [act for actions in actions_list for act in actions]
+        all_advantages = np.hstack(advantages_list)
+        
+        action_loss, entropy =\
+            train_iteration(
+                agent,
+                all_obsns,
+                all_actions,
+                all_advantages,
+                entropy_weight,
+            )
+
+        torch.cuda.synchronize()
+        prof.disable()
 
         if writer:
             ep_lens = [len(rewards) for rewards in rewards_list]
             write_stats(
                 writer,
-                epoch,
-                rollout_stats_list,
+                iteration,
+                action_loss,
+                entropy,
+                avg_job_durations,
+                completed_job_counts,
                 returns_list,
                 ep_lens,
                 max_time,
@@ -141,9 +174,49 @@ def train(
 
 
 
+def train_iteration(
+    agent: DecimaAgent,
+    all_obsns: list[ObsType],
+    all_actions: list[ActType],
+    all_advantages: np.ndarray,
+    entropy_weight: float,
+    num_epochs: int = 10, 
+    batch_size: int = 64
+) -> None:
+
+    all_sample_idxs = np.random.permutation(np.arange(len(all_obsns)))
+    split_ind = np.arange(batch_size, len(all_sample_idxs), batch_size)
+    mini_batches = np.split(all_sample_idxs, split_ind)
+
+    action_losses = []
+    entropies = []
+
+    for _ in range(num_epochs):
+        for idx in mini_batches:
+            obsns = [all_obsns[i] for i in idx]
+            actions = [all_actions[i] for i in idx]
+            advantages = torch.from_numpy(all_advantages[idx]).float()
+
+            total_loss, action_loss, entropy_loss = \
+                compute_loss(
+                    agent, 
+                    obsns, 
+                    actions, 
+                    advantages, 
+                    entropy_weight
+                )
+
+            action_losses += [action_loss]
+            entropies += [entropy_loss / len(idx)]
+
+            agent.update_parameters(total_loss)
+
+    return np.mean(action_losses), np.mean(entropies)
+
+
+
 def start_rollout_workers(
     num_envs: int, 
-    agent: DecimaAgent, 
     env_kwargs: dict
 ) -> Tuple[List[Process], List[Connection]]:
 
@@ -158,7 +231,6 @@ def start_rollout_workers(
                        args=(rank,
                              num_envs,
                              conn_sub,
-                             agent,
                              env_kwargs))
         procs += [proc]
         proc.start()
@@ -180,17 +252,15 @@ def end_rollout_workers(
 def write_stats(
     writer: SummaryWriter,
     epoch: int,
-    rollout_stats_list: List[dict], 
+    action_loss: float,
+    entropy: float,
+    avg_job_durations: list[float],
+    completed_job_counts: list[int],
     returns_list: List[np.ndarray],
     ep_lens: List[int],
     max_time: float,
     avg_per_step_reward: float
 ) -> None:
-
-    (action_losses,
-     entropies,
-     avg_job_durations, 
-     completed_job_counts) = zip(*rollout_stats_list)
 
     episode_stats = {
         'avg job duration': np.mean(avg_job_durations),
@@ -198,8 +268,8 @@ def write_stats(
         'completed jobs count': np.mean(completed_job_counts),
         'avg reward per sec': avg_per_step_reward,
         'avg return': np.mean([returns[0] for returns in returns_list]),
-        'action loss': np.mean(action_losses),
-        'entropy': np.mean(entropies),
+        'action loss': action_loss,
+        'entropy': entropy,
         'episode length': np.mean(ep_lens)
     }
 
@@ -236,7 +306,6 @@ def rollout_worker(
     rank: int, 
     num_envs: int, 
     conn: Connection, 
-    agent: DecimaAgent, 
     env_kwargs: dict
 ) -> None:
     '''collects rollouts and trains the model by communicating 
@@ -247,87 +316,57 @@ def rollout_worker(
     env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
     base_env = gym.make(env_id, **env_kwargs)
     env = DecimaActWrapper(DecimaObsWrapper(base_env))
-    agent.build(device=device, ddp=True)
+
+    agent = DecimaAgent(env_kwargs['num_workers'])
+    agent.build(device)
     
     epoch = 0
     while data := conn.recv():
+        state_dict, max_wall_time = data
+        agent.actor_network.load_state_dict(state_dict)
+        
         prof = Profiler()
         prof.enable()
 
-        stats = run_epoch(env, agent, data, conn, seed=epoch)
+        env_options = {'max_wall_time': max_wall_time}
+
+        with HiddenPrints():
+            rollout_buffer = \
+                collect_rollout(
+                    env, 
+                    agent, 
+                    seed=epoch, 
+                    options=env_options
+                )
+
+        avg_job_duration = metrics.avg_job_duration(env) * 1e-3
+        conn.send((
+            rollout_buffer, 
+            avg_job_duration, 
+            env.num_completed_jobs
+        ))
 
         prof.disable()
 
-        if rank == 0 and (epoch+1) % 10 == 0:
-            state_dict = \
-                agent.actor_network.module.state_dict()
-            torch.save(state_dict, 'model.pt')
-
-        conn.send(stats)
         epoch += 1
 
     cleanup_worker()
-
-
-
-def run_epoch(
-    env, 
-    agent: DecimaAgent, 
-    data: Tuple[float, float], 
-    conn: Connection,
-    seed: int = 42
-) -> None:
-
-    max_wall_time, entropy_weight = data
-
-    env_options = {'max_wall_time': max_wall_time}
-
-    with HiddenPrints():
-        rollout_buffer = \
-            collect_rollout(env, 
-                            agent, 
-                            seed=seed, 
-                            options=env_options)
-
-    (wall_times, 
-     rewards,
-     obsns,
-     actions) = \
-        zip(*((exp.wall_time, 
-               exp.reward,
-               exp.obs,
-               exp.action) 
-              for exp in rollout_buffer))
-
-    conn.send((np.array(rewards), np.array(wall_times)))
-
-    advantages = conn.recv()
-    advantages = torch.from_numpy(advantages).float()
-
-    (total_loss,
-     action_loss,
-     entropy_loss) = \
-        compute_loss(agent,
-                     obsns,
-                     actions,
-                     advantages,
-                     entropy_weight)
-    
-    agent.update_parameters(total_loss, dist.get_world_size())
-
-    return action_loss, \
-           entropy_loss / len(rollout_buffer), \
-           metrics.avg_job_duration(env) * 1e-3, \
-           env.num_completed_jobs
     
 
 
 
-class Experience(NamedTuple):
-    obs: object
-    wall_time: float
-    action: object
-    reward: float
+
+class RolloutBuffer:
+    obsns: list[ObsType] = []
+    wall_times: list[float] = []
+    actions: list[ActType] = []
+    rewards: list[float] = []
+
+    def add(self, obs, wall_time, action, reward):
+        self.obsns += [obs]
+        self.wall_times += [wall_time]
+        self.actions += [action]
+        self.rewards += [reward]
 
 
 
@@ -336,12 +375,12 @@ def collect_rollout(
     agent: DecimaAgent, 
     seed: int, 
     options: dict
-) -> List[Experience]:
+) -> RolloutBuffer:
 
     obs, info = env.reset(seed=seed, options=options)
     done = False
 
-    rollout_buffer = []
+    rollout_buffer = RolloutBuffer()
 
     while not done:
         action = agent(obs)
@@ -351,8 +390,7 @@ def collect_rollout(
 
         done = (terminated or truncated)
 
-        exp = Experience(obs, info['wall_time'], action, reward)
-        rollout_buffer += [exp]
+        rollout_buffer.add(obs, info['wall_time'], action, reward)
 
         obs = new_obs
 

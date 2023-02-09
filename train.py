@@ -14,7 +14,7 @@ import gym_dagsched.train_algs.reinforce as reinforce
 def main():
     setup()
 
-    num_workers = 50
+    num_workers = 10
 
     # model_dir = 'gym_dagsched/data/models'
     # state_dict_path = f'{model_dir}/model_1b_20s_10w_200ep.pt'
@@ -23,14 +23,14 @@ def main():
     decima_agent = DecimaAgent(num_workers,
                                state_dict_path=state_dict_path)
 
-    # writer = SummaryWriter('ignore/log/train/c')
-    writer = None
+    writer = SummaryWriter('ignore/log/train')
+    # writer = None
 
     reinforce.train(
         decima_agent,
         writer=writer, 
         world_size=4,
-        num_epochs=2,
+        num_iterations=500,
         num_workers=num_workers,
         num_init_jobs=1,
         num_job_arrivals=20,
