@@ -1,6 +1,8 @@
+from typing import Optional, Union
+from torch import Tensor
+
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributions import Categorical
 from torch_geometric.nn import MessagePassing, global_add_pool
 from torch_geometric.data import Data, Batch
@@ -14,6 +16,11 @@ from ..utils.graph import make_adj
 
 
 
+NUM_NODE_FEATURES = 5
+
+NUM_DAG_FEATURES = 2
+
+
 
 class DecimaAgent(BaseAgent):
 
@@ -22,8 +29,6 @@ class DecimaAgent(BaseAgent):
         num_workers: int,
         training_mode: bool = True,
         state_dict_path: str = None,
-        num_node_features: int = 5, 
-        num_dag_features: int = 3, 
         dim_embed: int = 8,
         optim_class: torch.optim.Optimizer = torch.optim.Adam,
         optim_lr: float = .001
@@ -31,10 +36,7 @@ class DecimaAgent(BaseAgent):
         super().__init__('Decima')
 
         self.actor_network = \
-            ActorNetwork(num_node_features, 
-                         num_dag_features, 
-                         num_workers,
-                         dim_embed)
+            ActorNetwork(num_workers, dim_embed)
 
         self.num_workers = num_workers
 
@@ -53,22 +55,14 @@ class DecimaAgent(BaseAgent):
 
 
     @property
-    def device(self):
-        try:
-            return self.actor_network.device
-        except:
-            return torch.device('cpu')
+    def device(self) -> torch.device:
+        return next(self.actor_network.parameters()).device
 
 
 
-    def build(self, device: torch.device = None, ddp: bool = False):
+    def build(self, device: torch.device = None) -> None:
         if device is not None:
             self.actor_network.to(device)
-
-        if ddp:
-            assert device is not None
-            self.actor_network = DDP(self.actor_network, 
-                                     device_ids=[device])
 
         params = self.actor_network.parameters()
         self.optim = self.optim_class(params, self.optim_lr)
@@ -87,7 +81,8 @@ class DecimaAgent(BaseAgent):
         with torch.no_grad():
             # no computational graphs needed during 
             # the episode, only model outputs.
-            node_scores, dag_scores = self.actor_network(dag_batch)
+            outputs = self.actor_network(dag_batch)
+            node_scores, dag_scores = [out.cpu() for out in outputs]
 
         schedulable_op_mask = \
             torch.tensor(obs['schedulable_op_mask'], dtype=bool)
@@ -95,11 +90,10 @@ class DecimaAgent(BaseAgent):
         valid_prlsm_lim_mask = \
             torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
 
-        node_scores, dag_scores = \
-            self._mask_outputs(node_scores.cpu(), 
-                               dag_scores.cpu(),
-                               schedulable_op_mask,
-                               valid_prlsm_lim_mask)
+        self._mask_outputs(
+            (node_scores, dag_scores),
+            (schedulable_op_mask, valid_prlsm_lim_mask)
+        )
 
         action = self._sample_action(node_scores, dag_scores, batch)
 
@@ -119,27 +113,25 @@ class DecimaAgent(BaseAgent):
          schedulable_op_masks,
          valid_prlsm_lim_masks) = self._stack_obsns(obsns)
 
-        nested_dag_batch.to(self.device)
-
-        # re-feed all the inputs from the entire
-        # episode back through the model, this time
-        # recording a computational graph
         model_outputs = \
-            self.actor_network(nested_dag_batch,
-                               num_dags_per_obs)
+            self.actor_network(
+                nested_dag_batch.to(self.device),
+                num_dags_per_obs.to(self.device)
+            )
 
         # move model outputs to CPU
         (node_scores_batch, 
          dag_scores_batch, 
          num_nodes_per_obs, 
          obs_indptr) = \
-            [t.cpu() for t in model_outputs]
+            [out.cpu() for out in model_outputs]
 
-        self._mask_outputs(node_scores_batch, 
-                           dag_scores_batch,
-                           schedulable_op_masks,
-                           valid_prlsm_lim_masks)
+        self._mask_outputs(
+            (node_scores_batch, dag_scores_batch),
+            (schedulable_op_masks, valid_prlsm_lim_masks)
+        )
 
+        # actions are dicts, but we only care about the values
         action_values = zip(*(act.values() for act in actions))
 
         (node_selections, 
@@ -150,22 +142,29 @@ class DecimaAgent(BaseAgent):
         (all_node_probs, 
          node_lgprobs, 
          node_entropies) = \
-            self._evaluate_node_actions(node_scores_batch,
-                                        node_selections,
-                                        num_nodes_per_obs)
+            self._evaluate_node_actions(
+                node_scores_batch,
+                node_selections,
+                num_nodes_per_obs
+            )
 
-        dag_probs = self._compute_dag_probs(all_node_probs, 
-                                            num_nodes_per_dag)
+        dag_probs = \
+            self._compute_dag_probs(
+                all_node_probs, 
+                num_nodes_per_dag
+            )
         
         dag_lgprobs, dag_entropies = \
-            self._evaluate_dag_actions(dag_scores_batch, 
-                                       dag_idxs, 
-                                       dag_selections,
-                                       dag_probs,
-                                       obs_indptr)
+            self._evaluate_dag_actions(
+                dag_scores_batch, 
+                dag_idxs, 
+                dag_selections,
+                dag_probs,
+                obs_indptr
+            )
 
+        # aggregate the evaluations for nodes and dags
         action_lgprobs = node_lgprobs + dag_lgprobs
-
         action_entropies = (node_entropies + dag_entropies) * \
                            self._get_entropy_scale(num_nodes_per_obs)
 
@@ -173,21 +172,11 @@ class DecimaAgent(BaseAgent):
 
 
 
-    def update_parameters(
-        self, 
-        loss: torch.Tensor, 
-        num_envs: int = None
-    ) -> None:
-    
-        # compute gradients
+    def update_parameters(self, loss: torch.Tensor) -> None:
         self.optim.zero_grad()
+        
+        # compute gradients
         loss.backward()
-
-        if num_envs is not None:
-            # DDP averages grads while we want their
-            # sum, so scale them back
-            for param in self.actor_network.parameters():
-                param.grad.mul_(num_envs)
 
         # update model parameters
         self.optim.step()
@@ -196,7 +185,7 @@ class DecimaAgent(BaseAgent):
 
     ## internal methods
 
-    def _to_pyg(self, obs_dag_batch):
+    def _to_pyg(self, obs_dag_batch: ObsType) -> Batch:
         '''construct PyG `Batch` object from `obs['dag_batch']`'''
         ptr = np.array(obs_dag_batch['ptr'])
         num_nodes_per_dag = ptr[1:] - ptr[:-1]
@@ -219,18 +208,20 @@ class DecimaAgent(BaseAgent):
 
 
     @classmethod
-    def _mask_outputs(cls,
-                      node_scores,
-                      dag_scores,
-                      schedulable_op_mask,
-                      valid_prlsm_lim_mask):
+    def _mask_outputs(
+        cls,
+        outputs: tuple[Tensor, Tensor],
+        masks: tuple[Tensor, Tensor]
+    ):
+        '''masks model outputs in-place'''
+        node_scores, dag_scores = outputs
+        schedulable_op_mask, valid_prlsm_lim_mask = masks
+
         # mask node scores
         node_scores[~schedulable_op_mask] = float('-inf')
 
         # mask dag scores
         dag_scores.masked_fill_(~valid_prlsm_lim_mask, float('-inf'))
-
-        return node_scores, dag_scores
 
 
 
@@ -336,10 +327,12 @@ class DecimaAgent(BaseAgent):
 
 
     @classmethod
-    def _evaluate_node_actions(cls,
-                               node_scores_batch,
-                               node_selection_batch,
-                               num_nodes_per_obs):
+    def _evaluate_node_actions(
+        cls,
+        node_scores_batch,
+        node_selection_batch,
+        num_nodes_per_obs
+    ):
         '''splits the node score/selection batches into subbatches 
         (see subroutine below), then for each subbatch, comptues 
         attributes (action log-probability and entropy) using 
@@ -413,10 +406,12 @@ class DecimaAgent(BaseAgent):
 
 
     @classmethod
-    def _split_node_experience(cls,
-                               node_scores_batch, 
-                               node_selection_batch, 
-                               num_nodes_per_obs):
+    def _split_node_experience(
+        cls,
+        node_scores_batch, 
+        node_selection_batch, 
+        num_nodes_per_obs
+    ):
         '''splits the node score/selection batches into
         subbatches, where each each sample within a subbatch
         has the same node count.
@@ -458,13 +453,14 @@ class DecimaAgent(BaseAgent):
 
 
     @classmethod
-    def _evaluate_dag_actions(cls,
-                              dag_scores_batch, 
-                              dag_idxs, 
-                              dag_selections,
-                              dag_probs,
-                              obs_indptr):
-
+    def _evaluate_dag_actions(
+        cls,
+        dag_scores_batch, 
+        dag_idxs, 
+        dag_selections,
+        dag_probs,
+        obs_indptr
+    ):
         dag_idxs += obs_indptr[:-1]
 
         dag_lgprob_batch = \
@@ -477,8 +473,7 @@ class DecimaAgent(BaseAgent):
         # entropy for these rows becomes 0.
         inf_counts = torch.isinf(dag_scores_batch).sum(1)
         allinf_rows = (inf_counts == dag_scores_batch.shape[1])
-        # dag_scores_batch[allinf_rows, 0] = 0
-        dag_scores_batch[allinf_rows] = 0
+        dag_scores_batch[allinf_rows, 0] = 0
 
         # compute expected entropy over dags for each obs.
         # each dag is weighted by the probability of it 
@@ -493,26 +488,37 @@ class DecimaAgent(BaseAgent):
 
 
 class ActorNetwork(nn.Module):
-    def __init__(self, 
-                 num_node_features, 
-                 num_dag_features, 
-                 num_workers,
-                 dim_embed):
+    
+    def __init__(self, num_workers: int, dim_embed: int):
         super().__init__()
 
         self.encoder = \
-            GraphEncoderNetwork(num_node_features, 
-                                dim_embed)
+            GraphEncoderNetwork(dim_embed)
 
         self.policy_network = \
-            PolicyNetwork(num_node_features, 
-                          num_dag_features,
-                          num_workers,
-                          dim_embed)
+            PolicyNetwork(num_workers, dim_embed)
         
 
         
-    def forward(self, dag_batch, num_dags_per_obs=None):
+    def forward(
+        self, 
+        dag_batch: Batch,
+        num_dags_per_obs: Optional[torch.Tensor] = None
+    ) -> Union[tuple[Tensor, Tensor], tuple[Tensor, Tensor, Tensor, Tensor]]:
+        '''
+        Args:
+            dag_batch (torch_geometric.data.Batch): PyG batch of job dags
+            num_dags_per_obs (optional torch.Tensor): if dag_batch is a nested
+                batch of dag_batches for many separate observations, then
+                this argument specifies how many dags are in each observation.
+                If it is not provided, then the dag_batch is assumed to not be
+                nested.
+        Returns:
+            node scores and dag scores, and if dag_batch is nested, then additionally
+            returns the number of nodes in each observation and an tensor containing
+            the starting node index for each observation
+        '''
+
         is_data_batched = (num_dags_per_obs is not None)
 
         (obs_indptr, 
@@ -526,15 +532,16 @@ class ActorNetwork(nn.Module):
          global_embeddings) = \
             self.encoder(dag_batch, obs_indptr)
 
-        node_scores, dag_scores = self.policy_network(
-            dag_batch,
-            node_embeddings, 
-            dag_embeddings, 
-            global_embeddings,
-            num_nodes_per_dag,
-            num_nodes_per_obs,
-            num_dags_per_obs
-        )
+        node_scores, dag_scores = \
+            self.policy_network(
+                dag_batch,
+                node_embeddings, 
+                dag_embeddings, 
+                global_embeddings,
+                num_nodes_per_dag,
+                num_nodes_per_obs,
+                num_dags_per_obs
+            )
 
         ret = (node_scores, dag_scores)
         if is_data_batched:
@@ -583,6 +590,7 @@ def make_mlp(in_ch, out_ch, h1=16, h2=8):
 
 
 class GCNConv(MessagePassing):
+
     def __init__(self, in_ch, out_ch):
         super().__init__(aggr='add')
         self.mlp_prep = make_mlp(in_ch, out_ch)
@@ -615,13 +623,14 @@ class GCNConv(MessagePassing):
     
 
 class GraphEncoderNetwork(nn.Module):
-    def __init__(self, num_node_features, dim_embed):
+
+    def __init__(self, dim_embed):
         super().__init__()
 
-        self.graph_conv = GCNConv(num_node_features, dim_embed)
+        self.graph_conv = GCNConv(NUM_NODE_FEATURES, dim_embed)
 
         self.mlp_node = \
-            make_mlp(num_node_features + dim_embed, dim_embed)
+            make_mlp(NUM_NODE_FEATURES + dim_embed, dim_embed)
 
         self.mlp_dag = make_mlp(dim_embed, dim_embed)
 
@@ -698,32 +707,30 @@ class GraphEncoderNetwork(nn.Module):
         
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, 
-                 num_node_features, 
-                 num_dag_features, 
-                 num_workers,
-                 dim_embed):
+
+    def __init__(self, num_workers, dim_embed):
         super().__init__()
-        self.num_dag_features = num_dag_features
         self.dim_embed = dim_embed
         self.num_workers = num_workers
 
-        self.dim_node_merged = num_node_features + (3 * dim_embed)
+        self.dim_node_merged = NUM_NODE_FEATURES + (3 * dim_embed)
         self.mlp_node_score = make_mlp(self.dim_node_merged, 1)
 
-        self.dim_dag_merged = num_dag_features + (2 * dim_embed) + 1
+        self.dim_dag_merged = NUM_DAG_FEATURES + (2 * dim_embed) + 1
         self.mlp_dag_score = make_mlp(self.dim_dag_merged, 1)
         
 
 
-    def forward(self,   
-                dag_batch, 
-                node_embeddings,
-                dag_embeddings, 
-                global_embeddings,
-                num_nodes_per_dag,
-                num_nodes_per_obs,
-                num_dags_per_obs):
+    def forward(
+        self,   
+        dag_batch, 
+        node_embeddings,
+        dag_embeddings, 
+        global_embeddings,
+        num_nodes_per_dag,
+        num_nodes_per_obs,
+        num_dags_per_obs
+    ):
         node_features = dag_batch.x
 
         node_scores = self._compute_node_scores(
@@ -737,7 +744,7 @@ class PolicyNetwork(nn.Module):
 
         dag_idxs = dag_batch.ptr[:-1]
         dag_features = \
-            node_features[dag_idxs, :self.num_dag_features]
+            node_features[dag_idxs, :NUM_DAG_FEATURES]
 
         dag_scores = self._compute_dag_scores(
             dag_features, 
@@ -751,14 +758,15 @@ class PolicyNetwork(nn.Module):
 
     
     
-    def _compute_node_scores(self, 
-                             node_features, 
-                             node_embeddings, 
-                             dag_embeddings, 
-                             global_embeddings,      
-                             num_nodes_per_dag, 
-                             num_nodes_per_obs):
-
+    def _compute_node_scores(
+        self, 
+        node_features, 
+        node_embeddings, 
+        dag_embeddings, 
+        global_embeddings,      
+        num_nodes_per_dag, 
+        num_nodes_per_obs
+    ):
         num_nodes = node_features.shape[0]
 
         dag_embeddings_repeat = \
@@ -788,12 +796,14 @@ class PolicyNetwork(nn.Module):
     
     
     
-    def _compute_dag_scores(self, 
-                            dag_features, 
-                            dag_embeddings, 
-                            global_embeddings,
-                            num_dags_per_obs,
-                            num_total_dags):
+    def _compute_dag_scores(
+        self, 
+        dag_features, 
+        dag_embeddings, 
+        global_embeddings,
+        num_dags_per_obs,
+        num_total_dags
+    ):
         device = dag_features.device
         worker_actions = \
             torch.arange(self.num_workers, device=device)

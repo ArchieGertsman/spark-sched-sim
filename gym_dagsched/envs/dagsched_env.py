@@ -25,7 +25,11 @@ from ..core.entities.worker import Worker
 from ..core.datagen.tpch_job_sequence import TPCHJobSequenceGen
 from ..utils.graph import subgraph
 from ..utils import metrics
-from ..utils.render import Renderer
+try:
+    from ..utils.render import Renderer
+    PYGAME_AVAILABLE = True
+except:
+    PYGAME_AVAILABLE = False
 
 
 
@@ -74,10 +78,13 @@ class DagSchedEnv(Env):
         self._state = WorkerAssignmentState(num_workers)
 
         self.render_mode = render_mode
-
         if render_mode == 'human':
+            if not PYGAME_AVAILABLE:
+                raise Exception('pygame is unavailable')
             self._renderer = \
-                Renderer(self.num_workers, self.num_total_jobs)
+                Renderer(self.num_workers, 
+                         self.num_total_jobs, 
+                         render_fps=self.metadata['render_fps'])
         else:
             self._renderer = None
 
@@ -332,6 +339,7 @@ class DagSchedEnv(Env):
         print('raw action', action)
         
         if not self.action_space.contains(action):
+            print('invalid action')
             self._commit_remaining_workers()
             return
 

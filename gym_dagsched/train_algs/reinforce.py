@@ -1,5 +1,7 @@
+import shutil
 import sys
-from typing import List, Tuple, NamedTuple, Optional
+from typing import List, Tuple, Optional
+from itertools import chain
 
 sys.path.append('./gym_dagsched/data_generation/tpch/')
 import os
@@ -12,6 +14,7 @@ from torch.multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
+from gymnasium.core import ObsType, ActType
 
 from ..agents.decima_agent import DecimaAgent
 from ..wrappers.decima_wrappers import (
@@ -24,201 +27,301 @@ from ..utils.profiler import Profiler
 from ..utils.baselines import compute_baselines
 from ..utils.returns_calculator import ReturnsCalculator
 from ..utils.hidden_prints import HiddenPrints
+from ..utils.rollout_buffer import RolloutBuffer
 
 
 
 
-def train(
-    agent: DecimaAgent,
-    num_epochs: int = 500,
-    world_size: int = 4,
-    writer: Optional[SummaryWriter] = None,
-    discount: float = .99,
-    entropy_weight_init: float = 1.,
-    entropy_weight_decay: float = 1e-3,
-    entropy_weight_min: float = 1e-4,
-    num_job_arrivals: int = 0, 
-    num_init_jobs: int = 20,
-    job_arrival_rate: int = 0,
-    num_workers: int = 10,
-    max_time_mean_init: float = np.inf,
-    max_time_mean_growth: float = 0.,
-    max_time_mean_ceil: float = np.inf,
-    moving_delay: float = 2000
-) -> None:
-    '''trains the model on different job arrival sequences. 
-    For each job sequence, 
-    - multiple rollouts are collected in parallel, asynchronously
-    - the rollouts are gathered at the center to compute advantages, and
-    - the advantages are scattered and models are updated using DDP
-    '''
+class Reinforce:
 
-    if not torch.cuda.is_available():
-        raise Exception('at least one GPU is needed for DDP')
+    def __init__(
+        self,
+        env_kwargs: dict,
+        num_iterations: int = 500,
+        num_epochs: int = 4,
+        batch_size: int = 512,
+        num_envs: int = 4,
+        seed: int = 42,
+        log_dir: str = 'log',
+        summary_writer_dir: Optional[str] = None,
+        model_save_dir: str = 'models',
+        model_save_freq: int = 20,
+        gamma: float = .99,
+        max_time_mean_init: float = np.inf,
+        max_time_mean_growth: float = 0.,
+        max_time_mean_ceil: float = np.inf,
+        entropy_weight_init: float = 1.,
+        entropy_weight_decay: float = 1e-3,
+        entropy_weight_min: float = 1e-4
+    ):  
+        self.num_iterations = num_iterations
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.num_envs = num_envs
 
-    if num_job_arrivals > 0 and job_arrival_rate == 0:
-        raise Exception('job arrival rate must be positive '
-                        'when jobs are streaming')
+        self.log_dir = log_dir
+        self.summary_writer_path = summary_writer_dir
+        self.model_save_path = model_save_dir
+        self.model_save_freq = model_save_freq
 
-    # use torch.distributed for IPC
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+        self.max_time_mean = max_time_mean_init
+        self.max_time_mean_growth = max_time_mean_growth
+        self.max_time_mean_ceil = max_time_mean_ceil
 
-    # computes differential returns by default
-    return_calc = ReturnsCalculator(discount)
+        self.entropy_weight = entropy_weight_init
+        self.entropy_weight_decay = entropy_weight_decay
+        self.entropy_weight_min = entropy_weight_min
 
-    env_kwargs = {
-        'num_workers': num_workers,
-        'num_init_jobs': num_init_jobs,
-        'num_job_arrivals': num_job_arrivals,
-        'job_arrival_rate': job_arrival_rate,
-        'moving_delay': moving_delay
-    }
+        self.agent = DecimaAgent(env_kwargs['num_workers'])
 
-    procs, conns = \
-        start_rollout_workers(world_size, agent, env_kwargs)
+        # computes differential returns by default, which is
+        # helpful for maximizing average returns
+        self.return_calc = ReturnsCalculator(gamma)
 
-    max_time_mean = max_time_mean_init
-    entropy_weight = entropy_weight_init
+        self.env_kwargs = env_kwargs
 
-    for epoch in range(num_epochs):
-        # sample the max wall duration of the current episode
-        max_time = np.random.exponential(max_time_mean)
+        torch.manual_seed(seed)
+        self.np_random = np.random.RandomState(seed)
 
-        print('training on sequence '
-              f'{epoch+1} with max wall time = ' 
-              f'{max_time*1e-3:.1f}s',
-              flush=True)
+        self.procs = []
+        self.conns = []
 
-        # send episode data
-        [conn.send((max_time, entropy_weight)) for conn in conns]
 
-        # rewards and wall times
-        rewards_list, wall_times_list = \
-            zip(*[conn.recv() for conn in conns])
+
+    def train(self) -> None:
+        '''trains the model on different job arrival sequences. 
+        For each job sequence, 
+        - multiple rollouts are collected in parallel, asynchronously
+        - the rollouts are gathered at the center to compute advantages, and
+        - the advantages are scattered and models are updated using DDP
+        '''
+
+        self._setup()
+
+        for iteration in range(self.num_iterations):
+            # sample the max wall duration of the current episode
+            max_time = self.np_random.exponential(self.max_time_mean)
+
+            self._log_iteration_start(iteration, max_time)
+
+            state_dict = self.agent.actor_network.state_dict()
+            if (iteration+1) % self.model_save_freq == 0:
+                torch.save(state_dict, f'{self.model_save_path}/model.pt')
+            
+            # scatter updated model params and max wall time
+            [conn.send((state_dict, max_time)) for conn in self.conns]
+
+            # gather rewards and wall times
+            (rollout_buffers,
+             avg_job_durations,
+             completed_job_counts) = \
+                zip(*[conn.recv() for conn in self.conns])
+
+            prof = Profiler()
+            prof.enable()
+            
+            action_loss, entropy = self._run_train_iteration(rollout_buffers)
+
+            torch.cuda.synchronize()
+            prof.disable()
+
+            if self.summary_writer:
+                ep_lens = [len(buff) for buff in rollout_buffers]
+                self._write_stats(
+                    iteration,
+                    action_loss,
+                    entropy,
+                    avg_job_durations,
+                    completed_job_counts,
+                    ep_lens,
+                    max_time
+                )
+
+            self._update_vars()
+
+        self._cleanup()
+
+
+
+    ## internal methods
+
+    def _setup(self) -> None:
+        shutil.rmtree(self.log_dir, ignore_errors=True)
+        os.mkdir(self.log_dir)
+        sys.stdout = open(f'{self.log_dir}/main.out', 'a')
+        
+        print('cuda available:', torch.cuda.is_available())
+
+        torch.multiprocessing.set_start_method('forkserver')
+        
+        if self.summary_writer_path:
+            self.summary_writer = SummaryWriter(self.summary_writer_path)
+
+        self.agent.build(device)
+
+        self._start_rollout_workers()
+
+
+
+    def _cleanup(self) -> None:
+        self._terminate_rollout_workers()
+
+        if self.summary_writer:
+            self.summary_writer.close()
+
+
+
+    @classmethod
+    def _log_iteration_start(cls, i, max_time):
+        print_str = f'training on sequence {i+1}'
+        if max_time < np.inf:
+            print_str += f' (max wall time = {max_time*1e-3})'
+        print(print_str, flush=True)
+
+
+
+    def _run_train_iteration(
+        self,
+        rollout_buffers: list[RolloutBuffer]
+    ) -> tuple[float, float]:
+
+        # separate the rollout data into lists
+        obsns_list, actions_list, wall_times_list, rewards_list = \
+            zip(*((buff.obsns, buff.actions, buff.wall_times, buff.rewards)
+                  for buff in rollout_buffers))
 
         returns_list = \
-            return_calc.calculate(rewards_list, wall_times_list)
+            self.return_calc.calculate(rewards_list, wall_times_list)
 
         baselines_list, stds_list = \
             compute_baselines(wall_times_list, returns_list)
 
-        # send advantages
-        gen = zip(returns_list,
-                  baselines_list,
-                  stds_list,
-                  conns)
-        for returns, baselines, stds, conn in gen:
-            advantages = (returns - baselines) / (stds + 1e-8)
-            conn.send(advantages)
+        gen = zip(returns_list, baselines_list, stds_list)
+        advantages_list = [(returns - baselines) / (stds + 1e-8)
+                            for returns, baselines, stds in gen]
 
-        # receive rollout stats
-        rollout_stats_list = [conn.recv() for conn in conns]
+        # flatten rollout data from all the workers
+        all_obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
+        all_actions = {i: act for i, act in enumerate(chain(*actions_list))}
+        all_advantages = np.hstack(advantages_list)
 
-        if writer:
-            ep_lens = [len(rewards) for rewards in rewards_list]
-            write_stats(
-                writer,
-                epoch,
-                rollout_stats_list,
-                returns_list,
-                ep_lens,
-                max_time,
-                return_calc.avg_per_step_reward()
-            )
+        NUM_SAMPLES = len(all_obsns)
+        action_losses = []
+        entropies = []
 
+        for _ in range(self.num_epochs):
+            all_sample_indices = self.np_random.permutation(np.arange(NUM_SAMPLES))
+            split_ind = np.arange(self.batch_size, NUM_SAMPLES, self.batch_size)
+            mini_batches = np.split(all_sample_indices, split_ind)
+
+            for indices in mini_batches:
+                obsns = [all_obsns[i] for i in indices]
+                actions = [all_actions[i] for i in indices]
+                advantages = torch.from_numpy(all_advantages[indices]).float()
+
+                total_loss, action_loss, entropy_loss = \
+                    self._compute_loss(
+                        obsns, 
+                        actions, 
+                        advantages
+                    )
+
+                action_losses += [action_loss]
+                entropies += [entropy_loss / len(indices)]
+
+                self.agent.update_parameters(total_loss)
+
+        return np.sum(action_losses), np.mean(entropies)
+
+
+
+    def _compute_loss(
+        self,
+        obsns: List[dict], 
+        actions: List[dict], 
+        advantages: torch.Tensor
+    ) -> Tuple[torch.Tensor, float, float]:
+
+        action_lgprobs, action_entropies = \
+            self.agent.evaluate_actions(obsns, actions)
+
+        action_loss = -advantages @ action_lgprobs
+        entropy_loss = action_entropies.sum()
+        total_loss = action_loss + self.entropy_weight * entropy_loss
+
+        return total_loss, action_loss.item(), entropy_loss.item()
+
+
+
+    def _start_rollout_workers(self) -> None:
+        self.procs = []
+        self.conns = []
+
+        for rank in range(self.num_envs):
+            conn_main, conn_sub = Pipe()
+            self.conns += [conn_main]
+
+            proc = Process(target=rollout_worker, 
+                        args=(rank,
+                              conn_sub,
+                              self.env_kwargs))
+            self.procs += [proc]
+            proc.start()
+
+
+
+    def _terminate_rollout_workers(self) -> None:
+        [conn.send(None) for conn in self.conns]
+        [proc.join() for proc in self.procs]
+
+
+
+    def _write_stats(
+        self,
+        epoch: int,
+        action_loss: float,
+        entropy: float,
+        avg_job_durations: list[float],
+        completed_job_counts: list[int],
+        ep_lens: List[int],
+        max_time: float
+    ) -> None:
+
+        episode_stats = {
+            'avg job duration': np.mean(avg_job_durations),
+            'max wall time': max_time,
+            'completed jobs count': np.mean(completed_job_counts),
+            'avg reward per sec': self.return_calc.avg_per_step_reward(),
+            'action loss': action_loss,
+            'entropy': entropy,
+            'episode length': np.mean(ep_lens)
+        }
+
+        for name, stat in episode_stats.items():
+            self.summary_writer.add_scalar(name, stat, epoch)
+
+
+
+    def _update_vars(self) -> None:
         # increase the mean episode duration
-        max_time_mean = \
-            min(max_time_mean + max_time_mean_growth,
-                max_time_mean_ceil)
+        self.max_time_mean = \
+            min(self.max_time_mean + self.max_time_mean_growth,
+                self.max_time_mean_ceil)
 
         # decrease the entropy weight
-        entropy_weight = \
-            max(entropy_weight - entropy_weight_decay, 
-                entropy_weight_min)
-
-    end_rollout_workers(conns, procs)
-
-
-
-def start_rollout_workers(
-    num_envs: int, 
-    agent: DecimaAgent, 
-    env_kwargs: dict
-) -> Tuple[List[Process], List[Connection]]:
-
-    procs = []
-    conns = []
-
-    for rank in range(num_envs):
-        conn_main, conn_sub = Pipe()
-        conns += [conn_main]
-
-        proc = Process(target=rollout_worker, 
-                       args=(rank,
-                             num_envs,
-                             conn_sub,
-                             agent,
-                             env_kwargs))
-        procs += [proc]
-        proc.start()
-
-    return procs, conns
-
-
-
-def end_rollout_workers(
-    conns: List[Connection], 
-    procs: List[Process]
-) -> None:
-
-    [conn.send(None) for conn in conns]
-    [proc.join() for proc in procs]
-
-
-
-def write_stats(
-    writer: SummaryWriter,
-    epoch: int,
-    rollout_stats_list: List[dict], 
-    returns_list: List[np.ndarray],
-    ep_lens: List[int],
-    max_time: float,
-    avg_per_step_reward: float
-) -> None:
-
-    (action_losses,
-     entropies,
-     avg_job_durations, 
-     completed_job_counts) = zip(*rollout_stats_list)
-
-    episode_stats = {
-        'avg job duration': np.mean(avg_job_durations),
-        'max wall time': max_time,
-        'completed jobs count': np.mean(completed_job_counts),
-        'avg reward per sec': avg_per_step_reward,
-        'avg return': np.mean([returns[0] for returns in returns_list]),
-        'action loss': np.mean(action_losses),
-        'entropy': np.mean(entropies),
-        'episode length': np.mean(ep_lens)
-    }
-
-    for name, stat in episode_stats.items():
-        writer.add_scalar(name, stat, epoch)
+        self.entropy_weight = \
+            max(self.entropy_weight - self.entropy_weight_decay, 
+                self.entropy_weight_min)
 
 
 
 
 ## rollout workers
 
-def setup_worker(rank: int, world_size: int) -> None:
+def setup_worker(rank: int) -> None:
     sys.stdout = open(f'ignore/log/proc/{rank}.out', 'a')
 
     torch.set_num_threads(1)
-
-    dist.init_process_group(dist.Backend.GLOO, 
-                            rank=rank, 
-                            world_size=world_size)
 
     # IMPORTANT! Each worker needs to produce 
     # unique rollouts, which are determined
@@ -227,107 +330,55 @@ def setup_worker(rank: int, world_size: int) -> None:
 
 
 
-def cleanup_worker() -> None:
-    dist.destroy_process_group()
-
-
-
 def rollout_worker(
     rank: int, 
-    num_envs: int, 
     conn: Connection, 
-    agent: DecimaAgent, 
     env_kwargs: dict
 ) -> None:
     '''collects rollouts and trains the model by communicating 
     with the main process and other workers
     '''
-    setup_worker(rank, num_envs)
+    setup_worker(rank)
 
     env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
     base_env = gym.make(env_id, **env_kwargs)
     env = DecimaActWrapper(DecimaObsWrapper(base_env))
-    agent.build(device=device, ddp=True)
+
+    agent = DecimaAgent(env_kwargs['num_workers'])
+    agent.build(device)
     
-    epoch = 0
+    iteration = 0
     while data := conn.recv():
+        state_dict, max_wall_time = data
+
+        # load updated model parameters
+        agent.actor_network.load_state_dict(state_dict)
+
+        env_options = {'max_wall_time': max_wall_time}
+        
         prof = Profiler()
         prof.enable()
 
-        stats = run_epoch(env, agent, data, conn, seed=epoch)
+        with HiddenPrints():
+            rollout_buffer = \
+                collect_rollout(
+                    env, 
+                    agent, 
+                    seed=iteration, 
+                    options=env_options
+                )
+
+        # send rollout buffer and stats to center
+        avg_job_duration = metrics.avg_job_duration(env) * 1e-3
+        conn.send((
+            rollout_buffer, 
+            avg_job_duration, 
+            env.num_completed_jobs
+        ))
 
         prof.disable()
 
-        if rank == 0 and (epoch+1) % 10 == 0:
-            state_dict = \
-                agent.actor_network.module.state_dict()
-            torch.save(state_dict, 'model.pt')
-
-        conn.send(stats)
-        epoch += 1
-
-    cleanup_worker()
-
-
-
-def run_epoch(
-    env, 
-    agent: DecimaAgent, 
-    data: Tuple[float, float], 
-    conn: Connection,
-    seed: int = 42
-) -> None:
-
-    max_wall_time, entropy_weight = data
-
-    env_options = {'max_wall_time': max_wall_time}
-
-    with HiddenPrints():
-        rollout_buffer = \
-            collect_rollout(env, 
-                            agent, 
-                            seed=seed, 
-                            options=env_options)
-
-    (wall_times, 
-     rewards,
-     obsns,
-     actions) = \
-        zip(*((exp.wall_time, 
-               exp.reward,
-               exp.obs,
-               exp.action) 
-              for exp in rollout_buffer))
-
-    conn.send((np.array(rewards), np.array(wall_times)))
-
-    advantages = conn.recv()
-    advantages = torch.from_numpy(advantages).float()
-
-    (total_loss,
-     action_loss,
-     entropy_loss) = \
-        compute_loss(agent,
-                     obsns,
-                     actions,
-                     advantages,
-                     entropy_weight)
-    
-    agent.update_parameters(total_loss, dist.get_world_size())
-
-    return action_loss, \
-           entropy_loss / len(rollout_buffer), \
-           metrics.avg_job_duration(env) * 1e-3, \
-           env.num_completed_jobs
-    
-
-
-
-class Experience(NamedTuple):
-    obs: object
-    wall_time: float
-    action: object
-    reward: float
+        iteration += 1
 
 
 
@@ -336,12 +387,12 @@ def collect_rollout(
     agent: DecimaAgent, 
     seed: int, 
     options: dict
-) -> List[Experience]:
+) -> RolloutBuffer:
 
     obs, info = env.reset(seed=seed, options=options)
     done = False
 
-    rollout_buffer = []
+    rollout_buffer = RolloutBuffer()
 
     while not done:
         action = agent(obs)
@@ -351,28 +402,8 @@ def collect_rollout(
 
         done = (terminated or truncated)
 
-        exp = Experience(obs, info['wall_time'], action, reward)
-        rollout_buffer += [exp]
+        rollout_buffer.add(obs, info['wall_time'], action, reward)
 
         obs = new_obs
 
     return rollout_buffer
-
-
-
-def compute_loss(
-    agent: DecimaAgent, 
-    obsns: List[dict], 
-    actions: List[dict], 
-    advantages: torch.Tensor, 
-    entropy_weight: float
-) -> Tuple[torch.Tensor, float, float]:
-
-    action_lgprobs, action_entropies = \
-        agent.evaluate_actions(obsns, actions)
-
-    action_loss = -advantages @ action_lgprobs
-    entropy_loss = action_entropies.sum()
-    total_loss = action_loss + entropy_weight * entropy_loss
-
-    return total_loss, action_loss.item(), entropy_loss.item()
