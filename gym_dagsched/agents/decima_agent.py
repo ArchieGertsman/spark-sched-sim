@@ -65,7 +65,7 @@ class DecimaAgent(BaseAgent):
             self.actor_network.to(device)
 
         params = self.actor_network.parameters()
-        self.optim = self.optim_class(params, self.optim_lr)
+        self.optim = self.optim_class(params, lr=self.optim_lr)
 
 
 

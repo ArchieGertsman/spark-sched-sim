@@ -12,7 +12,7 @@ from ..utils.rollout_buffer import RolloutBuffer
 
 
 
-class Reinforce(BaseAlg):
+class PPO(BaseAlg):
 
     def __init__(
         self,
@@ -84,6 +84,11 @@ class Reinforce(BaseAlg):
         all_obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
         all_actions = {i: act for i, act in enumerate(chain(*actions_list))}
         all_advantages = np.hstack(advantages_list)
+        with torch.no_grad():
+            all_old_lgprobs, _ = \
+                self.agent.evaluate_actions(
+                    all_obsns.values(), 
+                    all_actions.values())
 
         NUM_SAMPLES = len(all_obsns)
         action_losses = []
@@ -98,12 +103,14 @@ class Reinforce(BaseAlg):
                 obsns = [all_obsns[i] for i in indices]
                 actions = [all_actions[i] for i in indices]
                 advantages = torch.from_numpy(all_advantages[indices]).float()
+                old_lgprobs = all_old_lgprobs[indices]
 
                 total_loss, action_loss, entropy_loss = \
                     self._compute_loss(
                         obsns, 
                         actions, 
-                        advantages
+                        advantages,
+                        old_lgprobs
                     )
 
                 action_losses += [action_loss]
@@ -119,14 +126,22 @@ class Reinforce(BaseAlg):
         self,
         obsns: List[dict], 
         actions: List[dict], 
-        advantages: torch.Tensor
+        advantages: torch.Tensor,
+        old_lgprobs: torch.Tensor,
+        clip_range: float = .2
     ) -> Tuple[torch.Tensor, float, float]:
 
-        action_lgprobs, action_entropies = \
+        lgprobs, entropies = \
             self.agent.evaluate_actions(obsns, actions)
 
-        action_loss = -advantages @ action_lgprobs
-        entropy_loss = action_entropies.sum()
-        total_loss = action_loss + self.entropy_weight * entropy_loss
+        ratio = torch.exp(lgprobs - old_lgprobs)
+        policy_loss_1 = advantages * ratio
+        policy_loss_2 = advantages * \
+            torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+        policy_loss = \
+            -torch.min(policy_loss_1, policy_loss_2).mean()
 
-        return total_loss, action_loss.item(), entropy_loss.item()
+        entropy_loss = entropies.sum()
+        total_loss = policy_loss + self.entropy_weight * entropy_loss
+
+        return total_loss, policy_loss.item(), entropy_loss.item()

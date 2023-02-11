@@ -1,4 +1,5 @@
 from gym_dagsched.train_algs.reinforce import Reinforce
+from gym_dagsched.train_algs.ppo import PPO
 
 
 if __name__ == '__main__':
@@ -10,11 +11,15 @@ if __name__ == '__main__':
         'moving_delay': 2000.
     }
 
-    Reinforce(
+    PPO(
         env_kwargs,
         num_iterations=500,
         num_envs=4,
         log_dir='ignore/log/proc',
         summary_writer_dir='ignore/log/train', 
         model_save_dir='ignore/models',
+        optim_lr=3e-3,
+        entropy_weight_init=1e-3,
+        entropy_weight_decay=0.,
+        entropy_weight_min=0.
     ).train()
