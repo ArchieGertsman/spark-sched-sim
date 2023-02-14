@@ -8,6 +8,7 @@ class Profiler:
 
     def enable(self):
         self.pr.enable()
+        return self
 
 
     def disable(self):

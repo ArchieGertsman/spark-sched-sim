@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 from torch import Tensor
 
 import torch
@@ -12,7 +12,7 @@ import numpy as np
 from gymnasium.core import ObsType, ActType
 
 from .base_agent import BaseAgent
-from ..utils.graph import make_adj
+from ..utils.graph import obs_to_pyg, ObsBatch
 
 
 
@@ -74,7 +74,7 @@ class DecimaAgent(BaseAgent):
         observations of the environment and `DecimaActWrapper` 
         is receiving actions returned from here.
         '''
-        dag_batch = self._to_pyg(obs['dag_batch'])
+        dag_batch = obs_to_pyg(obs['dag_batch'])
         batch = dag_batch.batch.clone() # save a CPU copy
         dag_batch = dag_batch.to(self.device, non_blocking=True)
 
@@ -103,20 +103,14 @@ class DecimaAgent(BaseAgent):
 
     def evaluate_actions(
         self, 
-        obsns: list[ObsType], 
-        actions: list[ActType]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        (nested_dag_batch,
-         num_dags_per_obs,
-         num_nodes_per_dag,
-         schedulable_op_masks,
-         valid_prlsm_lim_masks) = self._stack_obsns(obsns)
+        obsns: ObsBatch,
+        actions: Tensor
+    ) -> tuple[Tensor, Tensor]:
 
         model_outputs = \
             self.actor_network(
-                nested_dag_batch.to(self.device),
-                num_dags_per_obs.to(self.device)
+                obsns.nested_dag_batch.to(self.device),
+                obsns.num_dags_per_obs.to(self.device)
             )
 
         # move model outputs to CPU
@@ -128,16 +122,12 @@ class DecimaAgent(BaseAgent):
 
         self._mask_outputs(
             (node_scores_batch, dag_scores_batch),
-            (schedulable_op_masks, valid_prlsm_lim_masks)
+            (obsns.schedulable_op_masks, obsns.valid_prlsm_lim_masks)
         )
 
-        # actions are dicts, but we only care about the values
-        action_values = zip(*(act.values() for act in actions))
-
-        (node_selections, 
-         dag_idxs, 
-         dag_selections) = \
-            [torch.tensor(lst) for lst in action_values]
+        # split columns of `actions` into separate tensors
+        node_selections, dag_idxs, dag_selections = \
+            [act.long() for act in actions.T]
 
         (all_node_probs, 
          node_lgprobs, 
@@ -151,7 +141,7 @@ class DecimaAgent(BaseAgent):
         dag_probs = \
             self._compute_dag_probs(
                 all_node_probs, 
-                num_nodes_per_dag
+                obsns.num_nodes_per_dag
             )
         
         dag_lgprobs, dag_entropies = \
@@ -184,28 +174,6 @@ class DecimaAgent(BaseAgent):
 
 
     ## internal methods
-
-    def _to_pyg(self, obs_dag_batch: ObsType) -> Batch:
-        '''construct PyG `Batch` object from `obs['dag_batch']`'''
-        ptr = np.array(obs_dag_batch['ptr'])
-        num_nodes_per_dag = ptr[1:] - ptr[:-1]
-        num_active_nodes = obs_dag_batch['data'].nodes.shape[0]
-        num_active_jobs = len(num_nodes_per_dag)
-
-        x = obs_dag_batch['data'].nodes
-        edge_index = torch.from_numpy(obs_dag_batch['data'].edge_links.T)
-        adj = make_adj(edge_index, num_active_nodes)
-        batch = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
-        dag_batch = Batch(x=torch.from_numpy(x), 
-                          edge_index=edge_index, 
-                          adj=adj,
-                          batch=torch.from_numpy(batch), 
-                          ptr=torch.from_numpy(ptr))
-        dag_batch._num_graphs = num_active_jobs
-
-        return dag_batch
-
-
 
     @classmethod
     def _mask_outputs(
@@ -240,69 +208,6 @@ class DecimaAgent(BaseAgent):
             'job_idx': job_idx.item(),
             'prlsm_lim': prlsm_lim.item()
         }
-
-
-
-    @classmethod
-    def _stack_obsns(cls, obsns):
-        (dag_batches,
-         valid_ops_masks, 
-         valid_prlsm_lim_masks) = \
-            zip(*((obs['dag_batch'], 
-                   obs['schedulable_op_mask'], 
-                   obs['valid_prlsm_lim_mask']) 
-                  for obs in obsns))
-
-        nested_dag_batch, num_dags_per_obs, num_nodes_per_dag = \
-            cls._nest_dag_batches(dag_batches)
-
-        valid_ops_masks = np.concatenate(valid_ops_masks).astype(bool)
-        valid_prlsm_lim_masks = torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
-
-        return nested_dag_batch, \
-               num_dags_per_obs, \
-               num_nodes_per_dag, \
-               valid_ops_masks, \
-               valid_prlsm_lim_masks
-
-
-    
-    @classmethod
-    def _nest_dag_batches(cls, dag_batches):
-        '''nests the dag batches from each observation into 
-        one large dag batch
-        '''
-        _to_pyg = lambda raw_data: \
-            Data(x=torch.from_numpy(raw_data.nodes), 
-                 edge_index=torch.from_numpy(raw_data.edge_links.T))
-
-        def _get_num_nodes_per_dag(ptr):
-            ptr = np.array(ptr)
-            return ptr[1:] - ptr[:-1]
-
-        data_list, num_dags_per_obs, num_nodes_per_dag = \
-            zip(*((_to_pyg(dag_batch['data']), 
-                    len(dag_batch['ptr'])-1,
-                    _get_num_nodes_per_dag(dag_batch['ptr']))
-                  for dag_batch in dag_batches))
-
-        num_dags_per_obs = torch.tensor(num_dags_per_obs)
-        num_nodes_per_dag = torch.from_numpy(np.concatenate(num_nodes_per_dag))
-        total_num_dags = num_dags_per_obs.sum()
-
-        nested_dag_batch = Batch.from_data_list(data_list)
-        nested_dag_batch.batch = \
-            torch.arange(total_num_dags) \
-                .repeat_interleave(num_nodes_per_dag)
-        ptr = num_nodes_per_dag.cumsum(dim=0)
-        nested_dag_batch.ptr = \
-            torch.cat([torch.tensor([0]), ptr], dim=0)
-        nested_dag_batch._num_graphs = total_num_dags
-        nested_dag_batch.adj = \
-            make_adj(nested_dag_batch.edge_index, 
-                     nested_dag_batch.x.shape[0])
-
-        return nested_dag_batch, num_dags_per_obs, num_nodes_per_dag
 
 
 
@@ -387,7 +292,7 @@ class DecimaAgent(BaseAgent):
             node_lgprobs += [node_lgprob_subbatch]
             node_entropies += [node_entropy_subbatch]
 
-        ## concatenate the subbatch attributes together
+        ## collate the subbatch attributes
 
         # for each node ever seen, records the probability
         # that that node is selected out of all the
@@ -503,7 +408,7 @@ class ActorNetwork(nn.Module):
     def forward(
         self, 
         dag_batch: Batch,
-        num_dags_per_obs: Optional[torch.Tensor] = None
+        num_dags_per_obs: Optional[Tensor] = None
     ) -> Union[tuple[Tensor, Tensor], tuple[Tensor, Tensor, Tensor, Tensor]]:
         '''
         Args:
@@ -514,9 +419,9 @@ class ActorNetwork(nn.Module):
                 If it is not provided, then the dag_batch is assumed to not be
                 nested.
         Returns:
-            node scores and dag scores, and if dag_batch is nested, then additionally
-            returns the number of nodes in each observation and an tensor containing
-            the starting node index for each observation
+            node scores and dag scores, and if dag_batch is a batch of batches, 
+            then additionally returns the number of nodes in each observation and 
+            an tensor containing the starting node index for each observation
         '''
 
         is_data_batched = (num_dags_per_obs is not None)
@@ -657,7 +562,7 @@ class GraphEncoderNetwork(nn.Module):
     def _compute_node_embeddings(self, dag_batch):
         '''one embedding per node, per dag'''
         assert hasattr(dag_batch, 'adj')
-        # achieve flow from leaves to roots by *not* taking 
+        # achieve flow from target to source by *not* taking 
         # transpose of `adj`
         return self.graph_conv(dag_batch.x, dag_batch.adj)
     

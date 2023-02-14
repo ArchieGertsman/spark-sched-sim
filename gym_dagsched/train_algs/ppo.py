@@ -1,13 +1,16 @@
-from typing import List, Tuple, Optional
+from typing import Optional
 from itertools import chain
+from gymnasium.core import ObsType, ActType
+from torch import Tensor
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 import torch.profiler
 
 from .base_alg import BaseAlg
-from ..utils.baselines import compute_baselines
 from ..utils.rollout_buffer import RolloutBuffer
+from ..utils.graph import collate_obsns, ObsBatch
 
 
 
@@ -31,7 +34,7 @@ class PPO(BaseAlg):
         gamma: float = .99,
         max_time_mean_init: float = np.inf,
         max_time_mean_growth: float = 0.,
-        max_time_mean_ceil: float = np.inf,
+        max_time_mean_clip_range: float = 0.,
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
         entropy_weight_min: float = 1e-4
@@ -52,7 +55,7 @@ class PPO(BaseAlg):
             gamma,
             max_time_mean_init,
             max_time_mean_growth,
-            max_time_mean_ceil,
+            max_time_mean_clip_range,
             entropy_weight_init,
             entropy_weight_decay,
             entropy_weight_min
@@ -60,7 +63,31 @@ class PPO(BaseAlg):
 
 
 
-    def _run_train_iteration(
+    def _compute_loss(
+        self,
+        obsns: ObsBatch,
+        actions: Tensor,
+        advantages: Tensor,
+        old_lgprobs: Tensor,
+        clip_range: float = .2
+    ) -> tuple[Tensor, float, float]:
+        '''clipped loss unique to PPO'''
+        lgprobs, entropies = \
+            self.agent.evaluate_actions(obsns, actions)
+
+        ratio = torch.exp(lgprobs - old_lgprobs)
+        loss1 = advantages * ratio
+        loss2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+        policy_loss = -torch.min(loss1, loss2).mean()
+
+        entropy_loss = entropies.sum()
+        total_loss = policy_loss + self.entropy_weight * entropy_loss
+
+        return total_loss, policy_loss.item(), entropy_loss.item()
+
+
+
+    def _learn_from_rollouts(
         self,
         rollout_buffers: list[RolloutBuffer]
     ) -> tuple[float, float]:
@@ -68,43 +95,21 @@ class PPO(BaseAlg):
         # separate the rollout data into lists
         obsns_list, actions_list, wall_times_list, rewards_list = \
             zip(*((buff.obsns, buff.actions, buff.wall_times, buff.rewards)
-                  for buff in rollout_buffers))
+                  for buff in rollout_buffers))      
 
-        returns_list = \
-            self.return_calc.calculate(rewards_list, wall_times_list)
+        advantages_list = self._compute_advantages(rewards_list, wall_times_list)
 
-        baselines_list, stds_list = \
-            compute_baselines(wall_times_list, returns_list)
+        # make a new dataset out of the new rollouts, and make a 
+        # dataloader that loads minibatches from that dataset
+        dataloader = \
+            self._make_dataloader(obsns_list, actions_list, advantages_list)
 
-        gen = zip(returns_list, baselines_list, stds_list)
-        advantages_list = [(returns - baselines) / (stds + 1e-8)
-                            for returns, baselines, stds in gen]
-
-        # flatten rollout data from all the workers
-        all_obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
-        all_actions = {i: act for i, act in enumerate(chain(*actions_list))}
-        all_advantages = np.hstack(advantages_list)
-        with torch.no_grad():
-            all_old_lgprobs, _ = \
-                self.agent.evaluate_actions(
-                    all_obsns.values(), 
-                    all_actions.values())
-
-        NUM_SAMPLES = len(all_obsns)
         action_losses = []
         entropies = []
 
+        # run multiple learning epochs with minibatching
         for _ in range(self.num_epochs):
-            all_sample_indices = self.np_random.permutation(np.arange(NUM_SAMPLES))
-            split_ind = np.arange(self.batch_size, NUM_SAMPLES, self.batch_size)
-            mini_batches = np.split(all_sample_indices, split_ind)
-
-            for indices in mini_batches:
-                obsns = [all_obsns[i] for i in indices]
-                actions = [all_actions[i] for i in indices]
-                advantages = torch.from_numpy(all_advantages[indices]).float()
-                old_lgprobs = all_old_lgprobs[indices]
-
+            for obsns, actions, advantages, old_lgprobs in dataloader:
                 total_loss, action_loss, entropy_loss = \
                     self._compute_loss(
                         obsns, 
@@ -114,7 +119,7 @@ class PPO(BaseAlg):
                     )
 
                 action_losses += [action_loss]
-                entropies += [entropy_loss / len(indices)]
+                entropies += [entropy_loss / advantages.numel()]
 
                 self.agent.update_parameters(total_loss)
 
@@ -122,26 +127,109 @@ class PPO(BaseAlg):
 
 
 
-    def _compute_loss(
+    def _make_dataloader(
         self,
-        obsns: List[dict], 
-        actions: List[dict], 
-        advantages: torch.Tensor,
-        old_lgprobs: torch.Tensor,
-        clip_range: float = .2
-    ) -> Tuple[torch.Tensor, float, float]:
+        obsns_list: list[list[ObsType]],
+        actions_list: list[list[ActType]],
+        advantages_list: list[np.ndarray]
+    ) -> DataLoader:
 
-        lgprobs, entropies = \
-            self.agent.evaluate_actions(obsns, actions)
+        old_lgprobs = \
+            self._compute_old_lgprobs(obsns_list, actions_list)
+        
+        rollout_dataset = \
+            PPORolloutDataset(
+                obsns_list, 
+                actions_list, 
+                advantages_list, 
+                old_lgprobs
+            )
 
-        ratio = torch.exp(lgprobs - old_lgprobs)
-        policy_loss_1 = advantages * ratio
-        policy_loss_2 = advantages * \
-            torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-        policy_loss = \
-            -torch.min(policy_loss_1, policy_loss_2).mean()
+        dataloader = \
+            DataLoader(
+                dataset=rollout_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                collate_fn=PPORolloutDataset.collate
+            )
 
-        entropy_loss = entropies.sum()
-        total_loss = policy_loss + self.entropy_weight * entropy_loss
+        return dataloader
 
-        return total_loss, policy_loss.item(), entropy_loss.item()
+
+
+    def _compute_old_lgprobs(
+        self, 
+        obsns_list: list[list[ObsType]], 
+        actions_list: list[list[ActType]]
+    ) -> Tensor:
+        obsns = collate_obsns(chain(*obsns_list))
+        actions = Tensor([[int(a) for a in act.values()] 
+                          for act in chain(*actions_list)])
+        with torch.no_grad():
+            old_lgprobs, _ = \
+                self.agent.evaluate_actions(obsns, actions)
+
+        return old_lgprobs
+
+
+
+
+class PPORolloutDataset(Dataset):
+    def __init__(
+        self, 
+        obsns_list: list[list[ObsType]],
+        actions_list: list[list[ActType]],
+        advantages_list: list[np.ndarray],
+        old_lgprobs: Tensor 
+    ):
+        '''
+        Args:
+            obsns_list: list of observation lists for each rollout
+            actions_list: list of action lists for each rollout
+            advantages_list: list of advantages for each rollout
+            old_lgprobs: already flattened tensor of all old log-
+                probabilities for all the rollouts
+        '''
+        super().__init__()
+        self.obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
+        self.actions = {i: act for i, act in enumerate(chain(*actions_list))}
+        self.advantages = np.hstack(advantages_list)
+        self.old_lgprobs = old_lgprobs
+
+
+
+    def __getitem__(
+        self, 
+        idx: int
+    ) -> tuple[ObsType, ActType, float, float]:
+        return self.obsns[idx], \
+               self.actions[idx], \
+               self.advantages[idx], \
+               self.old_lgprobs[idx]
+
+
+
+    def __len__(self):
+        return len(self.advantages)
+
+
+
+    @classmethod
+    def collate(
+        cls, 
+        batch: list[tuple[ObsType, ActType, np.ndarray, Tensor]]
+    ) -> tuple[ObsBatch, Tensor, Tensor, Tensor]:
+        '''
+        Args:
+            batch: list of (obs, action, advantage, old_lgprob) 
+                tuples to be collated into a minibatch
+        Returns:
+            tuple of collated observations, actions, advantages, 
+                and old log-probabilities
+        '''
+        obsns, actions, advantages, old_lgprobs = zip(*batch)
+        obsns = collate_obsns(obsns)
+        actions = Tensor([[int(a) for a in act.values()] for act in actions])
+        advantages = torch.from_numpy(np.hstack(advantages))
+        old_lgprobs = torch.stack(old_lgprobs)
+        return obsns, actions, advantages, old_lgprobs
