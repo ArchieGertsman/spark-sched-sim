@@ -1,13 +1,17 @@
+from typing import List, Optional
+
 from scipy.signal import lfilter
 import numpy as np
 
 
 
 class ReturnsCalculator:
-    def __init__(self, 
-                 discount, 
-                 diff_mode=True, 
-                 size=100000):
+    def __init__(
+        self, 
+        discount: float, 
+        diff_mode: bool = True, 
+        size: int = 100000
+    ):
         self.discount = discount
         self.diff_mode = diff_mode
         if diff_mode:
@@ -20,7 +24,19 @@ class ReturnsCalculator:
 
 
 
-    def calculate(self, rewards_list, times_list=None):
+    def __call__(
+        self, 
+        rewards_list: List[np.ndarray], 
+        times_list: Optional[List[np.ndarray]] = None
+    ) -> List[np.ndarray]:
+        return self.calculate(rewards_list, times_list)
+
+
+
+    def calculate(self, 
+        rewards_list: List[np.ndarray], 
+        times_list: Optional[List[np.ndarray]] = None
+    ) -> List[np.ndarray]:
         '''args:
         - `rewards_list`: list of reward arrays (len: num envs)
         - `times_list`: list of wall time arrays (len: num envs)
@@ -59,14 +75,13 @@ class ReturnsCalculator:
             time_diffs = times[1:] - times[:-1]
             time_diffs_list += [time_diffs]
 
-        for time_diffs, rewards in zip(time_diffs_list,
-                                       rewards_list):
+        for time_diffs, rewards in zip(time_diffs_list, rewards_list):
             self._add_list_filter_zero(time_diffs, rewards)
 
-        diff_rewards_list = \
-            [rewards - self.avg_per_step_reward() * time_diffs
-             for rewards, time_diffs in zip(rewards_list, 
-                                            time_diffs_list)]
+        diff_rewards_list = [
+            rewards - self.avg_per_step_reward() * time_diffs
+            for rewards, time_diffs in zip(rewards_list, time_diffs_list)
+        ]
 
         return diff_rewards_list
 

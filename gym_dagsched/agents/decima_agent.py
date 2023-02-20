@@ -1,4 +1,4 @@
-from typing import NamedTuple, Optional, Union
+from typing import Tuple, Optional, Union, Iterable
 from torch import Tensor
 
 import torch
@@ -31,7 +31,8 @@ class DecimaAgent(BaseAgent):
         state_dict_path: str = None,
         dim_embed: int = 8,
         optim_class: torch.optim.Optimizer = torch.optim.Adam,
-        optim_lr: float = .001
+        optim_lr: float = .001,
+        max_grad_norm: float = .5
     ):
         super().__init__('Decima')
 
@@ -52,6 +53,8 @@ class DecimaAgent(BaseAgent):
 
         self.training_mode = training_mode
 
+        self.max_grad_norm = max_grad_norm
+
 
 
     @property
@@ -69,6 +72,7 @@ class DecimaAgent(BaseAgent):
 
 
 
+    @torch.no_grad()
     def predict(self, obs: ObsType) -> ActType:
         '''assumes that `DecimaObsWrapper` is providing
         observations of the environment and `DecimaActWrapper` 
@@ -78,11 +82,9 @@ class DecimaAgent(BaseAgent):
         batch = dag_batch.batch.clone() # save a CPU copy
         dag_batch = dag_batch.to(self.device, non_blocking=True)
 
-        with torch.no_grad():
-            # no computational graphs needed during 
-            # the episode, only model outputs.
-            outputs = self.actor_network(dag_batch)
-            node_scores, dag_scores = [out.cpu() for out in outputs]
+        # no computational graphs needed during the episode
+        outputs = self.actor_network(dag_batch)
+        node_scores, dag_scores = [out.cpu() for out in outputs]
 
         schedulable_op_mask = \
             torch.tensor(obs['schedulable_op_mask'], dtype=bool)
@@ -168,6 +170,10 @@ class DecimaAgent(BaseAgent):
         # compute gradients
         loss.backward()
 
+        # clip grads
+        params = self.actor_network.parameters()
+        torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+
         # update model parameters
         self.optim.step()
 
@@ -234,15 +240,14 @@ class DecimaAgent(BaseAgent):
     @classmethod
     def _evaluate_node_actions(
         cls,
-        node_scores_batch,
-        node_selection_batch,
-        num_nodes_per_obs
-    ):
-        '''splits the node score/selection batches into subbatches 
-        (see subroutine below), then for each subbatch, comptues 
-        attributes (action log-probability and entropy) using 
-        vectorized computations. Finally, merges the attributes 
-        from the subbatches together. This is faster than 
+        node_scores_batch: Tensor,
+        node_action_batch: Tensor,
+        num_nodes_per_obs: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        '''splits the node action batch into subbatches 
+        (see subroutine below), then for each subbatch, evaluates
+        actions using vectorized computations. Finally, merges the 
+        evaluations from the subbatches together. This is faster than 
         either 
         - separately computing attributes for each sample in the
         batch, because vectorized computations are not utilized
@@ -250,6 +255,22 @@ class DecimaAgent(BaseAgent):
         - stacking the whole batch together with padding and doing 
         one large vectorized computation, because the backward 
         pass becomes very expensive
+
+        Args:
+            node_scores_batch: flat batch of node scores from the actor
+                network, with shape (total_num_nodes,)
+            node_selection_batch: batch of node actions with shape
+                (num_actions,)
+            num_nodes_per_obs: stores the number of nodes in each
+                observation with shape (num_actions,)
+        Returns:
+            tuple (all_node_probs, node_lgprobs, node_entropies), where
+                all_node_probs is the probability of each node getting
+                    selected, shape (total_num_nodes,)
+                node_lgprobs is the log-probability of the selected nodes
+                    actually getting selected, shape (num_actions,)
+                node_entropies is the node entropy for each model
+                    output, shape (num_actions,)
         '''
 
         def _eval_node_actions(node_scores, node_selection):
@@ -261,12 +282,13 @@ class DecimaAgent(BaseAgent):
         (node_scores_subbatches, 
          node_selection_subbatches, 
          subbatch_node_counts) = \
-            cls._split_node_experience(node_scores_batch, 
-                                       node_selection_batch, 
-                                       num_nodes_per_obs)
+            cls._split_node_experience(
+                node_scores_batch, 
+                node_action_batch, 
+                num_nodes_per_obs
+            )
 
-        # for each subbatch, compute the node
-        # action attributes, vectorized
+        # evaluate actions for each subbatch, vectorized
         all_node_probs = []
         node_lgprobs = []
         node_entropies = []
@@ -313,10 +335,10 @@ class DecimaAgent(BaseAgent):
     @classmethod
     def _split_node_experience(
         cls,
-        node_scores_batch, 
-        node_selection_batch, 
-        num_nodes_per_obs
-    ):
+        node_scores_batch: Tensor, 
+        node_selection_batch: Tensor, 
+        num_nodes_per_obs: Tensor
+    ) -> Tuple[Iterable[Tensor], Iterable[Tensor], Tensor]:
         '''splits the node score/selection batches into
         subbatches, where each each sample within a subbatch
         has the same node count.

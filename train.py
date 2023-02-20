@@ -1,7 +1,4 @@
-import numpy as np
-
-from gym_dagsched.train_algs.reinforce import Reinforce
-from gym_dagsched.train_algs.ppo import PPO
+from gym_dagsched.train_algs import PPO, VPG
 
 
 
@@ -14,7 +11,7 @@ if __name__ == '__main__':
         'moving_delay': 2000.
     }
 
-    Reinforce(
+    PPO(
         env_kwargs,
         num_iterations=1,
         num_envs=8,
@@ -22,15 +19,16 @@ if __name__ == '__main__':
         # summary_writer_dir='ignore/log/train', 
         model_save_dir='ignore/models',
         optim_lr=5e-3,
-        # entropy_weight_init=1e-4,
-        # entropy_weight_decay=1e-5,
-        # entropy_weight_min=1e-7,
-        entropy_weight_init=0.,
-        entropy_weight_decay=0.,
+        entropy_weight_init=1,
+        entropy_weight_decay=5e-5,
         entropy_weight_min=0.,
+        # entropy_weight_init=0.,
+        # entropy_weight_decay=0.,
+        # entropy_weight_min=0.,
         max_time_mean_init=2000e3,
-        max_time_mean_growth=10e3,
-        max_time_mean_clip_range=1000e3,
-        batch_size=256,
-        num_epochs=4
+        max_time_mean_growth=20e3,
+        max_time_mean_clip_range=500e3,
+        batch_size=1024,
+        num_epochs=4,
+        seed=2147483647
     ).train()

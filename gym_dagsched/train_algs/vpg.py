@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Tuple, Optional
 from torch import Tensor
 
 import numpy as np
@@ -10,8 +10,9 @@ from ..utils.graph import ObsBatch
 
 
 
-class PPO(BaseAlg):
-    '''Proximal Policy Optimization'''
+
+class VPG(BaseAlg):
+    '''Vanilla Policy Gradient'''
 
     def __init__(
         self,
@@ -34,8 +35,7 @@ class PPO(BaseAlg):
         max_time_mean_clip_range: float = 0.,
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
-        entropy_weight_min: float = 1e-4,
-        clip_range: float = .2
+        entropy_weight_min: float = 1e-4
     ):  
         super().__init__(
             env_kwargs,
@@ -60,32 +60,20 @@ class PPO(BaseAlg):
             entropy_weight_min
         )
 
-        self.clip_range = clip_range
-
 
 
     def _compute_loss(
         self,
-        obsns: ObsBatch,
-        actions: Tensor,
+        obsns: ObsBatch, 
+        actions: Tensor, 
         advantages: Tensor,
         old_lgprobs: Tensor
-    ) -> tuple[Tensor, float, float]:
+    ) -> Tuple[Tensor, float, float]:
 
-        lgprobs, entropies = \
-            self.agent.evaluate_actions(obsns, actions)
+        action_lgprobs, action_entropies = self.agent.evaluate_actions(obsns, actions)
 
-        ratio = torch.exp(lgprobs - old_lgprobs)
-        policy_loss1 = advantages * ratio
-        policy_loss2 = advantages * \
-            torch.clamp(
-                ratio, 
-                1 - self.clip_range, 
-                1 + self.clip_range
-            )
-
-        policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
-        entropy_loss = -entropies.mean()
+        policy_loss = -(advantages * action_lgprobs).mean()
+        entropy_loss = -action_entropies.mean()
         total_loss = policy_loss + self.entropy_weight * entropy_loss
 
         return total_loss, policy_loss.item(), entropy_loss.item()

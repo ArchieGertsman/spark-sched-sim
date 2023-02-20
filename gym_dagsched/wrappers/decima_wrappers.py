@@ -43,12 +43,6 @@ class DecimaObsWrapper(ObservationWrapper):
 
         # build node features
         nodes = np.zeros((num_active_nodes, 5), dtype=np.float32)
-        # nodes[:, :2] = obs['dag_batch']['data'].nodes
-        # nodes[:, 2] = obs['num_workers_to_schedule']
-        # nodes[:, 3] = np.repeat(worker_counts, num_nodes_per_dag)
-        # if obs['source_job_idx'] < num_active_jobs:
-        #     i = obs['source_job_idx']
-        #     nodes[ptr[i]:ptr[i+1], 4] = 1
 
         nodes[:, 0] = obs['num_workers_to_schedule'] / self.num_workers
 
@@ -66,13 +60,17 @@ class DecimaObsWrapper(ObservationWrapper):
 
         # update op action space to reflect the current number of active ops
         self.observation_space['dag_batch']['ptr'].feature_space.n = num_active_nodes+1
-        # self.action_space['op_idx'].n = num_active_nodes
+
+        graph_instance = \
+            GraphInstance(
+                nodes=nodes, 
+                edges=obs['dag_batch']['data'].edges, 
+                edge_links=obs['dag_batch']['data'].edge_links
+            )
 
         obs = {
             'dag_batch': {
-                'data': GraphInstance(nodes=nodes, 
-                                      edges=obs['dag_batch']['data'].edges, 
-                                      edge_links=obs['dag_batch']['data'].edge_links),
+                'data': graph_instance,
                 'ptr': obs['dag_batch']['ptr']
             },
             'schedulable_op_mask': obs['schedulable_op_mask'],
