@@ -18,7 +18,7 @@ class PPO(BaseAlg):
         env_kwargs: dict,
         num_iterations: int = 500,
         num_epochs: int = 4,
-        batch_size: int = 512,
+        batch_size: Optional[int] = 512,
         num_envs: int = 4,
         seed: int = 42,
         log_dir: str = 'log',
@@ -35,7 +35,8 @@ class PPO(BaseAlg):
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
         entropy_weight_min: float = 1e-4,
-        clip_range: float = .2
+        clip_range: float = .2,
+        target_kl: Optional[float] = None
     ):  
         super().__init__(
             env_kwargs,
@@ -57,7 +58,8 @@ class PPO(BaseAlg):
             max_time_mean_clip_range,
             entropy_weight_init,
             entropy_weight_decay,
-            entropy_weight_min
+            entropy_weight_min,
+            target_kl
         )
 
         self.clip_range = clip_range
@@ -72,8 +74,9 @@ class PPO(BaseAlg):
         old_lgprobs: Tensor
     ) -> tuple[Tensor, float, float]:
 
-        lgprobs, entropies = \
-            self.agent.evaluate_actions(obsns, actions)
+        lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         ratio = torch.exp(lgprobs - old_lgprobs)
         policy_loss1 = advantages * ratio
@@ -84,8 +87,12 @@ class PPO(BaseAlg):
                 1 + self.clip_range
             )
 
-        policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
+        policy_loss = -torch.min(policy_loss1, policy_loss2).mean() * 1e3
         entropy_loss = -entropies.mean()
         total_loss = policy_loss + self.entropy_weight * entropy_loss
 
-        return total_loss, policy_loss.item(), entropy_loss.item()
+        with torch.no_grad():
+            log_ratio = lgprobs - old_lgprobs
+            approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+
+        return total_loss, policy_loss.item(), entropy_loss.item(), approx_kl_div

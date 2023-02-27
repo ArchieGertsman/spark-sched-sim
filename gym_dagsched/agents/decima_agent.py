@@ -171,8 +171,11 @@ class DecimaAgent(BaseAgent):
         loss.backward()
 
         # clip grads
-        params = self.actor_network.parameters()
-        torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(
+            self.actor_network.parameters(), 
+            self.max_grad_norm,
+            error_if_nonfinite=True
+        )
 
         # update model parameters
         self.optim.step()

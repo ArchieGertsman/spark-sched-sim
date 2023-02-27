@@ -90,10 +90,12 @@ def rollout_worker(
 
         # send rollout buffer and stats to center
         avg_job_duration = metrics.avg_job_duration(env) * 1e-3
+        num_job_arrivals = env.num_completed_jobs + env.num_active_jobs
         conn.send((
             rollout_buffer, 
             avg_job_duration, 
-            env.num_completed_jobs
+            env.num_completed_jobs,
+            num_job_arrivals
         ))
 
         iteration += 1

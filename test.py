@@ -26,15 +26,15 @@ def main():
 
     num_tests = 10
 
-    num_workers = 10
+    num_workers = 50
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
-    base_seed = 500 # NOTE: model does awful on 503
+    base_seed = 1000 # NOTE: model does awful on 503
 
     model_dir = 'gym_dagsched/results/models'
-    model_name = 'model_1b_20s_10w_500ep.pt'
+    model_name = 'model_282it.pt'
 
     fifo_agent = FIFOAgent(num_workers)
     scpt_agent = CPTAgent(num_workers)
@@ -48,7 +48,7 @@ def main():
     env_kwargs = {
         'num_workers': num_workers,
         'num_init_jobs': 1,
-        'num_job_arrivals': 20,
+        'num_job_arrivals': 200,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
