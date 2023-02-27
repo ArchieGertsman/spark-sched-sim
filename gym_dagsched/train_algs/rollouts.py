@@ -24,13 +24,25 @@ class RolloutBuffer:
         self.wall_times: list[float] = []
         self.actions: list[ActType] = []
         self.rewards: list[float] = []
+        self.values: list[float] = []
+        self.lgprobs: list[float] = []
 
 
-    def add(self, obs, wall_time, action, reward):
+    def add(
+        self, 
+        obs: ObsType, 
+        wall_time: float, 
+        action: ActType, 
+        reward: float, 
+        value: float, 
+        lgprob: float
+    ) -> None:
         self.obsns += [obs]
         self.wall_times += [wall_time]
         self.actions += [action]
         self.rewards += [reward]
+        self.values += [value]
+        self.lgprobs += [lgprob]
 
 
     def __len__(self):
@@ -64,6 +76,7 @@ def setup_rollout_worker(rank: int, env_kwargs: dict) -> None:
 
 def rollout_worker(
     rank: int, 
+    world_size: int,
     conn: Connection, 
     env_kwargs: dict
 ) -> None:
@@ -77,14 +90,14 @@ def rollout_worker(
         state_dict, env_options = data
 
         # load updated model parameters
-        agent.actor_network.load_state_dict(state_dict)
+        agent.load_state_dict(state_dict)
         
         with Profiler(), HiddenPrints():
             rollout_buffer = \
                 collect_rollout(
                     env, 
                     agent, 
-                    seed=iteration, 
+                    seed=world_size*iteration + rank, 
                     options=env_options
                 )
 
@@ -115,13 +128,20 @@ def collect_rollout(
     rollout_buffer = RolloutBuffer()
 
     while not done:
-        action = agent(obs)
+        action, value, lgprob = agent(obs)
 
         new_obs, reward, terminated, truncated, info = env.step(action)
 
         done = (terminated or truncated)
 
-        rollout_buffer.add(obs, info['wall_time'], action, reward)
+        rollout_buffer.add(
+            obs, 
+            info['wall_time'], 
+            action, 
+            reward, 
+            value, 
+            lgprob
+        )
 
         obs = new_obs
 
@@ -136,6 +156,7 @@ class RolloutDataset(Dataset):
         self, 
         obsns: dict[int, ObsType],
         actions: dict[int, ActType],
+        returns: Tensor,
         advantages: Tensor,
         old_lgprobs: Tensor 
     ):
@@ -152,6 +173,7 @@ class RolloutDataset(Dataset):
         super().__init__()
         self.obsns = obsns
         self.actions = actions
+        self.returns = returns
         self.advantages = advantages
         self.old_lgprobs = old_lgprobs
 
@@ -159,6 +181,7 @@ class RolloutDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[ObsType, ActType, Tensor, Tensor]:
         return self.obsns[idx], \
                self.actions[idx], \
+               self.returns[idx], \
                self.advantages[idx], \
                self.old_lgprobs[idx]
 
@@ -170,7 +193,7 @@ class RolloutDataset(Dataset):
     @classmethod
     def collate(
         cls, 
-        batch: Iterable[tuple[ObsType, ActType, Tensor, Tensor]]
+        batch: Iterable[tuple[ObsType, ActType, Tensor, Tensor, Tensor]]
     ) -> tuple[ObsBatch, Tensor, Tensor, Tensor]:
         '''
         Args:
@@ -180,9 +203,10 @@ class RolloutDataset(Dataset):
             tuple of collated observations, actions, advantages, 
                 and old log-probabilities
         '''
-        obsns, actions, advantages, old_lgprobs = zip(*batch)
+        obsns, actions, returns, advantages, old_lgprobs = zip(*batch)
         obsns = collate_obsns(obsns)
         actions = Tensor([[int(a) for a in act.values()] for act in actions])
+        returns = torch.stack(returns)
         advantages = torch.stack(advantages)
         old_lgprobs = torch.stack(old_lgprobs)
-        return obsns, actions, advantages, old_lgprobs
+        return obsns, actions, returns, advantages, old_lgprobs

@@ -94,6 +94,13 @@ class BaseAlg(ABC):
         self.procs = []
         self.conns = []
 
+        self.avg_reward = -1000
+        self.avg_value = -1000
+
+        self.alpha = .1
+        self.lam = .95
+        self.nu = 1.
+
 
 
     def train(self) -> None:
@@ -112,7 +119,7 @@ class BaseAlg(ABC):
 
             self._log_iteration_start(iteration, max_time)
 
-            state_dict = self.agent.actor_network.state_dict()
+            state_dict = self.agent.state_dict()
             if (iteration+1) % self.model_save_freq == 0:
                 torch.save(state_dict, f'{self.model_save_path}/model.pt')
             
@@ -128,8 +135,9 @@ class BaseAlg(ABC):
                 zip(*[conn.recv() for conn in self.conns])
 
             with Profiler():
-                policy_loss, entropy_loss, approx_kl_div = \
+                policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
+                
                 torch.cuda.synchronize()
 
             if self.summary_writer:
@@ -137,6 +145,7 @@ class BaseAlg(ABC):
                 self._write_stats(
                     iteration,
                     policy_loss,
+                    value_loss,
                     entropy_loss,
                     avg_job_durations,
                     completed_job_counts,
@@ -182,6 +191,7 @@ class BaseAlg(ABC):
 
         policy_losses = []
         entropy_losses = []
+        value_losses = []
         approx_kl_divs = []
 
         continue_training = True
@@ -191,17 +201,23 @@ class BaseAlg(ABC):
             if not continue_training:
                 break
 
-            for obsns, actions, advantages, old_lgprobs in dataloader:
-                total_loss, action_loss, entropy_loss, approx_kl_div = \
+            for obsns, actions, returns, advantages, old_lgprobs in dataloader:
+                (total_loss, 
+                 action_loss, 
+                 entropy_loss, 
+                 value_loss, 
+                 approx_kl_div) = \
                     self._compute_loss(
                         obsns, 
-                        actions, 
+                        actions,
+                        returns,
                         advantages,
                         old_lgprobs
                     )
 
                 policy_losses += [action_loss]
                 entropy_losses += [entropy_loss]
+                value_losses += [value_loss]
                 approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
@@ -211,7 +227,10 @@ class BaseAlg(ABC):
 
                 self.agent.update_parameters(total_loss)
 
-        return np.mean(policy_losses), np.mean(entropy_losses), np.mean(approx_kl_divs)
+        return np.mean(policy_losses), \
+               np.mean(entropy_losses), \
+               np.mean(value_losses), \
+               np.mean(approx_kl_divs)
 
 
 
@@ -224,23 +243,67 @@ class BaseAlg(ABC):
         '''
 
         # separate the rollout data into lists
-        obsns_list, actions_list, wall_times_list, rewards_list = \
-            zip(*((buff.obsns, buff.actions, buff.wall_times, buff.rewards)
+        (obsns_list, 
+         actions_list, 
+         wall_times_list, 
+         rewards_list, 
+         values_list, 
+         lgprobs_list) = \
+            zip(*((buff.obsns, 
+                   buff.actions, 
+                   buff.wall_times, 
+                   buff.rewards,
+                   buff.values,
+                   buff.lgprobs)
                   for buff in rollout_buffers)) 
 
         # flatten observations and actions into a dict for fast access time
         obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
         actions = {i: act for i, act in enumerate(chain(*actions_list))}
 
-        advantages = self._compute_advantages(rewards_list, wall_times_list)
-        advantages = torch.from_numpy(advantages)
+        
+        rew = np.hstack(rewards_list)
+        rew = rew[rew != 0]
+        self.avg_reward += self.alpha * (rew.mean() - self.avg_reward)
 
-        old_lgprobs = self._compute_old_lgprobs(obsns.values(), actions.values())
+        val = np.hstack(values_list)
+        self.avg_value += self.alpha * (val.mean() - self.avg_value)
+
+
+        all_advantages = []
+
+        for rewards, values in zip(rewards_list, values_list):
+            rewards = np.hstack(rewards)
+            values = np.hstack(values)
+
+            dv = values[1:] - values[:-1]
+            dv = np.concatenate([dv, np.array([0])])
+            deltas = rewards - self.avg_reward + dv
+
+            advantages = []
+            for t in reversed(range(len(deltas))):
+                adv = deltas[t]
+                if t < len(deltas)-1:
+                    adv += self.lam * deltas[t+1]
+                advantages += [adv]
+
+            all_advantages += advantages
+
+        
+        advantages = torch.from_numpy(np.hstack(all_advantages)).float()
+        values = torch.from_numpy(val).float()
+
+        value_targets = advantages + values - self.nu * self.avg_value
+
+        
+
+        old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list))
         
         rollout_dataset = \
             RolloutDataset(
                 obsns, 
                 actions, 
+                value_targets,
                 advantages, 
                 old_lgprobs
             )
@@ -263,38 +326,6 @@ class BaseAlg(ABC):
                 )
 
         return dataloader
-
-
-
-    @torch.no_grad()
-    def _compute_old_lgprobs(
-        self, 
-        obsns: Iterable[ObsType], 
-        actions: Iterable[ActType]
-    ) -> Tensor:
-        obsns = collate_obsns(obsns)
-        actions = torch.tensor([list(act.values()) for act in actions])
-        old_lgprobs, _ = self.agent.evaluate_actions(obsns, actions)
-        return old_lgprobs
-
-
-
-    def _compute_advantages(
-        self,
-        rewards_list: list[np.ndarray],
-        wall_times_list: list[np.ndarray]
-    ) -> np.ndarray:
-
-        returns_list = self.return_calc(rewards_list, wall_times_list)
-        baselines_list, stds_list = compute_baselines(wall_times_list, returns_list)
-
-        returns = np.hstack(returns_list)
-        baselines = np.hstack(baselines_list)
-        stds = np.hstack(stds_list)
-
-        advantages = (returns - baselines) # / (stds + 1e-8)
-
-        return advantages
 
 
 
@@ -344,7 +375,7 @@ class BaseAlg(ABC):
 
             proc = Process(
                 target=rollout_worker, 
-                args=(rank, conn_sub, self.env_kwargs)
+                args=(rank, self.num_envs, conn_sub, self.env_kwargs)
             )
 
             self.procs += [proc]
@@ -377,6 +408,7 @@ class BaseAlg(ABC):
         self,
         epoch: int,
         policy_loss: float,
+        value_loss: float,
         entropy_loss: float,
         avg_job_durations: list[float],
         completed_job_counts: list[int],
@@ -391,8 +423,10 @@ class BaseAlg(ABC):
             'max wall time': max_time * 1e-3,
             'completed jobs count': np.mean(completed_job_counts),
             'job arrival count': np.mean(job_arrival_counts),
-            'avg reward per sec': self.return_calc.avg_per_step_reward(),
+            'avg reward': self.avg_reward,
+            'avg value': self.avg_value,
             'policy loss': policy_loss,
+            'value loss': value_loss,
             'entropy': -entropy_loss,
             'episode length': np.mean(ep_lens),
             'KL div': approx_kl_div
@@ -407,7 +441,7 @@ class BaseAlg(ABC):
         # increase the mean episode duration
         self.max_time_mean += self.max_time_mean_growth
 
-        self.max_time_mean_clip_range += 1e3
+        self.max_time_mean_clip_range += 2e3
 
         # decrease the entropy weight
         self.entropy_weight = np.clip(

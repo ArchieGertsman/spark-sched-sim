@@ -4,6 +4,7 @@ from torch import Tensor
 import numpy as np
 import torch
 import torch.profiler
+import torch.nn.functional as F
 
 from .base_alg import BaseAlg
 from ..utils.graph import ObsBatch
@@ -36,7 +37,8 @@ class PPO(BaseAlg):
         entropy_weight_decay: float = 1e-3,
         entropy_weight_min: float = 1e-4,
         clip_range: float = .2,
-        target_kl: Optional[float] = None
+        target_kl: Optional[float] = None,
+        value_weight: float = .5
     ):  
         super().__init__(
             env_kwargs,
@@ -63,6 +65,7 @@ class PPO(BaseAlg):
         )
 
         self.clip_range = clip_range
+        self.value_weight = value_weight
 
 
 
@@ -70,12 +73,14 @@ class PPO(BaseAlg):
         self,
         obsns: ObsBatch,
         actions: Tensor,
+        value_targets: Tensor,
         advantages: Tensor,
         old_lgprobs: Tensor
     ) -> tuple[Tensor, float, float]:
 
-        lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
+        values, lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
+        # normalize the advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         ratio = torch.exp(lgprobs - old_lgprobs)
@@ -89,10 +94,14 @@ class PPO(BaseAlg):
 
         policy_loss = -torch.min(policy_loss1, policy_loss2).mean() * 1e3
         entropy_loss = -entropies.mean()
-        total_loss = policy_loss + self.entropy_weight * entropy_loss
+        value_loss = F.mse_loss(value_targets, values.flatten())
+
+        total_loss = policy_loss + \
+                     self.entropy_weight * entropy_loss + \
+                     self.value_weight * value_loss
 
         with torch.no_grad():
             log_ratio = lgprobs - old_lgprobs
             approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
 
-        return total_loss, policy_loss.item(), entropy_loss.item(), approx_kl_div
+        return total_loss, policy_loss.item(), entropy_loss.item(), value_loss.item(), approx_kl_div

@@ -1,5 +1,6 @@
 from typing import Tuple, Optional, Union, Iterable
 from torch import Tensor
+from itertools import chain
 
 import torch
 import torch.nn as nn
@@ -36,8 +37,7 @@ class DecimaAgent(BaseAgent):
     ):
         super().__init__('Decima')
 
-        self.actor_network = \
-            ActorNetwork(num_workers, dim_embed)
+        self.acm = ActorCriticModel(num_workers, dim_embed)
 
         self.num_workers = num_workers
 
@@ -47,9 +47,9 @@ class DecimaAgent(BaseAgent):
 
         if state_dict_path is not None:
             state_dict = torch.load(state_dict_path, map_location=self.device)
-            self.actor_network.load_state_dict(state_dict)
+            self.acm.load_state_dict(state_dict)
 
-        self.actor_network.train(training_mode)
+        self.acm.train(training_mode)
 
         self.training_mode = training_mode
 
@@ -59,21 +59,28 @@ class DecimaAgent(BaseAgent):
 
     @property
     def device(self) -> torch.device:
-        return next(self.actor_network.parameters()).device
+        return next(self.acm.parameters()).device
+    
+
+    def state_dict(self) -> dict:
+        return self.acm.state_dict()
+    
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.acm.load_state_dict(sd)
 
 
 
     def build(self, device: torch.device = None) -> None:
         if device is not None:
-            self.actor_network.to(device)
+            self.acm.to(device)
 
-        params = self.actor_network.parameters()
-        self.optim = self.optim_class(params, lr=self.optim_lr)
+        self.optim = self.optim_class(self.acm.parameters(), lr=self.optim_lr)
 
 
 
     @torch.no_grad()
-    def predict(self, obs: ObsType) -> ActType:
+    def predict(self, obs: ObsType) -> Tuple[ActType, float, float]:
         '''assumes that `DecimaObsWrapper` is providing
         observations of the environment and `DecimaActWrapper` 
         is receiving actions returned from here.
@@ -83,8 +90,8 @@ class DecimaAgent(BaseAgent):
         dag_batch = dag_batch.to(self.device, non_blocking=True)
 
         # no computational graphs needed during the episode
-        outputs = self.actor_network(dag_batch)
-        node_scores, dag_scores = [out.cpu() for out in outputs]
+        acm_out = self.acm(dag_batch)
+        node_scores, dag_scores, value = [out.cpu() for out in acm_out]
 
         schedulable_op_mask = \
             torch.tensor(obs['schedulable_op_mask'], dtype=bool)
@@ -97,9 +104,9 @@ class DecimaAgent(BaseAgent):
             (schedulable_op_mask, valid_prlsm_lim_mask)
         )
 
-        action = self._sample_action(node_scores, dag_scores, batch)
+        action, lgprob = self._sample_action(node_scores, dag_scores, batch)
 
-        return action
+        return action, value.item(), lgprob.item()
 
 
 
@@ -108,19 +115,19 @@ class DecimaAgent(BaseAgent):
         obsns: ObsBatch,
         actions: Tensor
     ) -> tuple[Tensor, Tensor]:
+        
+        nested_dag_batch = obsns.nested_dag_batch.to(self.device)
+        num_dags_per_obs = obsns.num_dags_per_obs.to(self.device)
 
-        model_outputs = \
-            self.actor_network(
-                obsns.nested_dag_batch.to(self.device),
-                obsns.num_dags_per_obs.to(self.device)
-            )
+        acm_out = self.acm(nested_dag_batch, num_dags_per_obs)
 
         # move model outputs to CPU
         (node_scores_batch, 
          dag_scores_batch, 
+         values,
          num_nodes_per_obs, 
          obs_indptr) = \
-            [out.cpu() for out in model_outputs]
+            [out.cpu() for out in acm_out]
 
         self._mask_outputs(
             (node_scores_batch, dag_scores_batch),
@@ -156,11 +163,11 @@ class DecimaAgent(BaseAgent):
             )
 
         # aggregate the evaluations for nodes and dags
-        action_lgprobs = node_lgprobs + dag_lgprobs
-        action_entropies = (node_entropies + dag_entropies) * \
+        lgprobs = node_lgprobs + dag_lgprobs
+        entropies = (node_entropies + dag_entropies) * \
                            self._get_entropy_scale(num_nodes_per_obs)
 
-        return action_lgprobs, action_entropies
+        return values, lgprobs, entropies
 
 
 
@@ -172,7 +179,7 @@ class DecimaAgent(BaseAgent):
 
         # clip grads
         torch.nn.utils.clip_grad_norm_(
-            self.actor_network.parameters(), 
+            self.acm.parameters(), 
             self.max_grad_norm,
             error_if_nonfinite=True
         )
@@ -205,18 +212,26 @@ class DecimaAgent(BaseAgent):
     @classmethod
     def _sample_action(cls, node_scores, dag_scores, batch):
         # select the next operation to schedule
-        op_idx = Categorical(logits=node_scores).sample()
+        c_op = Categorical(logits=node_scores)
+        op_idx = c_op.sample()
+        op_lgprob = c_op.log_prob(op_idx)
 
         # select the parallelism limit for the selected op's job
         job_idx = batch[op_idx]
         dag_scores = dag_scores[job_idx]
-        prlsm_lim = Categorical(logits=dag_scores).sample()
+        c_prlsm_lim = Categorical(logits=dag_scores)
+        prlsm_lim = c_prlsm_lim.sample()
+        prlsm_lim_lgprob = c_prlsm_lim.log_prob(prlsm_lim)
 
-        return {
+        act = {
             'op_idx': op_idx.item(),
             'job_idx': job_idx.item(),
             'prlsm_lim': prlsm_lim.item()
         }
+
+        lgprob = op_lgprob + prlsm_lim_lgprob
+
+        return act, lgprob
 
 
 
@@ -417,16 +432,16 @@ class DecimaAgent(BaseAgent):
 
 
 
-class ActorNetwork(nn.Module):
+class ActorCriticModel(nn.Module):
     
     def __init__(self, num_workers: int, dim_embed: int):
         super().__init__()
 
-        self.encoder = \
-            GraphEncoderNetwork(dim_embed)
+        self.encoder = GraphEncoderNetwork(dim_embed)
 
-        self.policy_network = \
-            PolicyNetwork(num_workers, dim_embed)
+        self.policy_network = PolicyNetwork(num_workers, dim_embed)
+        
+        self.value_network = make_mlp(dim_embed, 1, h1=64, h2=32)
         
 
         
@@ -434,7 +449,7 @@ class ActorNetwork(nn.Module):
         self, 
         dag_batch: Batch,
         num_dags_per_obs: Optional[Tensor] = None
-    ) -> Union[tuple[Tensor, Tensor], tuple[Tensor, Tensor, Tensor, Tensor]]:
+    ): # -> Union[tuple[Tensor, Tensor], tuple[Tensor, Tensor, Tensor, Tensor]]:
         '''
         Args:
             dag_batch (torch_geometric.data.Batch): PyG batch of job dags
@@ -472,8 +487,10 @@ class ActorNetwork(nn.Module):
                 num_nodes_per_obs,
                 num_dags_per_obs
             )
+        
+        values = self.value_network(global_embeddings)
 
-        ret = (node_scores, dag_scores)
+        ret = (node_scores, dag_scores, values)
         if is_data_batched:
             ret += (num_nodes_per_obs, obs_indptr)
         return ret
