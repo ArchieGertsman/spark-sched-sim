@@ -4,17 +4,18 @@ from itertools import chain
 import numpy as np
 import torch
 from torch import Tensor
-import torch.profiler
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import torchopt
 
 from .base_alg import BaseAlg
-from .rollouts import RolloutBuffer, RolloutDataset
-from ..utils.graph import ObsBatch
+from .rollouts import RolloutBuffer, RolloutDataset, ValueDataset
+from ..utils.graph import ObsBatch, collate_obsns
 from ..utils.baselines import compute_baselines
 
 
 
-class PPO(BaseAlg):
+class MetaPPO(BaseAlg):
     '''Proximal Policy Optimization'''
 
     def __init__(
@@ -76,7 +77,7 @@ class PPO(BaseAlg):
         actions: Tensor,
         advantages: Tensor,
         old_lgprobs: Tensor,
-    ) -> tuple[Tensor, float, float, float]:
+    ) -> tuple[Tensor, float, float]:
 
         lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
@@ -103,12 +104,118 @@ class PPO(BaseAlg):
     
 
 
+    def adapt_and_predict(
+        self, 
+        critic_sd,
+        inner_opt_sd,
+        obsns_adapt_list, 
+        val_targs_adapt_list,
+        obsns_pred_list,
+        val_targs_pred_list
+    ):
+        obsns_adapt = {i: obs for i, obs in enumerate(chain(*obsns_adapt_list))}
+        val_targs_adapt = torch.from_numpy(np.hstack(val_targs_adapt_list)).float()
+        critic_dl = DataLoader(
+            ValueDataset(obsns_adapt, val_targs_adapt),
+            batch_size=(val_targs_adapt.numel() // self.num_envs + 1),
+            collate_fn=ValueDataset.collate,
+            shuffle=True,
+            generator=self.dataloader_gen
+        )
+
+        # adapt
+        print('start inner')
+        for _ in range(2):
+            for obsns, val_targs in critic_dl:
+                vals = self.agent.predict_values(obsns)
+                print('asdf', vals[-10:])
+                inner_val_loss = F.mse_loss(vals.flatten(), val_targs)
+                self.agent.inner_opt.step(inner_val_loss)
+
+        # predict
+        vals_pred = self.agent.predict_values(
+            collate_obsns(chain(*obsns_pred_list))
+        ).flatten()
+        val_targs_pred = torch.from_numpy(np.hstack(val_targs_pred_list)).float()
+        val_loss = F.mse_loss(vals_pred, val_targs_pred)
+        print('bruh')
+        print(vals_pred[-20:])
+        print(val_targs_pred[-20:])
+        print(val_loss)
+
+        torchopt.recover_state_dict(self.agent.critic, critic_sd)
+        torchopt.recover_state_dict(self.agent.inner_opt, inner_opt_sd)
+
+        return vals_pred.detach(), val_loss
+    
+
+
     def _learn_from_rollouts(
         self,
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> tuple[float, float]:
+        
+        (obsns_list, wall_times_list, rewards_list) = \
+            zip(*((buff.obsns, buff.wall_times, buff.rewards)
+                  for buff in rollout_buffers)) 
 
-        policy_dataloader = self._make_dataloader(rollout_buffers)
+        diff_rewards_list = self.return_calc.compute_diff_rewards(wall_times_list, rewards_list)
+
+        # differential returns for each rollout
+        diff_returns_list = []
+        for diff_rewards, obsns in zip(rewards_list, obsns_list): # diff_rewards_list:
+            diff_returns = np.zeros_like(diff_rewards)
+            # with torch.no_grad():
+            #     obs = collate_obsns([obsns[-1]])
+            #     val_bootstrap = self.agent.predict_values(obs).item()
+            diff_returns[-1] = diff_rewards[-1] # + .99 * val_bootstrap
+            for i in reversed(range(len(diff_rewards)-1)):
+                diff_returns[i] = diff_rewards[i] + .99 * diff_returns[i+1]
+            diff_returns_list += [diff_returns]
+
+        value_losses = []
+
+        
+        
+        # for _ in range(3):
+        critic_sd = torchopt.extract_state_dict(self.agent.critic) #, by='copy')
+        inner_opt_sd = torchopt.extract_state_dict(self.agent.inner_opt) #, by='copy')
+
+        # adapt critic on first half of rollouts, then predict values 
+        # for second half of rollouts
+        values_2nd, val_loss2 = self.adapt_and_predict(
+            critic_sd,
+            inner_opt_sd,
+            obsns_list[:self.num_envs//2],
+            diff_returns_list[:self.num_envs//2],
+            obsns_list[self.num_envs//2:],
+            diff_returns_list[self.num_envs//2:]
+        )
+        
+        # adapt critic on second half of rollouts, then predict values 
+        # for first half of rollouts
+        values_1st, val_loss1 = self.adapt_and_predict(
+            critic_sd,
+            inner_opt_sd,
+            obsns_list[self.num_envs//2:],
+            diff_returns_list[self.num_envs//2:],
+            obsns_list[:self.num_envs//2],
+            diff_returns_list[:self.num_envs//2]
+        )
+
+        value_loss = (val_loss1 + val_loss2) / 2
+        value_losses += [value_loss.item()]
+        self.agent.update_parameters(value_loss)
+
+
+
+        adapted_values = torch.hstack([values_1st, values_2nd])
+        diff_returns = torch.from_numpy(np.hstack(diff_returns_list)).float()
+
+        # monte carlo advantage estimation using adapted values
+        advantages = diff_returns - adapted_values
+
+        policy_dataloader = self._make_dataloader(rollout_buffers, advantages)
 
         policy_losses = []
         entropy_losses = []
@@ -116,8 +223,7 @@ class PPO(BaseAlg):
 
         continue_training = True
 
-        # update policy for one epoch
-        for _ in range(self.num_epochs):
+        for _ in range(2):
             if not continue_training:
                 break
 
@@ -143,7 +249,7 @@ class PPO(BaseAlg):
 
         return np.mean(policy_losses), \
                np.mean(entropy_losses), \
-               0, \
+               np.mean(value_losses), \
                np.mean(approx_kl_divs)
 
 
@@ -151,48 +257,21 @@ class PPO(BaseAlg):
 
     def _make_dataloader(
         self,
-        rollout_buffers: Iterable[RolloutBuffer]
+        rollout_buffers: Iterable[RolloutBuffer],
+        advantages
     ) -> DataLoader:
         '''creates a dataset out of the new rollouts, and returns a 
         dataloader that loads minibatches from that dataset
         '''
 
         # separate the rollout data into lists
-        (obsns_list, 
-         actions_list, 
-         wall_times_list, 
-         rewards_list, 
-         lgprobs_list) = \
-            zip(*((buff.obsns, 
-                   buff.actions, 
-                   buff.wall_times, 
-                   buff.rewards, 
-                   buff.lgprobs)
+        (obsns_list, actions_list, lgprobs_list) = \
+            zip(*((buff.obsns, buff.actions, buff.lgprobs)
                   for buff in rollout_buffers)) 
 
-        # flatten observations and actions into a dict for fast access time
+        # flatten observations into a dict for fast access time
         obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
         actions = torch.tensor([list(act.values()) for act in chain(*actions_list)])
-
-        rewards_list, returns_list = self.return_calc(rewards_list, wall_times_list)
-        values_list = compute_baselines(wall_times_list, returns_list)
-
-        lam = .98
-        adv_list = []
-        for rewards, values in zip(rewards_list, values_list):
-            dv = values[1:] - values[:-1]
-            dv = np.concatenate([dv, np.array([0])])
-            td_err = rewards + dv
-            adv = np.zeros_like(td_err)
-            adv[-1] = rewards[-1]
-            for t in reversed(range(len(td_err)-1)):
-                adv[t] = td_err[t] + lam * adv[t+1]
-            adv_list += [adv]
-        advantages = torch.from_numpy(np.hstack(adv_list)).float()
-
-        for buff, adv, values in zip(rollout_buffers, adv_list, values_list):
-            buff.returns = adv + values
-
         old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list))
         
         rollout_dataset = \
@@ -203,16 +282,14 @@ class PPO(BaseAlg):
                 old_lgprobs
             )
 
-        num_samples = old_lgprobs.numel()
-        batch_size = num_samples // self.batch_size + 1
-
         policy_dataloader = \
             DataLoader(
                 dataset=rollout_dataset,
-                batch_size=batch_size,
+                batch_size=(old_lgprobs.numel() // self.batch_size + 1),
                 shuffle=True,
                 collate_fn=RolloutDataset.collate,
                 generator=self.dataloader_gen
             )
-        
+
         return policy_dataloader
+

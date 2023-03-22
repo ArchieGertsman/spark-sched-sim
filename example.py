@@ -8,7 +8,7 @@ from gym_dagsched.wrappers.decima_wrappers import (
     DecimaObsWrapper,
     DecimaActWrapper
 )
-from gym_dagsched.agents.decima_agent import DecimaAgent
+from gym_dagsched.agents.ac_decima_agent import DecimaAgent
 from gym_dagsched.utils.hidden_prints import HiddenPrints
 from gym_dagsched.utils import metrics
 
@@ -16,16 +16,18 @@ from gym_dagsched.utils import metrics
 
 if __name__ == '__main__':
     # set rng seeds for reproducibility 
-    env_seed = 500 
+    env_seed = 1476
     torch_seed = 42
     torch.manual_seed(torch_seed)
 
     # select the number of simulated workers
-    num_workers = 10
+    num_workers = 50
 
     # load learned agent
-    model_dir = 'gym_dagsched/results/models'
-    model_name = 'model_1b_20s_10w_500ep.pt'
+    # model_dir = 'gym_dagsched/results/models'
+    # model_name = 'model_1b_20s_10w_500ep.pt'
+    model_dir = 'ignore/models'
+    model_name = 'model.pt'
     decima_agent = \
         DecimaAgent(num_workers,
                     training_mode=False, 
@@ -36,10 +38,10 @@ if __name__ == '__main__':
     env_kwargs = {
         'num_workers': num_workers,
         'num_init_jobs': 1,
-        'num_job_arrivals': 20,
+        'num_job_arrivals': 93,
         'job_arrival_rate': 1/25000,
-        'moving_delay': 2000.,
-        'render_mode': 'human' # visualize simulation
+        'moving_delay': 2000. #,
+        # 'render_mode': 'human' # visualize simulation
     }
 
     # setup gym environment
@@ -53,10 +55,9 @@ if __name__ == '__main__':
         done = False
         
         while not done:
-            action = decima_agent(obs)
+            action, _, _ = decima_agent(obs)
 
-            obs, reward, terminated, truncated, _ = \
-                env.step(action)
+            obs, reward, terminated, truncated, _ = env.step(action)
 
             done = (terminated or truncated)
 

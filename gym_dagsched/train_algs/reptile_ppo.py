@@ -1,20 +1,20 @@
 from typing import Optional, Iterable
 from itertools import chain
+from copy import deepcopy
 
 import numpy as np
 import torch
 from torch import Tensor
-import torch.profiler
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 from .base_alg import BaseAlg
-from .rollouts import RolloutBuffer, RolloutDataset
-from ..utils.graph import ObsBatch
-from ..utils.baselines import compute_baselines
+from .rollouts import RolloutBuffer, RolloutDataset, ValueDataset
+from ..utils.graph import ObsBatch, collate_obsns
 
 
 
-class PPO(BaseAlg):
+class ReptilePPO(BaseAlg):
     '''Proximal Policy Optimization'''
 
     def __init__(
@@ -107,17 +107,32 @@ class PPO(BaseAlg):
         self,
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> tuple[float, float]:
+        
+        critic_clone = deepcopy(self.agent.critic)
+        
+        critic_clone.load_state_dict({name:
+            torch.mean(torch.stack([rb.sd[name] for rb in rollout_buffers]), axis=0)
+            for name in critic_clone.state_dict()
+        })
+
+        self.agent.ac_opt.zero_grad()
+        for p_old, p_new in zip(self.agent.critic.parameters(), critic_clone.parameters()):
+            p_old.grad = p_old - p_new
+        self.agent.ac_opt.step()
+        
+        # old_sd = self.agent.critic.state_dict()
+        # self.agent.critic.load_state_dict({name:
+        #     old_sd[name] + .01 * (torch.mean(torch.stack([rb.sd[name] for rb in rollout_buffers])) - old_sd[name])
+        #     for name in old_sd
+        # })
 
         policy_dataloader = self._make_dataloader(rollout_buffers)
 
         policy_losses = []
         entropy_losses = []
         approx_kl_divs = []
-
         continue_training = True
-
-        # update policy for one epoch
-        for _ in range(self.num_epochs):
+        for _ in range(2):
             if not continue_training:
                 break
 
@@ -141,9 +156,13 @@ class PPO(BaseAlg):
 
                 self.agent.update_parameters(total_loss)
 
+
+        # self.agent.sched.step()
+
+
         return np.mean(policy_losses), \
                np.mean(entropy_losses), \
-               0, \
+               np.mean([rb.value_loss for rb in rollout_buffers]), \
                np.mean(approx_kl_divs)
 
 
@@ -162,54 +181,36 @@ class PPO(BaseAlg):
          actions_list, 
          wall_times_list, 
          rewards_list, 
-         lgprobs_list) = \
+         lgprobs_list,
+         returns_list,
+         values_list) = \
             zip(*((buff.obsns, 
                    buff.actions, 
                    buff.wall_times, 
                    buff.rewards, 
-                   buff.lgprobs)
+                   buff.lgprobs,
+                   buff.returns,
+                   buff.values)
                   for buff in rollout_buffers)) 
+        
+        # self.return_calc(rewards_list, wall_times_list)
 
-        # flatten observations and actions into a dict for fast access time
+        returns = torch.hstack(returns_list)
+        values = torch.hstack(values_list)
+        advantages = returns - values
+
         obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
         actions = torch.tensor([list(act.values()) for act in chain(*actions_list)])
-
-        rewards_list, returns_list = self.return_calc(rewards_list, wall_times_list)
-        values_list = compute_baselines(wall_times_list, returns_list)
-
-        lam = .98
-        adv_list = []
-        for rewards, values in zip(rewards_list, values_list):
-            dv = values[1:] - values[:-1]
-            dv = np.concatenate([dv, np.array([0])])
-            td_err = rewards + dv
-            adv = np.zeros_like(td_err)
-            adv[-1] = rewards[-1]
-            for t in reversed(range(len(td_err)-1)):
-                adv[t] = td_err[t] + lam * adv[t+1]
-            adv_list += [adv]
-        advantages = torch.from_numpy(np.hstack(adv_list)).float()
-
-        for buff, adv, values in zip(rollout_buffers, adv_list, values_list):
-            buff.returns = adv + values
-
         old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list))
-        
-        rollout_dataset = \
-            RolloutDataset(
-                obsns, 
-                actions, 
-                advantages, 
-                old_lgprobs
-            )
-
-        num_samples = old_lgprobs.numel()
-        batch_size = num_samples // self.batch_size + 1
-
         policy_dataloader = \
             DataLoader(
-                dataset=rollout_dataset,
-                batch_size=batch_size,
+                dataset=RolloutDataset(
+                    obsns, 
+                    actions, 
+                    advantages, 
+                    old_lgprobs
+                ),
+                batch_size=(old_lgprobs.numel() // self.batch_size + 1),
                 shuffle=True,
                 collate_fn=RolloutDataset.collate,
                 generator=self.dataloader_gen

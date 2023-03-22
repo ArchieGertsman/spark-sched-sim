@@ -15,10 +15,12 @@ class CPTAgent(HeuristicAgent):
     path time.
     '''
 
-    def __init__(self, 
-                 num_workers, 
-                 fair=True,
-                 by_shortest=True):
+    def __init__(
+        self, 
+        num_workers, 
+        fair=True,
+        by_shortest=True
+    ):
         name = 'SCPT ' if by_shortest else 'LCPT '
         name += '(fair)' if fair else '(greedy)'
         super().__init__(name)
@@ -32,6 +34,7 @@ class CPTAgent(HeuristicAgent):
         obs = self.preprocess_obs(obs)
         num_active_jobs = len(obs.worker_counts)
 
+        # prioritize source job, if there is one
         if obs.source_job_idx < num_active_jobs:
             selected_op_idx = self.find_op(obs, obs.source_job_idx)
 
@@ -97,8 +100,7 @@ class CPTAgent(HeuristicAgent):
             for child_op_idx in obs.G.successors(op_idx):
                 if child_op_idx not in cp_lens:
                     calc_cp_len(child_op_idx, cp_lens)
-                max_child_cpl = \
-                    max(max_child_cpl, cp_lens[child_op_idx])
+                max_child_cpl = max(max_child_cpl, cp_lens[child_op_idx])
             
             cp_lens[op_idx] += max_child_cpl
 
@@ -112,8 +114,11 @@ class CPTAgent(HeuristicAgent):
         if cp_lens == {}:
             return {}
 
-        cp_lens = {op_idx: cp_len for op_idx, cp_len in cp_lens.items()
-                   if obs.schedulable_op_mask[op_idx]}
+        cp_lens = {
+            op_idx: cp_len 
+            for op_idx, cp_len in cp_lens.items()
+            if obs.schedulable_op_mask[op_idx]
+        }
 
         cp_lens = dict(sorted(cp_lens.items(), 
                               key=lambda item: item[1], 

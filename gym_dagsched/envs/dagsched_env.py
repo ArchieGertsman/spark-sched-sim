@@ -33,6 +33,7 @@ except:
 
 
 
+
 class DagSchedEnv(Env):
     '''Gymnasium environment that simulates job dag scheduling'''
 
@@ -45,7 +46,8 @@ class DagSchedEnv(Env):
         num_job_arrivals: int,
         job_arrival_rate: float,
         moving_delay: float,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        reward_scale: float = 1e-5
     ):
         '''
         Args:
@@ -65,26 +67,30 @@ class DagSchedEnv(Env):
         '''
 
         num_total_jobs = num_init_jobs + num_job_arrivals
+        self.num_init_jobs = num_init_jobs
 
         self.num_workers = num_workers
         self.num_total_jobs = num_total_jobs
         self.moving_cost = moving_delay
 
-        self._datagen = \
-            TPCHJobSequenceGen(num_init_jobs,
-                               num_job_arrivals,
-                               job_arrival_rate)
+        self._datagen = TPCHJobSequenceGen(
+            num_init_jobs,
+            num_job_arrivals,
+            job_arrival_rate
+        )
 
         self._state = WorkerAssignmentState(num_workers)
 
+        self.reward_scale = reward_scale
+
         self.render_mode = render_mode
         if render_mode == 'human':
-            if not PYGAME_AVAILABLE:
-                raise Exception('pygame is unavailable')
-            self._renderer = \
-                Renderer(self.num_workers, 
-                         self.num_total_jobs, 
-                         render_fps=self.metadata['render_fps'])
+            assert PYGAME_AVAILABLE, 'pygame is unavailable'
+            self._renderer = Renderer(
+                self.num_workers, 
+                self.num_total_jobs, 
+                render_fps=self.metadata['render_fps']
+            )
         else:
             self._renderer = None
 
@@ -178,6 +184,13 @@ class DagSchedEnv(Env):
         except:
             self.max_wall_time = np.inf
 
+        try:
+            self._datagen.num_job_arrivals = options['num_job_arrivals']
+            self.num_total_jobs = self.num_init_jobs + options['num_job_arrivals']
+        except:
+            # number of job arrivals hasn't changed
+            pass
+
         # simulation wall time in ms
         self.wall_time = 0.
 
@@ -194,17 +207,13 @@ class DagSchedEnv(Env):
 
         # timeline is initially filled with all the job arrival
         # events, so extract all the job objects from there
-        self.jobs = {
-            i: e.job 
-            for i, (*_, e) in enumerate(self.timeline.pq)
-        }
+        self.jobs = {i: e.job for i, (*_, e) in enumerate(self.timeline.pq)}
 
         # the fastest way to obtain the edge links for an
         # observation is to start out with all of them in
         # a big array, and then to induce a subgraph based
         # on the current set of active nodes
-        self.all_edge_links, self.all_job_ptr = \
-            self._reset_edge_links()
+        self._reset_edge_links()
 
         self.num_total_ops = self.all_job_ptr[-1]
 
@@ -214,8 +223,7 @@ class DagSchedEnv(Env):
 
         self.completed_job_ids = set()
 
-        self.executor_interval_map = \
-            self._make_executor_interval_map()
+        self.executor_interval_map = self._make_executor_interval_map()
 
         # during a scheduling round, maintains the operations
         # that have already been selected so that they don't
@@ -255,14 +263,13 @@ class DagSchedEnv(Env):
         self._state.clear_worker_source()
         self.selected_ops.clear()
 
-        # save old attributes for computing reward
+        # save old state attributes for computing reward
         old_wall_time = self.wall_time
         old_active_job_ids = self.active_job_ids.copy()
 
         self._resume_simulation()
 
-        reward = self._calculate_reward(old_wall_time,
-                                        old_active_job_ids)
+        reward = self._calculate_reward(old_wall_time, old_active_job_ids)
         self.terminated = self.all_jobs_complete
         self.truncated = (self.wall_time >= self.max_wall_time)
 
@@ -319,7 +326,8 @@ class DagSchedEnv(Env):
             base_op_idx = job_ptr[-1]
             edge_links += [base_op_idx + np.vstack(job.dag.edges)]
             job_ptr += [base_op_idx + job.num_ops]
-        return np.vstack(edge_links), np.array(job_ptr)
+        self.all_edge_links = np.vstack(edge_links)
+        self.all_job_ptr = np.array(job_ptr)
 
 
 
@@ -359,11 +367,9 @@ class DagSchedEnv(Env):
 
         # agent may have requested more workers than
         # are actually needed or available
-        num_workers = \
-            self._adjust_num_workers(num_workers, op)
+        num_workers = self._adjust_num_workers(num_workers, op)
 
-        print(f'committing {num_workers} workers '
-              f'to {op.pool_key}')
+        print(f'committing {num_workers} workers to {op.pool_key}')
         self._state.add_commitment(num_workers, op.pool_key)
 
         # mark op as selected so that it doesn't get
@@ -373,8 +379,7 @@ class DagSchedEnv(Env):
         # find remaining schedulable operations
         job = self.jobs[op.job_id]
         self.schedulable_ops -= set(job.active_ops)
-        self.schedulable_ops |= \
-            self._find_schedulable_ops([op.job_id])
+        self.schedulable_ops |= self._find_schedulable_ops([op.job_id])
 
 
 
@@ -448,7 +453,7 @@ class DagSchedEnv(Env):
 
         edge_links = subgraph(self.all_edge_links, active_op_mask)
 
-        # we aren't using any edge data, so this array is always zeros
+        # not using edge data, so this array is always zeros
         edges = np.zeros(len(edge_links), dtype=int)
 
         num_workers_to_schedule = self._state.num_workers_to_schedule()
@@ -643,22 +648,18 @@ class DagSchedEnv(Env):
         go in a loop, under-committing workers from the same
         source pool.
         '''
-        num_uncommitted_workers = \
-            self._state.num_workers_to_schedule()
+        num_uncommitted_workers = self._state.num_workers_to_schedule()
 
         if num_uncommitted_workers > 0:
-            self._state.add_commitment(num_uncommitted_workers, 
-                                       GENERAL_POOL_KEY)
+            self._state.add_commitment(num_uncommitted_workers, GENERAL_POOL_KEY)
 
 
 
-    def _find_schedulable_ops(self, 
-                              job_ids=None, 
-                              source_job_id=None):
+    def _find_schedulable_ops(self, job_ids=None, source_job_id=None):
         '''An operation is schedulable if it is ready
         (see `_is_op_ready()`), it hasn't been selected
         in the current scheduling round, and its job
-        is not saturated with workers (i.e. can gain
+        is not saturated with workers (i.e. can accept
         more workers).
         
         returns a union of schedulable operations
@@ -675,17 +676,17 @@ class DagSchedEnv(Env):
         # filter out saturated jobs. The source job is
         # never considered saturated, because it is not
         # gaining any new workers during scheduling
-        job_ids = [job_id for job_id in job_ids
+        job_ids = [
+            job_id for job_id in job_ids
                    if job_id == source_job_id or \
-                      (self._state.total_worker_count(job_id) < \
-                            self.num_workers)]
+                      (self._state.total_worker_count(job_id) < self.num_workers)
+        ]
 
-        schedulable_ops = \
-            set(op
-                for job_id in iter(job_ids)
-                for op in iter(self.jobs[job_id].active_ops)
-                if op not in self.selected_ops and \
-                   self._is_op_ready(op))
+        schedulable_ops = set(
+            op for job_id in iter(job_ids) \
+               for op in iter(self.jobs[job_id].active_ops)
+               if op not in self.selected_ops and self._is_op_ready(op)
+        )
 
         return schedulable_ops
 
@@ -715,14 +716,10 @@ class DagSchedEnv(Env):
         worker_demand = self._get_worker_demand(op)
         num_source_workers = self._state.num_workers_to_schedule()
 
-        num_workers_adjusted = \
-            min(num_workers, worker_demand, num_source_workers)
+        num_workers_adjusted = min(num_workers, worker_demand, num_source_workers)
 
         assert num_workers_adjusted > 0
-
-        print('num_workers adjustment:',
-             f'{num_workers} -> {num_workers_adjusted}')
-
+        print('num_workers adjustment:', f'{num_workers} -> {num_workers_adjusted}')
         return num_workers_adjusted
 
 
@@ -737,14 +734,11 @@ class DagSchedEnv(Env):
         resources were assigned to the operation 
         than needed.
         '''
-        num_workers_moving = \
-            self._state.num_workers_moving_to_op(op.pool_key)
+        num_workers_moving = self._state.num_workers_moving_to_op(op.pool_key)
             
-        num_commitments = \
-            self._state.num_commitments_to_op(op.pool_key)
+        num_commitments = self._state.num_commitments_to_op(op.pool_key)
 
-        demand = op.num_remaining_tasks - \
-                 (num_workers_moving + num_commitments)
+        demand = op.num_remaining_tasks - (num_workers_moving + num_commitments)
 
         return demand
 
@@ -793,10 +787,12 @@ class DagSchedEnv(Env):
         
 
 
-    def _handle_released_worker(self, 
-                                worker_id, 
-                                op, 
-                                did_job_frontier_change):
+    def _handle_released_worker(
+        self, 
+        worker_id, 
+        op, 
+        did_job_frontier_change
+    ):
         '''called upon a task completion.
         
         if the op has a commitment, then fulfill it, unless the worker
@@ -807,27 +803,26 @@ class DagSchedEnv(Env):
         job dag, then move the worker to the job's worker pool so that it can 
         be assigned to the new ops
         '''
-        commitment_pool_key = \
-            self._state.peek_commitment(op.pool_key)
+        commitment_pool_key = self._state.peek_commitment(op.pool_key)
 
         if commitment_pool_key is not None:
-            self._fulfill_commitment(worker_id,
-                                     commitment_pool_key)
+            self._fulfill_commitment(worker_id, commitment_pool_key)
             return True
     
         if did_job_frontier_change:
-            self._state.move_worker_to_pool(worker_id, 
-                                            op.job_pool_key)
+            self._state.move_worker_to_pool(worker_id, op.job_pool_key)
 
         return False
 
         
 
 
-    def _update_worker_source(self, 
-                              op, 
-                              had_commitment, 
-                              did_job_frontier_change):
+    def _update_worker_source(
+        self, 
+        op, 
+        had_commitment, 
+        did_job_frontier_change
+    ):
         '''called upon a task completion.
         
         if any new operations were unlocked within this 
@@ -870,8 +865,7 @@ class DagSchedEnv(Env):
     def _fulfill_commitment(self, worker_id, dst_pool_key):
         print('fulfilling commitment to', dst_pool_key)
 
-        src_pool_key = \
-            self._state.remove_commitment(worker_id, dst_pool_key)
+        src_pool_key = self._state.remove_commitment(worker_id, dst_pool_key)
 
         if dst_pool_key == GENERAL_POOL_KEY:
             # this worker is free and isn't commited to
@@ -932,9 +926,7 @@ class DagSchedEnv(Env):
 
 
 
-    def _move_free_workers(self, 
-                           src_pool_key=None, 
-                           worker_ids=None):
+    def _move_free_workers(self, src_pool_key=None, worker_ids=None):
         '''There may be free workers that were never committed
         anywhere. Such workers are either moved to to the job
         pool or general pool, depending on whether the job is
@@ -961,8 +953,7 @@ class DagSchedEnv(Env):
         # if the source is a saturated job's pool, then move it to the 
         # general pool. If it's an operation's pool, then move it to 
         # the job's pool.
-        dst_pool_key = GENERAL_POOL_KEY if is_job_saturated \
-                       else (job_id, None)
+        dst_pool_key = GENERAL_POOL_KEY if is_job_saturated else (job_id, None)
 
         print('moving free uncommited workers from'
               f'{src_pool_key} to {dst_pool_key}')
@@ -971,8 +962,7 @@ class DagSchedEnv(Env):
             worker = self.workers[worker_id]
             if dst_pool_key == GENERAL_POOL_KEY:
                 worker.add_history(self.wall_time, -1)
-            self._state.move_worker_to_pool(worker_id, 
-                                            dst_pool_key)
+            self._state.move_worker_to_pool(worker_id, dst_pool_key)
 
 
 
@@ -1008,7 +998,10 @@ class DagSchedEnv(Env):
 
         if not worker.is_at_job(op.job_id):
             self._state.move_worker_to_pool(
-                worker.id_, op.pool_key, send=True)
+                worker.id_, 
+                op.pool_key, 
+                send=True
+            )
             self._send_worker(worker, op)
             return
 
@@ -1029,8 +1022,11 @@ class DagSchedEnv(Env):
     def _find_backup_op(self, worker):
         # first, try searching within the same job
         local_ops = \
-            self._find_schedulable_ops(job_ids=[worker.job_id], 
-                                       source_job_id=worker.job_id)
+            self._find_schedulable_ops(
+                job_ids=[worker.job_id], 
+                source_job_id=worker.job_id
+            )
+        
         if len(local_ops) > 0:
             return local_ops.pop()
 
@@ -1038,9 +1034,12 @@ class DagSchedEnv(Env):
         other_job_ids = \
             [job_id for job_id in iter(self.active_job_ids)
              if job_id != worker.job_id]
+        
         other_ops = \
-            self._find_schedulable_ops(job_ids=other_job_ids,
-                                       source_job_id=worker.job_id)
+            self._find_schedulable_ops(
+                job_ids=other_job_ids,
+                source_job_id=worker.job_id
+            )
 
         if len(other_ops) > 0:
             return other_ops.pop()
@@ -1050,9 +1049,7 @@ class DagSchedEnv(Env):
 
 
 
-    def _calculate_reward(self, 
-                          old_wall_time, 
-                          old_active_job_ids):
+    def _calculate_reward(self, old_wall_time, old_active_job_ids):
         reward = 0.
 
         # include jobs that completed and arrived
@@ -1066,7 +1063,8 @@ class DagSchedEnv(Env):
             start = max(job.t_arrival, old_wall_time)
             end = min(job.t_completed, self.wall_time)
             reward -= (end - start)
-        return reward
+
+        return reward * self.reward_scale
 
 
     

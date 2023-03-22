@@ -4,17 +4,16 @@ from itertools import chain
 import numpy as np
 import torch
 from torch import Tensor
-import torch.profiler
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 from .base_alg import BaseAlg
-from .rollouts import RolloutBuffer, RolloutDataset
-from ..utils.graph import ObsBatch
-from ..utils.baselines import compute_baselines
+from .rollouts import RolloutBuffer, RolloutDataset, ValueDataset
+from ..utils.graph import ObsBatch, collate_obsns
 
 
 
-class PPO(BaseAlg):
+class ACPPO(BaseAlg):
     '''Proximal Policy Optimization'''
 
     def __init__(
@@ -108,16 +107,13 @@ class PPO(BaseAlg):
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> tuple[float, float]:
 
-        policy_dataloader = self._make_dataloader(rollout_buffers)
+        policy_dataloader, value_dataloader = self._make_dataloaders(rollout_buffers)
 
         policy_losses = []
         entropy_losses = []
         approx_kl_divs = []
-
         continue_training = True
-
-        # update policy for one epoch
-        for _ in range(self.num_epochs):
+        for _ in range(2):
             if not continue_training:
                 break
 
@@ -141,15 +137,23 @@ class PPO(BaseAlg):
 
                 self.agent.update_parameters(total_loss)
 
+        value_losses = []
+        for _ in range(3):
+            for obsns, value_targets in value_dataloader:
+                values = self.agent.predict_values(obsns).flatten()
+                value_loss = F.mse_loss(values, value_targets)
+                value_losses += [value_loss.item()]
+                self.agent.update_parameters(value_loss)
+
         return np.mean(policy_losses), \
                np.mean(entropy_losses), \
-               0, \
+               np.mean(value_losses), \
                np.mean(approx_kl_divs)
 
 
 
 
-    def _make_dataloader(
+    def _make_dataloaders(
         self,
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> DataLoader:
@@ -159,60 +163,69 @@ class PPO(BaseAlg):
 
         # separate the rollout data into lists
         (obsns_list, 
+         last_obs_list,
          actions_list, 
          wall_times_list, 
          rewards_list, 
          lgprobs_list) = \
             zip(*((buff.obsns, 
+                   buff.last_obs,
                    buff.actions, 
                    buff.wall_times, 
                    buff.rewards, 
                    buff.lgprobs)
                   for buff in rollout_buffers)) 
+        
+        self.return_calc(rewards_list, wall_times_list)
 
-        # flatten observations and actions into a dict for fast access time
+        returns, values = self._compute_returns(obsns_list, last_obs_list, rewards_list)
+        advantages = returns - values
+
         obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
         actions = torch.tensor([list(act.values()) for act in chain(*actions_list)])
-
-        rewards_list, returns_list = self.return_calc(rewards_list, wall_times_list)
-        values_list = compute_baselines(wall_times_list, returns_list)
-
-        lam = .98
-        adv_list = []
-        for rewards, values in zip(rewards_list, values_list):
-            dv = values[1:] - values[:-1]
-            dv = np.concatenate([dv, np.array([0])])
-            td_err = rewards + dv
-            adv = np.zeros_like(td_err)
-            adv[-1] = rewards[-1]
-            for t in reversed(range(len(td_err)-1)):
-                adv[t] = td_err[t] + lam * adv[t+1]
-            adv_list += [adv]
-        advantages = torch.from_numpy(np.hstack(adv_list)).float()
-
-        for buff, adv, values in zip(rollout_buffers, adv_list, values_list):
-            buff.returns = adv + values
-
         old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list))
-        
-        rollout_dataset = \
-            RolloutDataset(
-                obsns, 
-                actions, 
-                advantages, 
-                old_lgprobs
-            )
-
-        num_samples = old_lgprobs.numel()
-        batch_size = num_samples // self.batch_size + 1
-
         policy_dataloader = \
             DataLoader(
-                dataset=rollout_dataset,
-                batch_size=batch_size,
+                dataset=RolloutDataset(
+                    obsns, 
+                    actions, 
+                    advantages, 
+                    old_lgprobs
+                ),
+                batch_size=(old_lgprobs.numel() // self.batch_size + 1),
                 shuffle=True,
                 collate_fn=RolloutDataset.collate,
                 generator=self.dataloader_gen
             )
         
-        return policy_dataloader
+        value_dataloader = DataLoader(
+            ValueDataset(obsns, returns),
+            batch_size=(returns.numel() // self.batch_size + 1),
+            shuffle=True,
+            collate_fn=ValueDataset.collate,
+            generator=self.dataloader_gen
+        )
+        
+        return policy_dataloader, value_dataloader
+
+
+
+    def _compute_returns(self, obsns_list, last_obs_list, rewards_list):
+        returns_list = []
+        values_list = []
+        for rewards, obsns, last_obs in zip(rewards_list, obsns_list, last_obs_list):
+            obsns = collate_obsns(obsns + [last_obs])
+            with torch.no_grad():
+                values = self.agent.predict_values(obsns).flatten()
+            values_list += [values[:-1]]
+
+            returns = np.zeros_like(rewards)
+            returns[-1] = rewards[-1] + .99 * values[-1].item() # value bootstrap
+            for i in reversed(range(len(rewards)-1)):
+                returns[i] = rewards[i] + .99 * returns[i+1]
+            returns_list += [returns]
+
+        returns = torch.from_numpy(np.hstack(returns_list)).float()
+        values = torch.hstack(values_list)
+
+        return returns, values

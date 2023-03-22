@@ -91,7 +91,7 @@ def collate_obsns(obsns: list[ObsType]) -> ObsBatch:
         collate_dag_batches(dag_batches)
 
     schedulable_ops_masks = \
-        np.concatenate(schedulable_ops_masks).astype(bool)
+        torch.from_numpy(np.concatenate(schedulable_ops_masks).astype(bool))
 
     valid_prlsm_lim_masks = \
         torch.from_numpy(np.vstack(valid_prlsm_lim_masks))

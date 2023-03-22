@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Optional, Iterable
 from torch import Tensor
 
 import numpy as np
@@ -6,7 +6,9 @@ import torch
 import torch.profiler
 
 from .base_alg import BaseAlg
-from ..utils.graph import ObsBatch
+from .rollouts import RolloutBuffer
+from ..utils.graph import collate_obsns
+from ..utils.baselines import compute_baselines
 
 
 
@@ -35,8 +37,7 @@ class VPG(BaseAlg):
         max_time_mean_clip_range: float = 0.,
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
-        entropy_weight_min: float = 1e-4,
-        target_kl: Optional[float] = None
+        entropy_weight_min: float = 1e-4
     ):  
         super().__init__(
             env_kwargs,
@@ -58,30 +59,69 @@ class VPG(BaseAlg):
             max_time_mean_clip_range,
             entropy_weight_init,
             entropy_weight_decay,
-            entropy_weight_min,
-            target_kl
+            entropy_weight_min
+        )
+    
+
+
+    def _learn_from_rollouts(
+        self,
+        rollout_buffers: Iterable[RolloutBuffer]
+    ) -> tuple[float, float]:
+        
+        (obsns_list, 
+         actions_list, 
+         wall_times_list, 
+         rewards_list, 
+         lgprobs_list,
+         values_list) = \
+            zip(*((buff.obsns, 
+                   buff.actions, 
+                   buff.wall_times, 
+                   buff.rewards, 
+                   buff.lgprobs,
+                   buff.values)
+                  for buff in rollout_buffers)) 
+
+        returns_list = self.return_calc(rewards_list, wall_times_list)
+        baselines_list = compute_baselines(wall_times_list, returns_list)
+
+        self.agent.ac_opt.zero_grad()
+
+        num_samples = 0
+        policy_loss_tot = 0.
+        entropy_loss_tot = 0.
+
+        gen = zip(obsns_list, actions_list, returns_list, baselines_list)
+        for obsns, actions, returns, baselines in gen:
+            num_samples += len(obsns)
+            obsns = collate_obsns(obsns)
+            actions = torch.tensor([list(act.values()) for act in actions_list])
+            adv = torch.from_numpy(returns - baselines).float()
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            lgprobs, entropies, _ = self.agent.evaluate_actions(obsns, actions)
+
+            policy_loss = -(lgprobs * adv).sum()
+            policy_loss_tot += policy_loss.item()
+
+            entropy_loss = -entropies.sum()
+            entropy_loss_tot += entropy_loss.item()
+
+            loss = policy_loss + self.entropy_weight * entropy_loss
+            loss.backward()
+
+        # for param in self.agent.ac.parameters():
+        #     param.grad.div_(num_samples)
+
+        torch.nn.utils.clip_grad_norm_(
+            self.agent.ac.parameters(), 
+            .5,
+            error_if_nonfinite=True
         )
 
+        self.agent.ac_opt.step()
 
-
-    def _compute_loss(
-        self,
-        obsns: ObsBatch, 
-        actions: Tensor, 
-        advantages: Tensor,
-        old_lgprobs: Tensor
-    ) -> Tuple[Tensor, float, float]:
-
-        lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
-
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        policy_loss = -(advantages * lgprobs).mean()
-        entropy_loss = -entropies.mean()
-        total_loss = policy_loss + self.entropy_weight * entropy_loss
-
-        with torch.no_grad():
-            log_ratio = lgprobs - old_lgprobs
-            approx_kl_div = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-
-        return total_loss, policy_loss.item(), entropy_loss.item(), approx_kl_div
+        return policy_loss_tot / num_samples, \
+               entropy_loss_tot / num_samples, \
+               0, \
+               0

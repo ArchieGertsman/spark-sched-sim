@@ -1,5 +1,4 @@
 import numpy as np
-import networkx as nx
 
 from .base_agent import HeuristicAgent
 

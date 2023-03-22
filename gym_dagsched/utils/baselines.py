@@ -24,12 +24,9 @@ def compute_baselines(
 
     # find baseline and std at each unique time point
     baselines = {}
-    stds = {}
     for t, y_hat in zip(ts_unique, y_hats.T):
         baselines[t] = y_hat.mean()
-        stds[t] = y_hat.std()
 
     baselines_list = [np.array([baselines[t] for t in ts]) for ts in ts_list]
-    stds_list = [np.array([stds[t] for t in ts]) for ts in ts_list]
 
-    return baselines_list, stds_list
+    return baselines_list

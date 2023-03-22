@@ -16,7 +16,7 @@ from gym_dagsched.wrappers.decima_wrappers import (
 )
 from gym_dagsched.utils.metrics import avg_job_duration
 from gym_dagsched.utils.hidden_prints import HiddenPrints
-from gym_dagsched.agents.decima_agent import DecimaAgent
+from gym_dagsched.agents.ac_decima_agent import DecimaAgent
 from gym_dagsched.agents.fifo_agent import FIFOAgent
 from gym_dagsched.agents.cpt_agent import CPTAgent
 
@@ -24,17 +24,19 @@ from gym_dagsched.agents.cpt_agent import CPTAgent
 def main():
     setup()
 
-    num_tests = 10
+    print('testing', flush=True)
+
+    num_tests = 50
 
     num_workers = 50
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
-    base_seed = 1000 # NOTE: model does awful on 503
+    base_seed = 500 # NOTE: model does awful on 503
 
-    model_dir = 'gym_dagsched/results/models'
-    model_name = 'model_282it.pt'
+    model_dir = 'ignore/models'
+    model_name = 'model.pt'
 
     fifo_agent = FIFOAgent(num_workers)
     scpt_agent = CPTAgent(num_workers)
@@ -48,7 +50,7 @@ def main():
     env_kwargs = {
         'num_workers': num_workers,
         'num_init_jobs': 1,
-        'num_job_arrivals': 200,
+        'num_job_arrivals': 100,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
@@ -60,8 +62,8 @@ def main():
     test_instances = [
         (fifo_agent, base_env, num_tests, base_seed),
         (scpt_agent, base_env, num_tests, base_seed),
-        (lcpt_agent, base_env, num_tests, base_seed),
-        (decima_agent, wrapped_env, num_tests, base_seed)
+        (lcpt_agent, base_env, num_tests, base_seed) #,
+        # (decima_agent, wrapped_env, num_tests, base_seed)
     ]
 
     # run tests in parallel using multiprocessing
@@ -78,7 +80,7 @@ def main():
 
 
 def test(instance):
-    sys.stdout = open(f'ignore/log/proc/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc1/main.out', 'a')
     torch.set_num_threads(1)
 
     agent, env, num_tests, base_seed = instance
@@ -120,7 +122,10 @@ def run_episode(env, agent, seed):
     rewards = []
     
     while not done:
-        action = agent(obs)
+        if isinstance(agent, DecimaAgent):
+            action, *_ = agent(obs)
+        else:
+            action = agent(obs)
 
         obs, reward, terminated, truncated, _ = \
             env.step(action)
@@ -164,10 +169,10 @@ def visualize_results(out_fname,
 
 
 def setup():
-    shutil.rmtree('ignore/log/proc/', ignore_errors=True)
-    os.mkdir('ignore/log/proc/')
+    shutil.rmtree('ignore/log/proc1/', ignore_errors=True)
+    os.mkdir('ignore/log/proc1/')
 
-    sys.stdout = open(f'ignore/log/proc/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc1/main.out', 'a')
 
     set_start_method('forkserver')
 

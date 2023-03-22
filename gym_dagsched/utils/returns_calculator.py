@@ -44,29 +44,28 @@ class ReturnsCalculator:
         returns: list of return arrays (len: num envs)
         '''
         if self.diff_mode:
-            if times_list is None:
-                raise Exception('`times_list` is required when '
-                                'differential mode is enabled')
+            assert times_list is not None, \
+                '`times_list` is required when ' \
+                'differential mode is enabled'
             rewards_list = \
-                self._compute_diff_rewards(times_list, rewards_list)
+                self.compute_diff_rewards(times_list, rewards_list)
 
         returns_list = [self._compute_returns(rewards) 
                         for rewards in rewards_list]
 
-        return returns_list
+        return rewards_list, returns_list
 
 
 
-    def avg_per_step_reward(self):
-        if not self.diff_mode:
-            raise Exception('only for differential mode')
+    def avg_rew_per_sec(self):
+        assert self.diff_mode, 'only for differential mode'
         return self.reward_sum / self.time_sum
 
 
 
     ## internal methods
 
-    def _compute_diff_rewards(self, times_list, rewards_list):
+    def compute_diff_rewards(self, times_list, rewards_list):
         assert self.diff_mode
 
         time_diffs_list = []
@@ -79,7 +78,7 @@ class ReturnsCalculator:
             self._add_list_filter_zero(time_diffs, rewards)
 
         diff_rewards_list = [
-            rewards - self.avg_per_step_reward() * time_diffs
+            rewards - self.avg_rew_per_sec() * time_diffs
             for rewards, time_diffs in zip(rewards_list, time_diffs_list)
         ]
 
@@ -100,15 +99,17 @@ class ReturnsCalculator:
     def _add(self, dt, reward):
         if self.count >= self.size:
             stale_reward = self.reward_record.pop(0)
-            stale_time = self.time_record.pop(0)
             self.reward_sum -= stale_reward
+
+            stale_time = self.time_record.pop(0)
             self.time_sum -= stale_time
         else:
             self.count += 1
 
         self.reward_record.append(reward)
-        self.time_record.append(dt)
         self.reward_sum += reward
+        
+        self.time_record.append(dt)
         self.time_sum += dt
 
 

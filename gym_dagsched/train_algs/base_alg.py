@@ -3,23 +3,17 @@ from typing import Optional, Iterable
 import shutil
 import os
 import sys
-from itertools import chain
 
 import numpy as np
-from gymnasium.core import ObsType, ActType
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader
 from torch.multiprocessing import Pipe, Process
 from torch.utils.tensorboard import SummaryWriter
 
-from ..agents.decima_agent import DecimaAgent
+from .rollouts import RolloutBuffer, rollout_worker
+from ..agents.ac_decima_agent import DecimaAgent
 from ..utils.device import device
 from ..utils.profiler import Profiler
 from ..utils.returns_calculator import ReturnsCalculator
-from .rollouts import RolloutBuffer, RolloutDataset, rollout_worker
-from ..utils.baselines import compute_baselines
-from ..utils.graph import ObsBatch, collate_obsns
 
 
 
@@ -47,11 +41,10 @@ class BaseAlg(ABC):
         gamma: float,
         max_time_mean_init: float,
         max_time_mean_growth: float,
-        max_time_mean_clip_range: float,
+        max_time_mean_ceil: float,
         entropy_weight_init: float,
         entropy_weight_decay: float,
-        entropy_weight_min: float,
-        target_kl: Optional[float]
+        entropy_weight_min: float
     ):  
         self.num_iterations = num_iterations
         self.num_epochs = num_epochs
@@ -65,17 +58,16 @@ class BaseAlg(ABC):
 
         self.max_time_mean = max_time_mean_init
         self.max_time_mean_growth = max_time_mean_growth
-        self.max_time_mean_clip_range = max_time_mean_clip_range
+        self.max_time_mean_ceil = max_time_mean_ceil
 
         self.entropy_weight = entropy_weight_init
         self.entropy_weight_decay = entropy_weight_decay
         self.entropy_weight_min = entropy_weight_min
 
-        self.target_kl = target_kl
-
         # computes differential returns by default, which is
         # helpful for maximizing average returns
-        self.return_calc = ReturnsCalculator(gamma) #, size=20000)
+        self.return_calc = ReturnsCalculator(gamma, 10000)
+        self.gamma = gamma
 
         self.env_kwargs = env_kwargs
 
@@ -89,10 +81,13 @@ class BaseAlg(ABC):
                 env_kwargs['num_workers'],
                 optim_class=optim_class,
                 optim_lr=optim_lr,
-                max_grad_norm=max_grad_norm)
+                max_grad_norm=max_grad_norm
+            )
 
         self.procs = []
         self.conns = []
+
+        self.num_job_arrivals = 20
 
 
 
@@ -107,18 +102,38 @@ class BaseAlg(ABC):
 
         self._setup()
 
-        for iteration in range(self.num_iterations):
-            max_time = self._sample_max_time()
+        for i in range(self.num_iterations):
+            # max_time = self.np_random_max_time.exponential(self.max_time_mean)
+            # max_time = np.inf
+            max_time = 5e5
+            # num_job_arrivals = self.np_random_max_time.randint(
+            #     self.num_job_arrivals // 2,
+            #     min(self.num_job_arrivals * 2, 201)
+            # )
+            # num_job_arrivals = 30
 
-            self._log_iteration_start(iteration, max_time)
+            self._log_iteration_start(i, max_time)
 
-            state_dict = self.agent.actor_network.state_dict()
-            if (iteration+1) % self.model_save_freq == 0:
-                torch.save(state_dict, f'{self.model_save_path}/model.pt')
+            actor_sd = self.agent.actor.state_dict()
+            critic_sd = self.agent.critic.state_dict()
+            if (i+1) % self.model_save_freq == 0:
+                torch.save(actor_sd, f'{self.model_save_path}/model.pt')
             
             # scatter
-            env_options = {'max_wall_time': max_time}
-            [conn.send((state_dict, env_options)) for conn in self.conns]
+            env_seed = i
+            env_options = {
+                'max_wall_time': max_time #,
+                # 'num_job_arrivals': 30
+            }
+            for j, conn in enumerate(self.conns):
+                # env_seed = i * self.num_envs + j
+                env_seed = i
+                conn.send((
+                    actor_sd, 
+                    critic_sd,
+                    env_seed, 
+                    env_options
+                ))
 
             # gather
             (rollout_buffers,
@@ -128,14 +143,14 @@ class BaseAlg(ABC):
                 zip(*[conn.recv() for conn in self.conns])
 
             with Profiler():
-                policy_loss, entropy_loss, approx_kl_div = \
+                policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
                 torch.cuda.synchronize()
 
             if self.summary_writer:
                 ep_lens = [len(buff) for buff in rollout_buffers]
                 self._write_stats(
-                    iteration,
+                    i,
                     policy_loss,
                     entropy_loss,
                     avg_job_durations,
@@ -143,10 +158,12 @@ class BaseAlg(ABC):
                     job_arrival_counts,
                     ep_lens,
                     max_time,
-                    approx_kl_div
+                    approx_kl_div,
+                    value_loss,
+                    [buff.returns[0] for buff in rollout_buffers]
                 )
 
-            self._update_vars()
+            self._update_vars(i)
 
         self._cleanup()
 
@@ -155,150 +172,17 @@ class BaseAlg(ABC):
     ## internal methods
 
     @abstractmethod
-    def _compute_loss(
-        self,
-        obsns: ObsBatch,
-        actions: Tensor,
-        advantages: Tensor,
-        old_lgprobs: Tensor
-    ) -> tuple[Tensor, float, float]:
-        '''Loss calculation unique to each algorithm
-
-        Returns: 
-            tuple (total_loss, policy_loss, entropy_loss),
-            where total_loss is differentiable and the other losses
-            are just scalars for logging.
-        '''
-        pass
-
-
-
     def _learn_from_rollouts(
         self,
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> tuple[float, float]:
-
-        dataloader = self._make_dataloader(rollout_buffers)
-
-        policy_losses = []
-        entropy_losses = []
-        approx_kl_divs = []
-
-        continue_training = True
-
-        # run multiple learning epochs with minibatching
-        for _ in range(self.num_epochs):
-            if not continue_training:
-                break
-
-            for obsns, actions, advantages, old_lgprobs in dataloader:
-                total_loss, action_loss, entropy_loss, approx_kl_div = \
-                    self._compute_loss(
-                        obsns, 
-                        actions, 
-                        advantages,
-                        old_lgprobs
-                    )
-
-                policy_losses += [action_loss]
-                entropy_losses += [entropy_loss]
-                approx_kl_divs.append(approx_kl_div)
-
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
-                    print(f"Early stopping due to reaching max kl: {approx_kl_div:.2f}")
-                    break
-
-                self.agent.update_parameters(total_loss)
-
-        return np.mean(policy_losses), np.mean(entropy_losses), np.mean(approx_kl_divs)
-
-
-
-    def _make_dataloader(
-        self,
-        rollout_buffers: Iterable[RolloutBuffer]
-    ) -> DataLoader:
-        '''creates a dataset out of the new rollouts, and returns a 
-        dataloader that loads minibatches from that dataset
-        '''
-
-        # separate the rollout data into lists
-        obsns_list, actions_list, wall_times_list, rewards_list = \
-            zip(*((buff.obsns, buff.actions, buff.wall_times, buff.rewards)
-                  for buff in rollout_buffers)) 
-
-        # flatten observations and actions into a dict for fast access time
-        obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
-        actions = {i: act for i, act in enumerate(chain(*actions_list))}
-
-        advantages = self._compute_advantages(rewards_list, wall_times_list)
-        advantages = torch.from_numpy(advantages)
-
-        old_lgprobs = self._compute_old_lgprobs(obsns.values(), actions.values())
-        
-        rollout_dataset = \
-            RolloutDataset(
-                obsns, 
-                actions, 
-                advantages, 
-                old_lgprobs
-            )
-
-        if self.batch_size is not None:
-            dataloader = \
-                DataLoader(
-                    dataset=rollout_dataset,
-                    batch_size=self.batch_size,
-                    shuffle=True,
-                    collate_fn=RolloutDataset.collate,
-                    generator=self.dataloader_gen
-                )
-        else:
-            dataloader = \
-                DataLoader(
-                    dataset=rollout_dataset,
-                    batch_size=len(rollout_dataset),
-                    collate_fn=RolloutDataset.collate
-                )
-
-        return dataloader
-
-
-
-    @torch.no_grad()
-    def _compute_old_lgprobs(
-        self, 
-        obsns: Iterable[ObsType], 
-        actions: Iterable[ActType]
-    ) -> Tensor:
-        obsns = collate_obsns(obsns)
-        actions = torch.tensor([list(act.values()) for act in actions])
-        old_lgprobs, _ = self.agent.evaluate_actions(obsns, actions)
-        return old_lgprobs
-
-
-
-    def _compute_advantages(
-        self,
-        rewards_list: list[np.ndarray],
-        wall_times_list: list[np.ndarray]
-    ) -> np.ndarray:
-
-        returns_list = self.return_calc(rewards_list, wall_times_list)
-        baselines_list, stds_list = compute_baselines(wall_times_list, returns_list)
-
-        returns = np.hstack(returns_list)
-        baselines = np.hstack(baselines_list)
-        stds = np.hstack(stds_list)
-
-        advantages = (returns - baselines) # / (stds + 1e-8)
-
-        return advantages
+        pass
 
 
 
     def _setup(self) -> None:
+        # torch.autograd.set_detect_anomaly(True)
+
         shutil.rmtree(self.log_dir, ignore_errors=True)
         os.mkdir(self.log_dir)
         sys.stdout = open(f'{self.log_dir}/main.out', 'a')
@@ -344,7 +228,13 @@ class BaseAlg(ABC):
 
             proc = Process(
                 target=rollout_worker, 
-                args=(rank, conn_sub, self.env_kwargs)
+                args=(
+                    rank, 
+                    self.num_envs, 
+                    conn_sub, 
+                    self.env_kwargs, 
+                    self.log_dir
+                )
             )
 
             self.procs += [proc]
@@ -358,21 +248,6 @@ class BaseAlg(ABC):
 
 
 
-    def _sample_max_time(self):
-        max_time = self.np_random_max_time.uniform(
-            low=self.max_time_mean - self.max_time_mean_clip_range,
-            high=self.max_time_mean + self.max_time_mean_clip_range
-        )
-        # max_time = self.np_random_max_time.exponential(self.max_time_mean)
-        # max_time = np.clip(
-        #     max_time, 
-        #     self.max_time_mean - self.max_time_mean_clip_range,
-        #     self.max_time_mean + self.max_time_mean_clip_range
-        # )
-        return max_time
-
-
-
     def _write_stats(
         self,
         epoch: int,
@@ -383,7 +258,9 @@ class BaseAlg(ABC):
         job_arrival_counts: list[int],
         ep_lens: list[int],
         max_time: float,
-        approx_kl_div: float
+        approx_kl_div: float,
+        value_loss: float,
+        returns
     ) -> None:
 
         episode_stats = {
@@ -391,11 +268,15 @@ class BaseAlg(ABC):
             'max wall time': max_time * 1e-3,
             'completed jobs count': np.mean(completed_job_counts),
             'job arrival count': np.mean(job_arrival_counts),
-            'avg reward per sec': self.return_calc.avg_per_step_reward(),
+            'avg reward per sec': self.return_calc.avg_rew_per_sec() * 1e5,
             'policy loss': policy_loss,
             'entropy': -entropy_loss,
             'episode length': np.mean(ep_lens),
-            'KL div': approx_kl_div
+            'max time mean': self.max_time_mean * 1e-3,
+            'entropy weight': self.entropy_weight,
+            'KL div': approx_kl_div,
+            'value loss': value_loss,
+            'return': np.mean(returns)
         }
 
         for name, stat in episode_stats.items():
@@ -403,15 +284,18 @@ class BaseAlg(ABC):
 
 
 
-    def _update_vars(self) -> None:
-        # increase the mean episode duration
-        self.max_time_mean += self.max_time_mean_growth
+    def _update_vars(self, iteration) -> None:
+        # geometrically increase the mean episode duration
+        self.max_time_mean = min(
+            self.max_time_mean * self.max_time_mean_growth, 
+            self.max_time_mean_ceil
+        )
 
-        self.max_time_mean_clip_range += 1e3
+        if (iteration+1) % 10 == 0:
+            self.num_job_arrivals += 1
 
-        # decrease the entropy weight
-        self.entropy_weight = np.clip(
-            self.entropy_weight - self.entropy_weight_decay,
-            self.entropy_weight_min,
-            None
+        # geometrically decrease the entropy weight
+        self.entropy_weight = max(
+            self.entropy_weight * self.entropy_weight_decay,
+            self.entropy_weight_min
         )
