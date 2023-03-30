@@ -109,7 +109,7 @@ class DagSchedEnv(Env):
                 # shape: (num active ops) x (2 features)
                 # op features: num remaining tasks, most recent task duration
                 # edge features: none
-                'data': Graph(node_space=Box(0, np.inf, (2,)), 
+                'data': Graph(node_space=Box(0, np.inf, (3,)), 
                               edge_space=Discrete(1)),
 
                 # length: num active jobs
@@ -436,7 +436,7 @@ class DagSchedEnv(Env):
             for op in iter(job.active_ops):
                 self.op_selection_map[len(nodes)] = op
                 
-                nodes += [(op.num_remaining_tasks, op.most_recent_duration)]
+                nodes += [(op.num_remaining_tasks, op.most_recent_duration, int(op.schedulable))]
                 
                 schedulable_op_mask += [1] if op.schedulable else [0]
                 op.schedulable = False
@@ -449,7 +449,7 @@ class DagSchedEnv(Env):
             nodes = np.vstack(nodes).astype(np.float32)
         except:
             # no nodes
-            nodes = np.zeros((0,2), dtype=np.float32)
+            nodes = np.zeros((0, 3), dtype=np.float32)
 
         edge_links = subgraph(self.all_edge_links, active_op_mask)
 
@@ -1050,21 +1050,24 @@ class DagSchedEnv(Env):
 
 
     def _calculate_reward(self, old_wall_time, old_active_job_ids):
-        reward = 0.
-
         # include jobs that completed and arrived
         # during the most recent simulation run
+        duration = self.wall_time - old_wall_time
+        if duration == 0:
+            return 0
+
         job_ids = set(old_active_job_ids) | set(self.active_job_ids)
 
         print('calc reward', len(job_ids), old_wall_time, self.wall_time)
 
+        total_work = 0
         for job_id in iter(job_ids):
             job = self.jobs[job_id]
             start = max(job.t_arrival, old_wall_time)
             end = min(job.t_completed, self.wall_time)
-            reward -= (end - start)
+            total_work += end - start
 
-        return reward * self.reward_scale
+        return -total_work
 
 
     

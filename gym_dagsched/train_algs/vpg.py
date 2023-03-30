@@ -34,7 +34,7 @@ class VPG(BaseAlg):
         gamma: float = .99,
         max_time_mean_init: float = np.inf,
         max_time_mean_growth: float = 0.,
-        max_time_mean_clip_range: float = 0.,
+        max_time_mean_ceil: float = 0.,
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
         entropy_weight_min: float = 1e-4
@@ -56,7 +56,7 @@ class VPG(BaseAlg):
             gamma,
             max_time_mean_init,
             max_time_mean_growth,
-            max_time_mean_clip_range,
+            max_time_mean_ceil,
             entropy_weight_init,
             entropy_weight_decay,
             entropy_weight_min
@@ -72,21 +72,17 @@ class VPG(BaseAlg):
         (obsns_list, 
          actions_list, 
          wall_times_list, 
-         rewards_list, 
-         lgprobs_list,
-         values_list) = \
+         rewards_list) = \
             zip(*((buff.obsns, 
                    buff.actions, 
                    buff.wall_times, 
-                   buff.rewards, 
-                   buff.lgprobs,
-                   buff.values)
+                   buff.rewards)
                   for buff in rollout_buffers)) 
 
         returns_list = self.return_calc(rewards_list, wall_times_list)
         baselines_list = compute_baselines(wall_times_list, returns_list)
 
-        self.agent.ac_opt.zero_grad()
+        self.agent.optim.zero_grad()
 
         num_samples = 0
         policy_loss_tot = 0.
@@ -96,10 +92,10 @@ class VPG(BaseAlg):
         for obsns, actions, returns, baselines in gen:
             num_samples += len(obsns)
             obsns = collate_obsns(obsns)
-            actions = torch.tensor([list(act.values()) for act in actions_list])
+            actions = torch.tensor([list(act.values()) for act in actions])
             adv = torch.from_numpy(returns - baselines).float()
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            lgprobs, entropies, _ = self.agent.evaluate_actions(obsns, actions)
+            lgprobs, entropies, logit_loss = self.agent.evaluate_actions(obsns, actions)
 
             policy_loss = -(lgprobs * adv).sum()
             policy_loss_tot += policy_loss.item()
@@ -107,19 +103,19 @@ class VPG(BaseAlg):
             entropy_loss = -entropies.sum()
             entropy_loss_tot += entropy_loss.item()
 
-            loss = policy_loss + self.entropy_weight * entropy_loss
+            loss = policy_loss + self.entropy_weight * entropy_loss + .001 * logit_loss
             loss.backward()
 
-        # for param in self.agent.ac.parameters():
-        #     param.grad.div_(num_samples)
-
         torch.nn.utils.clip_grad_norm_(
-            self.agent.ac.parameters(), 
+            self.agent.actor.parameters(), 
             .5,
             error_if_nonfinite=True
         )
 
-        self.agent.ac_opt.step()
+        self.agent.optim.step()
+
+        for buff, rewards, times in zip(rollout_buffers, rewards_list, wall_times_list):
+            buff.sum_rewards = np.sum(rewards) / (times[-1] / (1e3 * 60))
 
         return policy_loss_tot / num_samples, \
                entropy_loss_tot / num_samples, \

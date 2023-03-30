@@ -10,7 +10,7 @@ from torch.multiprocessing import Pipe, Process
 from torch.utils.tensorboard import SummaryWriter
 
 from .rollouts import RolloutBuffer, rollout_worker
-from ..agents.ac_decima_agent import DecimaAgent
+from ..agents.decima_agent import DecimaAgent
 from ..utils.device import device
 from ..utils.profiler import Profiler
 from ..utils.returns_calculator import ReturnsCalculator
@@ -66,7 +66,7 @@ class BaseAlg(ABC):
 
         # computes differential returns by default, which is
         # helpful for maximizing average returns
-        self.return_calc = ReturnsCalculator(gamma, 10000)
+        self.return_calc = ReturnsCalculator()
         self.gamma = gamma
 
         self.env_kwargs = env_kwargs
@@ -115,19 +115,20 @@ class BaseAlg(ABC):
             self._log_iteration_start(i, max_time)
 
             actor_sd = self.agent.actor.state_dict()
-            critic_sd = self.agent.critic.state_dict()
+            critic_sd = None # self.agent.critic.state_dict()
             if (i+1) % self.model_save_freq == 0:
                 torch.save(actor_sd, f'{self.model_save_path}/model.pt')
             
             # scatter
             env_seed = i
             env_options = {
-                'max_wall_time': max_time #,
-                # 'num_job_arrivals': 30
+                # 'max_wall_time': max_time #,
+                'num_job_arrivals': 20
             }
+            N = self.num_envs // 2
             for j, conn in enumerate(self.conns):
-                # env_seed = i * self.num_envs + j
-                env_seed = i
+                env_seed = i * N + (j % N)
+                # env_seed = i
                 conn.send((
                     actor_sd, 
                     critic_sd,
@@ -145,6 +146,7 @@ class BaseAlg(ABC):
             with Profiler():
                 policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
+                self.agent.lr_scheduler.step()
                 torch.cuda.synchronize()
 
             if self.summary_writer:
@@ -153,14 +155,14 @@ class BaseAlg(ABC):
                     i,
                     policy_loss,
                     entropy_loss,
-                    avg_job_durations,
-                    completed_job_counts,
-                    job_arrival_counts,
-                    ep_lens,
+                    avg_job_durations[:N],
+                    completed_job_counts[:N],
+                    job_arrival_counts[:N],
+                    ep_lens[:N],
                     max_time,
                     approx_kl_div,
                     value_loss,
-                    [buff.returns[0] for buff in rollout_buffers]
+                    [buff.sum_rewards for buff in rollout_buffers]
                 )
 
             self._update_vars(i)
@@ -268,15 +270,15 @@ class BaseAlg(ABC):
             'max wall time': max_time * 1e-3,
             'completed jobs count': np.mean(completed_job_counts),
             'job arrival count': np.mean(job_arrival_counts),
-            'avg reward per sec': self.return_calc.avg_rew_per_sec() * 1e5,
+            'avg num jobs': -np.mean(returns),
+            'moving avg num jobs': -self.return_calc.avg_num_jobs,
             'policy loss': policy_loss,
             'entropy': -entropy_loss,
             'episode length': np.mean(ep_lens),
             'max time mean': self.max_time_mean * 1e-3,
             'entropy weight': self.entropy_weight,
             'KL div': approx_kl_div,
-            'value loss': value_loss,
-            'return': np.mean(returns)
+            'value loss': value_loss
         }
 
         for name, stat in episode_stats.items():

@@ -24,7 +24,7 @@ class DecimaObsWrapper(ObservationWrapper):
 
         self.observation_space = Dict({
             'dag_batch': Dict({
-                'data': Graph(node_space=Box(-np.inf, np.inf, (5,)),
+                'data': Graph(node_space=Box(-np.inf, np.inf, (6,)),
                               edge_space=Discrete(1)),
                 'ptr': Sequence(Discrete(1))
             }),
@@ -42,7 +42,7 @@ class DecimaObsWrapper(ObservationWrapper):
         num_active_jobs = len(worker_counts)
 
         # build node features
-        nodes = np.zeros((num_active_nodes, 5), dtype=np.float32)
+        nodes = np.zeros((num_active_nodes, 6), dtype=np.float32)
 
         nodes[:, 0] = obs['num_workers_to_schedule'] / self.num_workers
 
@@ -55,8 +55,10 @@ class DecimaObsWrapper(ObservationWrapper):
 
         num_remaining_tasks = obs['dag_batch']['data'].nodes[:, 0]
         most_recent_duration = obs['dag_batch']['data'].nodes[:, 1]
+        schedulable = obs['dag_batch']['data'].nodes[:, 2]
         nodes[:, 3] = num_remaining_tasks / 200
         nodes[:, 4] = most_recent_duration * num_remaining_tasks * 1e-5
+        nodes[:, 5] = 2*schedulable - 1
 
         # update op action space to reflect the current number of active ops
         self.observation_space['dag_batch']['ptr'].feature_space.n = num_active_nodes+1

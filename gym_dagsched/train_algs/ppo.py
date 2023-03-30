@@ -67,6 +67,7 @@ class PPO(BaseAlg):
 
         self.target_kl = target_kl
         self.clip_range = clip_range
+        self.gae_lam = .95
 
 
 
@@ -78,7 +79,7 @@ class PPO(BaseAlg):
         old_lgprobs: Tensor,
     ) -> tuple[Tensor, float, float, float]:
 
-        lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
+        lgprobs, entropies, logit_loss = self.agent.evaluate_actions(obsns, actions)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -93,7 +94,7 @@ class PPO(BaseAlg):
 
         policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
         entropy_loss = -entropies.mean()
-        total_loss = policy_loss + self.entropy_weight * entropy_loss
+        total_loss = policy_loss + self.entropy_weight * entropy_loss # + .001 * logit_loss
 
         with torch.no_grad():
             log_ratio = lgprobs - old_lgprobs
@@ -166,34 +167,99 @@ class PPO(BaseAlg):
             zip(*((buff.obsns, 
                    buff.actions, 
                    buff.wall_times, 
-                   buff.rewards, 
+                   buff.rewards,
                    buff.lgprobs)
                   for buff in rollout_buffers)) 
+        
+        N = self.num_envs // 2
 
         # flatten observations and actions into a dict for fast access time
-        obsns = {i: obs for i, obs in enumerate(chain(*obsns_list))}
-        actions = torch.tensor([list(act.values()) for act in chain(*actions_list)])
+        obsns = {i: obs for i, obs in enumerate(chain(*obsns_list[:N]))}
+        actions = torch.tensor([list(act.values()) for act in chain(*actions_list[:N])])
+        old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list[:N]))
 
-        rewards_list, returns_list = self.return_calc(rewards_list, wall_times_list)
-        values_list = compute_baselines(wall_times_list, returns_list)
+        # deltas_list = []
+        # num_jobs_list = []
+        # for times, job_minutes in zip(wall_times_list, rewards_list):
+        #     times = np.concatenate([np.array([0.]), times])
+        #     deltas = (times[1:] - times[:-1]) / (1e3 * 60)
+        #     deltas_list += [deltas]
+        #     # num_jobs_list += [job_minutes / deltas]
+        #     num_jobs = np.zeros_like(job_minutes)
+        #     for t, (jm, d) in enumerate(zip(job_minutes, deltas)):
+        #         if d != 0:
+        #             num_jobs[t] = jm / d
+        #         else:
+        #             num_jobs[t] = num_jobs[t-1]
+        #     num_jobs_list += [num_jobs]
 
-        lam = .98
+
+        # num_jobs_baselines_list = compute_baselines(wall_times_list, num_jobs_list)
+
+        # returns_list = []
+        # baselines_list = []
+        # for deltas, job_minutes, num_jobs_baseline in zip(deltas_list, rewards_list, num_jobs_baselines_list):
+        #     returns = np.zeros_like(job_minutes)
+        #     baselines = np.zeros_like(job_minutes)
+        #     r = 0
+        #     b = 0
+        #     for t in reversed(range(len(deltas))):
+        #         r += job_minutes[t]
+        #         b += deltas[t] * num_jobs_baseline[t]
+        #         returns[t] = r
+        #         baselines[t] = b
+        #     returns_list += [returns]
+        #     baselines_list += [baselines]
+
+        diff_returns_list = self.return_calc(rewards_list, wall_times_list)
+        # baselines_list = compute_baselines(wall_times_list, diff_returns_list)
+
+        
+        t_samp_list = wall_times_list[:N]
+        r_samp_list = diff_returns_list[:N]
+        t_greedy_list = wall_times_list[N:]
+        r_greedy_list = diff_returns_list[N:]
+
         adv_list = []
-        for rewards, values in zip(rewards_list, values_list):
-            dv = values[1:] - values[:-1]
-            dv = np.concatenate([dv, np.array([0])])
-            td_err = rewards + dv
-            adv = np.zeros_like(td_err)
-            adv[-1] = rewards[-1]
-            for t in reversed(range(len(td_err)-1)):
-                adv[t] = td_err[t] + lam * adv[t+1]
-            adv_list += [adv]
+        for t_samp, r_samp, t_greedy, r_greedy in zip(
+            t_samp_list, 
+            r_samp_list,
+            t_greedy_list,
+            r_greedy_list
+        ):
+            baseline = np.interp(t_samp, t_greedy, r_greedy)
+            adv_list += [r_samp - baseline]
+
+        # advantages = torch.from_numpy(
+        #     np.hstack(diff_returns_list) - np.hstack(baselines_list)
+        # ).float()
+        
         advantages = torch.from_numpy(np.hstack(adv_list)).float()
 
-        for buff, adv, values in zip(rollout_buffers, adv_list, values_list):
-            buff.returns = adv + values
+        for buff, rewards, times in zip(rollout_buffers, rewards_list, wall_times_list):
+            buff.sum_rewards = 0 #np.mean(rewards[rewards != 0])
 
-        old_lgprobs = torch.from_numpy(np.hstack(lgprobs_list))
+
+        # adv_list = []
+        # for rewards, times, values in zip(rewards_list, wall_times_list, values_list):
+        #     times = np.concatenate([np.array([0.]), times])
+        #     deltas = (times[1:] - times[:-1]) / (1e3 * 60)
+
+        #     dv = values[1:] - values[:-1]
+        #     dv = np.concatenate([dv, np.array([0])])
+
+        #     td_err = rewards - deltas * self.return_calc.avg_num_jobs + dv
+
+        #     adv = np.zeros_like(td_err)
+        #     a = 0
+        #     for t in reversed(range(len(td_err))):
+        #         a = td_err[t] + self.gae_lam * a
+        #         adv[t] = a
+        #     adv_list += [adv]
+        # advantages = torch.from_numpy(np.hstack(adv_list)).float()
+
+        # for buff, adv, values in zip(rollout_buffers, adv_list, values_list):
+        #     buff.returns = adv + values
         
         rollout_dataset = \
             RolloutDataset(

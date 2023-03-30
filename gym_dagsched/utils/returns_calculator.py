@@ -6,23 +6,17 @@ import numpy as np
 
 
 class ReturnsCalculator:
-    def __init__(
-        self, 
-        discount: float, 
-        diff_mode: bool = True, 
-        size: int = 100000
-    ):
-        self.discount = discount
-        self.diff_mode = diff_mode
-        if diff_mode:
-            self.size = size
-            self.count = 0
-            self.reward_record = []
-            self.time_record = []
-            self.reward_sum = 0
-            self.time_sum = 0
-
-
+    def __init__(self):
+        # self.work_buff = []
+        # self.dt_buff = []
+        # self.total_work = 0
+        # self.total_time = 0
+        # self.buffer_cap = 50000
+        self.avg_num_jobs = 0.
+        self.alpha = 1.
+        self.min_alpha = .08
+        self.alpha_scale = .9
+        
 
     def __call__(
         self, 
@@ -30,94 +24,112 @@ class ReturnsCalculator:
         times_list: Optional[List[np.ndarray]] = None
     ) -> List[np.ndarray]:
         return self.calculate(rewards_list, times_list)
+    
 
+    # @property
+    # def avg_num_jobs(self):
+    #     return self.total_work / self.total_time
+    
+
+
+    # def calculate(self, 
+    #     rewards_list: List[np.ndarray], 
+    #     times_list: Optional[List[np.ndarray]] = None
+    # ) -> List[np.ndarray]:
+
+    #     deltas_list = []
+    #     for times in times_list:
+    #         times = np.concatenate([np.array([0.]), times])
+    #         deltas = times[1:] - times[:-1]
+    #         deltas_list += [deltas]
+
+    #     for rewards, deltas in zip(rewards_list, deltas_list):
+    #         for rew, dt in zip(rewards, deltas):
+    #             if dt == 0:
+    #                 continue
+    #             self.work_buff += [rew]
+    #             self.dt_buff += [dt]
+    #             self.total_work += rew
+    #             self.total_time += dt
+    #             if len(self.work_buff) > self.buffer_cap:
+    #                 self.total_work -= self.work_buff.pop(0)
+    #                 self.total_time -= self.dt_buff.pop(0)
+
+    #     diff_returns_list = []
+    #     for work, deltas in zip(rewards_list, deltas_list):
+    #         diff_returns = np.zeros_like(work)
+    #         dr = 0
+    #         for t in reversed(range(len(deltas))):
+    #             dr = work[t] - deltas[t] * self.avg_num_jobs + dr
+    #             diff_returns[t] = dr
+    #         diff_returns_list += [diff_returns * 1e-5]
+
+    #     return diff_returns_list
+
+
+
+
+    # def calculate(self, 
+    #     rewards_list: List[np.ndarray], 
+    #     times_list: Optional[List[np.ndarray]] = None
+    # ) -> List[np.ndarray]:
+        
+    #     rewards = np.hstack(rewards_list); rewards = rewards[rewards != 0]
+    #     new_avg = rewards.mean()
+    #     self.avg_num_jobs += self.alpha * (new_avg - self.avg_num_jobs)
+    #     self.alpha = max(.9 * self.alpha, .05)
+
+    #     diff_returns_list = []
+    #     for num_jobs in rewards_list:
+    #         diff_returns = np.zeros_like(num_jobs)
+    #         dr = 0
+    #         for t in reversed(range(len(num_jobs))):
+    #             if num_jobs[t] == 0:
+    #                 num_jobs[t] = num_jobs[t+1]
+    #             dr = num_jobs[t] - self.avg_num_jobs + dr
+    #             diff_returns[t] = dr
+    #         diff_returns_list += [diff_returns]
+
+    #     return diff_returns_list
 
 
     def calculate(self, 
         rewards_list: List[np.ndarray], 
         times_list: Optional[List[np.ndarray]] = None
     ) -> List[np.ndarray]:
-        '''args:
-        - `rewards_list`: list of reward arrays (len: num envs)
-        - `times_list`: list of wall time arrays (len: num envs)
         
-        returns: list of return arrays (len: num envs)
-        '''
-        if self.diff_mode:
-            assert times_list is not None, \
-                '`times_list` is required when ' \
-                'differential mode is enabled'
-            rewards_list = \
-                self.compute_diff_rewards(times_list, rewards_list)
+        dt_list = self._get_dt_list(times_list)
 
-        returns_list = [self._compute_returns(rewards) 
-                        for rewards in rewards_list]
+        self._update_moving_avg(rewards_list, dt_list)
 
-        return rewards_list, returns_list
+        diff_returns_list = []
+        for work, dt in zip(rewards_list, dt_list):
+            diff_rew = work - dt * self.avg_num_jobs
+            diff_ret = np.zeros_like(diff_rew)
+            dr = 0
+            for t in reversed(range(len(diff_rew))):
+                dr = diff_rew[t] + dr
+                diff_ret[t] = dr
+            diff_returns_list += [diff_ret]
 
+        return diff_returns_list
+    
 
-
-    def avg_rew_per_sec(self):
-        assert self.diff_mode, 'only for differential mode'
-        return self.reward_sum / self.time_sum
-
-
-
-    ## internal methods
-
-    def compute_diff_rewards(self, times_list, rewards_list):
-        assert self.diff_mode
-
-        time_diffs_list = []
-        for times in times_list:
-            times = np.concatenate([np.array([0.]), times])
-            time_diffs = times[1:] - times[:-1]
-            time_diffs_list += [time_diffs]
-
-        for time_diffs, rewards in zip(time_diffs_list, rewards_list):
-            self._add_list_filter_zero(time_diffs, rewards)
-
-        diff_rewards_list = [
-            rewards - self.avg_rew_per_sec() * time_diffs
-            for rewards, time_diffs in zip(rewards_list, time_diffs_list)
-        ]
-
-        return diff_rewards_list
+    def _update_moving_avg(self, rewards_list, dt_list):
+        N = len(rewards_list) // 2
+        rewards = np.hstack(rewards_list[:N]); rewards = rewards[rewards != 0]
+        dt = np.hstack(dt_list[:N]); dt = dt[dt != 0]
+        total_time = dt.sum()
+        new_avg = rewards.sum() / total_time
+        self.avg_num_jobs += self.alpha * (new_avg - self.avg_num_jobs)
+        self.alpha = max(self.alpha_scale * self.alpha, self.min_alpha)
 
 
-
-    def _compute_returns(self, rewards):
-        r = rewards[...,::-1]
-        a = [1, -self.discount]
-        b = [1]
-        y = lfilter(b, a, x=r)
-        y = y[...,::-1].copy()
-        return y
-
-
-
-    def _add(self, dt, reward):
-        if self.count >= self.size:
-            stale_reward = self.reward_record.pop(0)
-            self.reward_sum -= stale_reward
-
-            stale_time = self.time_record.pop(0)
-            self.time_sum -= stale_time
-        else:
-            self.count += 1
-
-        self.reward_record.append(reward)
-        self.reward_sum += reward
-        
-        self.time_record.append(dt)
-        self.time_sum += dt
-
-
-
-    def _add_list_filter_zero(self, time_diffs, rewards):
-        assert len(time_diffs) == len(rewards)
-        for dt, reward in zip(time_diffs, rewards):
-            if dt != 0:
-                self._add(dt, reward)
-            else:
-                assert reward == 0
+    @classmethod
+    def _get_dt_list(cls, times_list):
+        dt_list = []
+        for ts in times_list:
+            ts = np.concatenate([np.array([0.]), ts])
+            dt = ts[1:] - ts[:-1]
+            dt_list += [dt]
+        return dt_list

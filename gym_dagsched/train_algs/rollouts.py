@@ -14,7 +14,8 @@ import numpy as np
 
 from ..wrappers.decima_wrappers import DecimaActWrapper, DecimaObsWrapper
 from ..wrappers.avg_reward_wrapper import AverageReward
-from ..agents.ac_decima_agent import DecimaAgent
+from ..agents.decima_agent import DecimaAgent
+from ..agents.fifo_agent import FIFOAgent
 from ..utils.graph import ObsBatch, collate_obsns
 from ..utils.device import device
 from ..utils.profiler import Profiler
@@ -43,6 +44,7 @@ class RolloutBuffer:
         self.sd = None
         self.returns = None
         self.value_loss = None
+        self.baselines = None
 
 
     def __len__(self):
@@ -64,15 +66,16 @@ def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
     torch.manual_seed(rank)
 
     env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
-    env = gym.make(env_id, **env_kwargs)
-    env = DecimaActWrapper(env)
-    env = DecimaObsWrapper(env)
-    # env = AverageReward(env)
-
+    env_agent = gym.make(env_id, **env_kwargs)
+    env_agent = DecimaActWrapper(env_agent)
+    env_agent = DecimaObsWrapper(env_agent)
     agent = DecimaAgent(env_kwargs['num_workers'])
     agent.build(device=device)
 
-    return env, agent
+    env_heuristic = gym.make(env_id, **env_kwargs)
+    heuristic = FIFOAgent(env_kwargs['num_workers'])
+
+    return env_agent, env_heuristic, agent, heuristic
 
 
 
@@ -86,23 +89,60 @@ def rollout_worker(
     '''collects rollouts and trains the model by communicating 
     with the main process and other workers
     '''
-    env, agent = setup_rollout_worker(rank, env_kwargs, log_dir)
+    env_agent, env_heuristic, agent, heuristic = setup_rollout_worker(rank, env_kwargs, log_dir)
+
+    greedy = (rank >= num_envs // 2)
+
+    print('GREEDY:', greedy)
     
     while data := conn.recv():
-        actor_sd, critic_sd, env_seed, env_options = data
+        actor_sd, _, env_seed, env_options = data
+
+        print('ENV SEED:', env_seed)
 
         # load updated model parameters
         agent.actor.load_state_dict(actor_sd)
-        agent.critic.load_state_dict(critic_sd)
+        # agent.critic.load_state_dict(critic_sd)
         
         with Profiler(), HiddenPrints():
-            rollout_buffer = \
+            rba = \
                 collect_rollout(
-                    env, 
-                    agent, 
-                    seed=env_seed, 
-                    options=env_options
+                    env_agent, 
+                    agent,
+                    greedy,
+                    env_seed, 
+                    env_options
                 )
+            
+            avg_job_duration = metrics.avg_job_duration(env_agent) * 1e-3
+            num_completed_jobs = env_agent.num_completed_jobs
+            num_job_arrivals = env_agent.num_completed_jobs + env_agent.num_active_jobs
+            
+        #     rbh = \
+        #         collect_rollout(
+        #             env_heuristic, 
+        #             heuristic, 
+        #             seed=env_seed, 
+        #             options=env_options
+        #         )
+            
+        # returns = []
+        # total_time = 0
+        # R = 0
+        # for i in reversed(range(len(rbh.rewards))):
+        #     if i > 0:
+        #         delta = rbh.wall_times[i] - rbh.wall_times[i-1]
+        #         total_time += delta
+        #         R += delta * rbh.rewards[i]
+        #         returns += [R]
+        #     else:
+        #         returns += [0]
+        # returns = np.array(returns) / total_time
+
+        # rba.baselines = np.interp(rba.wall_times, rbh.wall_times, returns)
+
+
+
             
 
         # returns = _compute_returns(
@@ -148,12 +188,10 @@ def rollout_worker(
         # rollout_buffer.value_loss = np.mean(value_losses)
 
         # send rollout buffer and stats to center
-        avg_job_duration = metrics.avg_job_duration(env) * 1e-3
-        num_job_arrivals = env.num_completed_jobs + env.num_active_jobs
         conn.send((
-            rollout_buffer, 
+            rba,
             avg_job_duration, 
-            env.num_completed_jobs,
+            num_completed_jobs,
             num_job_arrivals
         ))
 
@@ -162,6 +200,7 @@ def rollout_worker(
 def collect_rollout(
     env, 
     agent: DecimaAgent, 
+    greedy: bool,
     seed: int, 
     options: dict
 ) -> RolloutBuffer:
@@ -174,7 +213,11 @@ def collect_rollout(
     i = 0
     while not done:
         i += 1
-        action, lgprob = agent(obs)
+        if isinstance(agent, DecimaAgent):
+            action, lgprob = agent.predict(obs, greedy)
+        else:
+            action = agent(obs)
+            lgprob = 0
 
         new_obs, reward, terminated, truncated, info = env.step(action)
 

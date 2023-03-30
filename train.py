@@ -16,7 +16,7 @@ if __name__ == '__main__':
     PPO(
         env_kwargs,
         num_iterations=12000,
-        num_envs=8,
+        num_envs=10,
         log_dir='ignore/log/proc',
         summary_writer_dir='ignore/log/train/', 
         model_save_dir='ignore/models',
@@ -27,9 +27,10 @@ if __name__ == '__main__':
         max_time_mean_init=2e6,
         max_time_mean_growth=1.0008,
         max_time_mean_ceil=2e7,
-        batch_size=8,
+        batch_size=12,
         num_epochs=2,
         seed=2147483647,
         target_kl=.01,
-        gamma=1.
+        gamma=1.,
+        clip_range=.2
     ).train()
