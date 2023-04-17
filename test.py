@@ -10,15 +10,13 @@ from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from gym_dagsched.wrappers.decima_wrappers import (
+from spark_sched_sim.wrappers.decima_wrappers import (
     DecimaObsWrapper,
     DecimaActWrapper
 )
-from gym_dagsched.utils.metrics import avg_job_duration
-from gym_dagsched.utils.hidden_prints import HiddenPrints
-from gym_dagsched.agents.ac_decima_agent import DecimaAgent
-from gym_dagsched.agents.fifo_agent import FIFOAgent
-from gym_dagsched.agents.cpt_agent import CPTAgent
+from spark_sched_sim.metrics import avg_job_duration
+from train_algs.utils.hidden_prints import HiddenPrints
+from spark_sched_sim.schedulers import DecimaScheduler, FIFOScheduler, CPTScheduler
 
 
 def main():
@@ -26,9 +24,9 @@ def main():
 
     print('testing', flush=True)
 
-    num_tests = 50
+    num_tests = 10
 
-    num_workers = 50
+    num_executors = 50
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
@@ -38,44 +36,47 @@ def main():
     model_dir = 'ignore/models'
     model_name = 'model.pt'
 
-    fifo_agent = FIFOAgent(num_workers)
-    scpt_agent = CPTAgent(num_workers)
-    lcpt_agent = CPTAgent(num_workers, by_shortest=False)
-    decima_agent = \
-        DecimaAgent(num_workers,
-                    training_mode=False, 
-                    state_dict_path=\
-                        f'{model_dir}/{model_name}')
+    fifo_scheduler = FIFOScheduler(num_executors)
+    scpt_scheduler = CPTScheduler(num_executors)
+    lcpt_scheduler = CPTScheduler(num_executors, by_shortest=False)
+    decima_scheduler = \
+        DecimaScheduler(
+            num_executors,
+            training_mode=False, 
+            state_dict_path=f'{model_dir}/{model_name}'
+        )
 
     env_kwargs = {
-        'num_workers': num_workers,
+        'num_executors': num_executors,
         'num_init_jobs': 1,
         'num_job_arrivals': 100,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
 
-    env_id = 'gym_dagsched:gym_dagsched/DagSchedEnv-v0'
+    env_id = 'spark_sched_sim:SparkSchedSimEnv-v0'
     base_env = gym.make(env_id, **env_kwargs)
     wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
 
     test_instances = [
-        (fifo_agent, base_env, num_tests, base_seed),
-        (scpt_agent, base_env, num_tests, base_seed),
-        (lcpt_agent, base_env, num_tests, base_seed) #,
-        # (decima_agent, wrapped_env, num_tests, base_seed)
+        (fifo_scheduler, base_env, num_tests, base_seed),
+        (scpt_scheduler, base_env, num_tests, base_seed),
+        (lcpt_scheduler, base_env, num_tests, base_seed),
+        (decima_scheduler, wrapped_env, num_tests, base_seed)
     ]
 
     # run tests in parallel using multiprocessing
     with Pool(len(test_instances)) as p:
         test_results = p.map(test, test_instances)
 
-    agent_names = [agent.name for agent, *_ in test_instances]
+    sched_names = [sched.name for sched, *_ in test_instances]
 
-    visualize_results('job_duration_cdf.png', 
-                      agent_names, 
-                      test_results,
-                      env_kwargs)
+    visualize_results(
+        'job_duration_cdf.png', 
+        sched_names, 
+        test_results,
+        env_kwargs
+    )
 
 
 
@@ -83,7 +84,7 @@ def test(instance):
     sys.stdout = open(f'ignore/log/proc1/main.out', 'a')
     torch.set_num_threads(1)
 
-    agent, env, num_tests, base_seed = instance
+    sched, env, num_tests, base_seed = instance
 
     avg_job_durations = []
 
@@ -91,11 +92,11 @@ def test(instance):
         torch.manual_seed(42)
 
         with HiddenPrints():
-            run_episode(env, agent, base_seed + i)
+            run_episode(env, sched, base_seed + i)
 
         result = avg_job_duration(env)*1e-3
         avg_job_durations += [result]
-        print(f'{agent.name}: test {i+1}, avj={result:.1f}s', flush=True)
+        print(f'{sched.name}: test {i+1}, avj={result:.1f}s', flush=True)
 
     return np.array(avg_job_durations)
 
@@ -114,7 +115,7 @@ def compute_CDF(arr, num_bins=100):
 
 
 
-def run_episode(env, agent, seed): 
+def run_episode(env, sched, seed): 
     env_options = {'max_wall_time': np.inf} 
     obs, _ = env.reset(seed=seed, options=env_options)
 
@@ -122,13 +123,12 @@ def run_episode(env, agent, seed):
     rewards = []
     
     while not done:
-        if isinstance(agent, DecimaAgent):
-            action, *_ = agent(obs)
+        if isinstance(sched, DecimaScheduler):
+            action, *_ = sched(obs)
         else:
-            action = agent(obs)
+            action = sched(obs)
 
-        obs, reward, terminated, truncated, _ = \
-            env.step(action)
+        obs, reward, terminated, truncated, _ = env.step(action)
 
         rewards += [reward]
         done = (terminated or truncated)
@@ -137,25 +137,25 @@ def run_episode(env, agent, seed):
 
 
 
-def visualize_results(out_fname, 
-                      agent_names, 
-                      test_results,
-                      env_kwargs):
-
+def visualize_results(
+    out_fname, 
+    sched_names, 
+    test_results,
+    env_kwargs
+):
     # plot CDF's
-    for agent_name, avg_job_durations in zip(agent_names, 
-                                             test_results):
+    for sched_name, avg_job_durations in zip(sched_names, test_results):
         x, y = compute_CDF(avg_job_durations)
-        plt.plot(x, y, label=agent_name)
+        plt.plot(x, y, label=sched_name)
 
     # display environment options in a table
-    plt.table(cellText=\
-                [[key,val] 
-                for key,val in env_kwargs.items()],
-            colWidths=[.25, .1],
-            cellLoc='center', 
-            rowLoc='center',
-            loc='right')
+    plt.table(
+        cellText=[[key,val] for key,val in env_kwargs.items()],
+        colWidths=[.25, .1],
+        cellLoc='center', 
+        rowLoc='center',
+        loc='right'
+    )
 
     plt.tight_layout()
     plt.legend(bbox_to_anchor=(1, 1), loc='upper left')
