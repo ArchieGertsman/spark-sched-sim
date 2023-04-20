@@ -67,7 +67,7 @@ def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
 
     # IMPORTANT! Each worker needs to produce unique 
     # rollouts, which are determined by the rng seed
-    torch.manual_seed(0) #rank)
+    torch.manual_seed(rank)
 
     # env_heuristic = gym.make(env_id, **env_kwargs)
     # heuristic = FIFOScheduler(env_kwargs['num_executors'])

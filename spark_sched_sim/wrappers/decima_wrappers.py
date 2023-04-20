@@ -14,6 +14,8 @@ from gymnasium.spaces import (
     GraphInstance
 )
 
+from ..graph_utils import construct_message_passing_masks
+
 
 class DecimaObsWrapper(ObservationWrapper):
     
@@ -29,20 +31,25 @@ class DecimaObsWrapper(ObservationWrapper):
                 'ptr': Sequence(Discrete(1))
             }),
             'schedulable_stage_mask': Sequence(Discrete(2)),
-            'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_executors))
+            'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_executors)),
+            'edge_mask_batch': MultiBinary((1,1))
         })
+
+        self.num_nodes = -1
+        self.edge_links = None
+        self.edge_mask_batch = None
 
 
     
     def observation(self, obs):
         ptr = np.array(obs['dag_batch']['ptr'])
         num_nodes_per_dag = ptr[1:] - ptr[:-1]
-        num_active_nodes = obs['dag_batch']['data'].nodes.shape[0]
+        num_nodes = obs['dag_batch']['data'].nodes.shape[0]
         executor_counts = obs['executor_counts']
         num_active_jobs = len(executor_counts)
 
         # build node features
-        nodes = np.zeros((num_active_nodes, 5), dtype=np.float32)
+        nodes = np.zeros((num_nodes, 5), dtype=np.float32)
 
         nodes[:, 0] = obs['num_executors_to_schedule'] / self.num_executors
 
@@ -58,8 +65,17 @@ class DecimaObsWrapper(ObservationWrapper):
         nodes[:, 3] = num_remaining_tasks / 200
         nodes[:, 4] = num_remaining_tasks * most_recent_duration * 1e-5
 
-        # update stage action space to reflect the current number of active stages
-        self.observation_space['dag_batch']['ptr'].feature_space.n = num_active_nodes+1
+        edge_links = obs['dag_batch']['data'].edge_links
+
+        if self.edge_links is None or num_nodes != self.num_nodes or \
+            not np.array_equal(edge_links, self.edge_links):
+            # dag batch has changed, so update message passing data
+            self.num_nodes = num_nodes
+            self.edge_links = edge_links
+            self.edge_mask_batch = construct_message_passing_masks(edge_links, num_nodes)
+
+        self.observation_space['dag_batch']['ptr'].feature_space.n = num_nodes+1
+        self.observation_space['edge_mask_batch'].n = self.edge_mask_batch.shape
 
         graph_instance = \
             GraphInstance(
@@ -74,7 +90,8 @@ class DecimaObsWrapper(ObservationWrapper):
                 'ptr': obs['dag_batch']['ptr']
             },
             'schedulable_stage_mask': obs['schedulable_stage_mask'],
-            'valid_prlsm_lim_mask': obs['valid_prlsm_lim_mask']
+            'valid_prlsm_lim_mask': obs['valid_prlsm_lim_mask'],
+            'edge_mask_batch': self.edge_mask_batch
         }
 
         return obs

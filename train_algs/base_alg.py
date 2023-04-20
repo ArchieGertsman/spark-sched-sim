@@ -103,7 +103,7 @@ class BaseAlg(ABC):
         self._setup()
 
         for i in range(self.num_iterations):
-            max_time = 6e6
+            max_time = 1e6
             # max_time = self.np_random_max_time.geometric(1/self.max_time_mean)
             # max_time = self.np_random_max_time.triangular(0, 0, 2.5*self.max_time_mean)
             # max_time = 1e6

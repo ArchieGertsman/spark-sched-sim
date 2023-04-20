@@ -84,29 +84,24 @@ class DecimaScheduler(BaseScheduler):
         observations of the environment and `DecimaActWrapper` 
         is receiving actions returned from here.
         '''
-        dag_batch = graph_utils.obs_to_pyg(obs['dag_batch'])
-        batch = dag_batch.batch.clone() # save a CPU copy
-        dag_batch = dag_batch.to(self.device, non_blocking=True)
+        dag_batch, node_to_dag_map = graph_utils.obs_to_pyg(obs)
+        dag_batch.to(self.device, non_blocking=True)
 
         # no computational graphs needed during the episode
         outputs = self.actor(dag_batch)
         node_scores, dag_scores = [out.cpu() for out in outputs]
 
-        schedulable_stage_mask = \
-            torch.tensor(obs['schedulable_stage_mask'], dtype=bool)
+        schedulable_stage_mask = torch.tensor(obs['schedulable_stage_mask'], dtype=bool)
 
-        valid_prlsm_lim_mask = \
-            torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
+        valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
 
-        self._mask_outputs(
-            (node_scores, dag_scores),
-            (schedulable_stage_mask, valid_prlsm_lim_mask)
-        )
+        self._apply_mask(node_scores, schedulable_stage_mask)
+        self._apply_mask(dag_scores, valid_prlsm_lim_mask)
 
         action, lgprob = self._sample_action(
             node_scores, 
             dag_scores, 
-            batch, 
+            node_to_dag_map, 
             greedy
         )
 
@@ -120,7 +115,7 @@ class DecimaScheduler(BaseScheduler):
         actions: Tensor
     ) -> tuple[Tensor, Tensor]:
         
-        # save CPU copies of some attributes
+        # save CPU copies of some bookkeeping attributes
         obs_ptr = obsns.dag_batch['obs_ptr']
         num_nodes_per_dag = obsns.dag_batch['num_nodes_per_dag']
         num_nodes_per_obs = obsns.dag_batch['num_nodes_per_obs']
@@ -131,30 +126,21 @@ class DecimaScheduler(BaseScheduler):
         # move model outputs to CPU
         node_scores_batch, dag_scores_batch = [out.cpu() for out in model_outputs]
 
-        self._mask_outputs(
-            (node_scores_batch, dag_scores_batch),
-            (obsns.schedulable_stage_masks, obsns.valid_prlsm_lim_masks)
-        )
+        self._apply_mask(node_scores_batch, obsns.schedulable_stage_masks)
+        self._apply_mask(dag_scores_batch, obsns.valid_prlsm_lim_masks)
 
         # split columns of `actions` into separate tensors
         # NOTE: columns need to be cloned to avoid in-place operation
-        node_selections, dag_idxs, dag_selections = \
-            [col.clone() for col in actions.T]
+        node_selections, dag_idxs, dag_selections = [col.clone() for col in actions.T]
 
-        (all_node_probs, 
-         node_lgprobs, 
-         node_entropies) = \
+        all_node_probs, node_lgprobs, node_entropies = \
             self._evaluate_node_actions(
                 node_scores_batch,
                 node_selections,
                 num_nodes_per_obs
             )
 
-        dag_probs = \
-            self._compute_dag_probs(
-                all_node_probs, 
-                num_nodes_per_dag
-            )
+        dag_probs = self._compute_dag_probs(all_node_probs, num_nodes_per_dag)
         
         dag_lgprobs, dag_entropies = \
             self._evaluate_dag_actions(
@@ -198,25 +184,15 @@ class DecimaScheduler(BaseScheduler):
     ## internal methods
 
     @classmethod
-    def _mask_outputs(
-        cls,
-        outputs: tuple[Tensor, Tensor],
-        masks: tuple[Tensor, Tensor]
-    ):
+    def _apply_mask(cls, t: Tensor, msk: Tensor) -> Tensor:
         '''masks model outputs in-place'''
-        node_scores, dag_scores = outputs
-        schedulable_stage_mask, valid_prlsm_lim_mask = masks
-
-        # mask node scores
-        node_scores[~schedulable_stage_mask] = float('-inf')
-
-        # mask dag scores
-        dag_scores.masked_fill_(~valid_prlsm_lim_mask, float('-inf'))
+        min_real = torch.finfo(t.dtype).min
+        t.masked_fill_(~msk, min_real)
 
 
 
     @classmethod
-    def _sample_action(cls, node_scores, dag_scores, batch, greedy):
+    def _sample_action(cls, node_scores, dag_scores, node_to_dag_map, greedy):
         # select the next stage to schedule
         c_stage = Categorical(logits=node_scores)
         if greedy:
@@ -226,7 +202,7 @@ class DecimaScheduler(BaseScheduler):
         lgprob_stage = c_stage.log_prob(stage_idx)
 
         # select the parallelism limit for the selected stage's job
-        job_idx = batch[stage_idx]
+        job_idx = node_to_dag_map[stage_idx]
         dag_scores = dag_scores[job_idx]
         c_pl = Categorical(logits=dag_scores)
         if greedy:
@@ -249,9 +225,8 @@ class DecimaScheduler(BaseScheduler):
 
     @classmethod
     def _compute_dag_probs(cls, all_node_probs, num_nodes_per_dag):
-        '''for each dag, compute the probability of it
-        being selected by summing over the probabilities
-        of each of its nodes being selected
+        '''for each dag, compute the probability of it being selected by summing 
+        over the probabilities of each of its nodes being selected
         '''
         dag_indptr = num_nodes_per_dag.cumsum(0)
         dag_indptr = torch.cat([torch.tensor([0]), dag_indptr], 0)
@@ -309,9 +284,7 @@ class DecimaScheduler(BaseScheduler):
             node_entropy = c.entropy()
             return c.probs, node_lgprob, node_entropy
 
-        (node_scores_subbatches, 
-         node_selection_subbatches, 
-         subbatch_node_counts) = \
+        node_scores_subbatches, node_selection_subbatches, subbatch_node_counts = \
             cls._split_node_experience(
                 node_scores_batch, 
                 node_action_batch, 
@@ -323,22 +296,13 @@ class DecimaScheduler(BaseScheduler):
         node_lgprobs = []
         node_entropies = []
 
-        gen = zip(node_scores_subbatches,
-                  node_selection_subbatches,
-                  subbatch_node_counts)
+        gen = zip(node_scores_subbatches, node_selection_subbatches, subbatch_node_counts)
 
-        for (node_scores_subbatch, 
-             node_selection_subbatch,
-             node_count) in gen:
+        for node_scores_subbatch, node_selection_subbatch, node_count in gen:
+            node_scores_subbatch = node_scores_subbatch.view(-1, node_count)
 
-            node_scores_subbatch = \
-                node_scores_subbatch.view(-1, node_count)
-
-            (node_probs, 
-             node_lgprob_subbatch, 
-             node_entropy_subbatch) = \
-                _eval_node_actions(node_scores_subbatch,
-                                   node_selection_subbatch)
+            node_probs, node_lgprob_subbatch, node_entropy_subbatch = \
+                _eval_node_actions(node_scores_subbatch, node_selection_subbatch)
 
             all_node_probs += [torch.flatten(node_probs)]
             node_lgprobs += [node_lgprob_subbatch]
@@ -369,23 +333,19 @@ class DecimaScheduler(BaseScheduler):
         node_selection_batch: Tensor, 
         num_nodes_per_obs: Tensor
     ) -> Tuple[Iterable[Tensor], Iterable[Tensor], Tensor]:
-        '''splits the node score/selection batches into
-        subbatches, where each each sample within a subbatch
-        has the same node count.
+        '''splits the node score/selection batches into subbatches, where each 
+        each sample within a subbatch has the same node count.
         '''
         batch_size = len(num_nodes_per_obs)
 
         # find indices where node count changes
-        node_count_change_mask = \
-            num_nodes_per_obs[:-1] != num_nodes_per_obs[1:]
+        node_count_change_mask = num_nodes_per_obs[:-1] != num_nodes_per_obs[1:]
 
         ptr = 1 + node_count_change_mask.nonzero().squeeze()
         if ptr.shape == torch.Size():
             # ptr is zero-dimentional; not allowed in torch.cat
             ptr = ptr.unsqueeze(0)
-        ptr = torch.cat([torch.tensor([0]), 
-                         ptr, 
-                         torch.tensor([batch_size])])
+        ptr = torch.cat([torch.tensor([0]), ptr, torch.tensor([batch_size])])
 
         # unique node count within each subbatch
         subbatch_node_counts = num_nodes_per_obs[ptr[:-1]]
@@ -395,17 +355,12 @@ class DecimaScheduler(BaseScheduler):
 
         # split node scores into subbatches
         node_scores_split = \
-            torch.split(node_scores_batch, 
-                        list(subbatch_sizes * subbatch_node_counts))
+            torch.split(node_scores_batch, list(subbatch_sizes * subbatch_node_counts))
 
         # split node selections into subbatches
-        node_selection_split = \
-            torch.split(node_selection_batch, 
-                        list(subbatch_sizes))
+        node_selection_split = torch.split(node_selection_batch, list(subbatch_sizes))
 
-        return node_scores_split, \
-               node_selection_split, \
-               subbatch_node_counts
+        return node_scores_split, node_selection_split, subbatch_node_counts
 
 
 
@@ -420,9 +375,9 @@ class DecimaScheduler(BaseScheduler):
     ):
         dag_idxs += obs_ptr[:-1]
 
-        dag_lgprob_batch = \
-            Categorical(logits=dag_scores_batch[dag_idxs]) \
-                .log_prob(dag_selections)
+        dag_lgprob_batch = Categorical(
+            logits=dag_scores_batch[dag_idxs]
+        ).log_prob(dag_selections)
 
         # can't have rows where all the entries are
         # -inf when computing entropy, so for all such 
@@ -453,25 +408,7 @@ class ActorNetwork(nn.Module):
 
         
     def forward(self, dag_batch: Batch):
-        '''
-        Args:
-            dag_batch (torch_geometric.data.Batch): PyG batch of job dags
-            num_dags_per_obs (optional torch.Tensor): if dag_batch is a nested
-                batch of dag_batches for many separate observations, then
-                this argument specifies how many dags are in each observation.
-                If it is not provided, then the dag_batch is assumed to not be
-                nested.
-        Returns:
-            node scores and dag scores, and if dag_batch is a batch of batches, 
-            then additionally returns the number of nodes in each observation and 
-            an tensor containing the starting node index for each observation
-        '''
-
         dag_batch['num_nodes_per_dag'] = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
-
-        if not hasattr(dag_batch, 'obs_ptr'):
-            dag_batch['num_dags_per_obs'] = dag_batch.num_graphs
-            dag_batch['num_nodes_per_obs'] = dag_batch.x.shape[0]
 
         node_embeddings, dag_summaries, global_summaries = self.encoder(dag_batch)
 
@@ -504,11 +441,6 @@ class EncoderNetwork(nn.Module):
         # global summaries
         self.mlp_glob_msg = MLP(dim_embed, [16, 8, dim_embed], activation_layer=ACT_FN)
 
-        self.num_nodes = -1
-        self.edge_index = None
-        self.level_edge_index_list = None
-        self.level_mask_batch = None
-
 
 
     def forward(self, dag_batch):
@@ -525,19 +457,17 @@ class EncoderNetwork(nn.Module):
         # preprocess node features
         x = self.mlp_node_prep(dag_batch.x)
 
-        if self.edge_index is None or self.num_nodes != num_nodes or \
-            not torch.equal(dag_batch.edge_index, self.edge_index):
-            self.num_nodes = num_nodes
-            self.edge_index = dag_batch.edge_index.clone()
-            self.level_edge_index_list, self.level_mask_batch = \
-                graph_utils.construct_message_passing_levels(dag_batch)
-        
-        if self.level_edge_index_list is None:
+        edge_mask_batch = dag_batch['edge_mask_batch']
+
+        if edge_mask_batch.shape[0] == 0:
             # no message passing to be done
             return x
         
         # target-to-source message passing, one level of the dag (batch) at a time
-        for edge_index, mask in zip(self.level_edge_index_list, self.level_mask_batch):
+        for edge_mask in edge_mask_batch:
+            edge_index = dag_batch.edge_index[:, edge_mask]
+            node_mask = torch.zeros(num_nodes, dtype=bool, device=x.device)
+            node_mask[edge_index[0]] = True
             adj = graph_utils.make_adj(edge_index, num_nodes)
 
             # message
@@ -548,7 +478,7 @@ class EncoderNetwork(nn.Module):
 
             # update
             y = self.mlp_node_update(y)
-            x = x + mask.unsqueeze(1) * y
+            x = x + node_mask.unsqueeze(1) * y
         
         return x
     
@@ -578,7 +508,7 @@ class EncoderNetwork(nn.Module):
             x = segment_csr(x, dag_batch['obs_ptr'])
         else:
             # single observation
-            x = x.sum(dim=0).unsqueeze(0)
+            x = x.sum(0).unsqueeze(0)
 
         return x
         
@@ -636,9 +566,16 @@ class PolicyNetwork(nn.Module):
                 dim=0
             )
         
+        if hasattr(dag_batch, 'num_dags_per_obs'):
+            # batch of observations
+            num_nodes_per_obs = dag_batch['num_nodes_per_obs']
+        else:
+            # single observation
+            num_nodes_per_obs = dag_batch.x.shape[0]
+        
         global_summaries_repeat = \
             global_summaries.repeat_interleave(
-                dag_batch['num_nodes_per_obs'], 
+                num_nodes_per_obs,
                 output_size=num_nodes,
                 dim=0
             )
@@ -683,10 +620,17 @@ class PolicyNetwork(nn.Module):
                 output_size=num_total_actions,
                 dim=0
             )
+        
+        if hasattr(dag_batch, 'num_dags_per_obs'):
+            # batch of observations
+            num_dags_per_obs = dag_batch['num_dags_per_obs']
+        else:
+            # single observation
+            num_dags_per_obs = dag_batch.num_graphs
 
         global_summaries_repeat = \
             global_summaries.repeat_interleave(
-                dag_batch['num_dags_per_obs'] * self.num_executors, 
+                num_dags_per_obs * self.num_executors, 
                 output_size=num_total_actions,
                 dim=0
             )
