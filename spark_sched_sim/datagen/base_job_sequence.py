@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from queue import PriorityQueue
 
 import numpy as np
 
@@ -17,13 +16,13 @@ class BaseJobSequenceGen(ABC):
     ):
         self.num_init_jobs = num_init_jobs
         self.num_job_arrivals = num_job_arrivals
-        self.job_arrival_rate = job_arrival_rate
+        self.mean_interarrival_time = 1 / job_arrival_rate
 
 
 
     def new_timeline(self, np_random: np.random.RandomState) -> Timeline:
-        '''Fills timeline with job arrivals, which follow a
-        Poisson process parameterized by `job_arrival_rate`
+        '''Fills timeline with job arrivals, which follow a Poisson process 
+        parameterized by `job_arrival_rate`
         '''
         self.np_random = np_random
         timeline = Timeline()
@@ -33,8 +32,8 @@ class BaseJobSequenceGen(ABC):
 
         for job_id in range(self.num_init_jobs + self.num_job_arrivals):
             if job_id >= self.num_init_jobs:
-                # sample time until next arrival
-                t += np_random.geometric(self.job_arrival_rate)
+                # sample time in ms until next arrival
+                t += np_random.exponential(self.mean_interarrival_time)
 
             job = self.generate_job(job_id, t)
             timeline.push(t, JobArrival(job))

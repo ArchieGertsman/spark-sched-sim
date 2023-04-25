@@ -5,9 +5,7 @@ from .stage import Stage
 
 
 class Job:
-    '''An object representing a job in the system, containing
-    a set of stages with dependencies stored in a dag.
-    '''
+    '''An object representing a job in the system, containing a set of stages with dependencies stored in a dag.'''
 
     def __init__(
         self, 
@@ -33,13 +31,14 @@ class Job:
         # incomplete stages whose parents have completed
         self.frontier_stages = set()
 
-        # networkx dag storing the stages' interdependencies
+        # networkx dag storing the stage dependencies
         self.dag = dag
 
         # time that this job arrived into the system
         self.t_arrival = t_arrival
 
         self.query_size = query_size
+
         self.query_num = query_num
 
         # time that this job completed, i.e. when the last
@@ -62,7 +61,6 @@ class Job:
 
     @property
     def completed(self):
-        '''whether or not this job has completed'''
         return self.num_active_stages == 0
 
 
@@ -108,42 +106,37 @@ class Job:
 
 
     def source_stages(self):
-        return \
-            set(self.stages[node]
-                for node, in_deg in self.dag.in_degree()
-                if in_deg == 0)
+        return set(
+            self.stages[node]
+            for node, in_deg in self.dag.in_degree()
+            if in_deg == 0
+        )
 
 
 
     def children_stages(self, stage):
-        return (self.stages[stage_id] 
-                for stage_id in self.dag.successors(stage.id_))
+        return (self.stages[stage_id] for stage_id in self.dag.successors(stage.id_))
 
 
 
     def parent_stages(self, stage):
-        return (self.stages[stage_id] 
-                for stage_id in self.dag.predecessors(stage.id_))
+        return (self.stages[stage_id] for stage_id in self.dag.predecessors(stage.id_))
 
 
 
     def find_new_frontier_stages(self, stage):
-        '''if ` stage` is completed, returns all of its
-        successors whose other dependencies are also 
+        '''if ` stage` is completed, returns all of its successors whose other dependencies are also 
         completed, if any exist.
         '''
-
         if not stage.completed:
             return set()
 
         new_stages = set()
         # search through stage's children
         for suc_stage_id in self.dag.successors(stage.id_):
-            # if all dependencies are satisfied, then
-            # add this child to the frontiers
+            # if all dependencies are satisfied, then add this child to the frontier
             new_stage = self.stages[suc_stage_id]
-            if not new_stage.completed and \
-               self.check_dependencies(suc_stage_id):
+            if not new_stage.completed and self.check_dependencies(suc_stage_id):
                 new_stages.add(new_stage)
         
         return new_stages
@@ -151,9 +144,7 @@ class Job:
 
 
     def check_dependencies(self, stage_id):
-        '''searches to see if all the dependencies of stage 
-        with id `stage_id` are satisfied.
-        '''
+        '''searches to see if all the dependencies of stage with id `stage_id` are satisfied.'''
         for dep_id in self.dag.predecessors(stage_id):
             if not self.stages[dep_id].completed:
                 return False

@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from torch_geometric.data import Data, Batch
 from torch_geometric.data.collate import collate
-import torch_geometric.utils as pyg_utils
 from torch_scatter import segment_csr
 import networkx as nx
 
@@ -30,7 +29,7 @@ def make_edge_mask(edge_links, node_mask):
 
 def subgraph(edge_links: ndarray, node_mask: ndarray) -> ndarray:
     '''
-    Simple numpy version of PyG's subgraph utility function
+    Minimal numpy version of PyG's subgraph utility function
     Args:
         edge_links: array of edges of shape (num_edges, 2),
             following the convention of gymnasium Graph space
@@ -56,17 +55,20 @@ def obs_to_pyg(obs: ObsType) -> Batch:
     num_nodes_per_dag = ptr[1:] - ptr[:-1]
     num_active_jobs = len(num_nodes_per_dag)
 
+    # NOTE: `node_to_dag_map` is exactly the `batch` attribute in PyG `Batch`
+    # objects, but that attribute is not needed in the forward pass, so it's
+    # left out of the `Batch` object and named more descriptively.
+    node_to_dag_map = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
+
     x = obs_dag_batch['data'].nodes
     edge_links = obs_dag_batch['data'].edge_links
     dag_batch = Batch(
         x=torch.from_numpy(x), 
         edge_index=torch.from_numpy(edge_links.T),
-        ptr=torch.from_numpy(ptr)
+        ptr=torch.from_numpy(ptr),
+        _num_graphs=num_active_jobs
     )
-    dag_batch._num_graphs = num_active_jobs
     dag_batch['edge_mask_batch'] = torch.from_numpy(obs['edge_mask_batch'])
-
-    node_to_dag_map = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
 
     return dag_batch, node_to_dag_map
 
@@ -91,25 +93,33 @@ def collate_obsns(obsns: list[ObsType]) -> ObsBatch:
     ))
 
     dag_batch = collate_dag_batches(dag_batches)
+    dag_batch['edge_mask_batch'] = \
+        collate_edge_mask_batches(edge_mask_batches, dag_batch.edge_index.shape[1])
+
     schedulable_stage_masks = torch.from_numpy(np.concatenate(schedulable_stage_masks).astype(bool))
     valid_prlsm_lim_masks = torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
-
-    max_depth = max(edge_mask_batch.shape[0] for edge_mask_batch in edge_mask_batches)
-    edge_mask_batch = np.zeros((max_depth, dag_batch.edge_index.shape[1]), dtype=bool)
-    i = 0
-    for mask_batch in edge_mask_batches:
-        depth, num_edges = mask_batch.shape
-        if depth > 0:
-            edge_mask_batch[:depth, i : i+num_edges] = mask_batch
-        i += num_edges
-
-    dag_batch['edge_mask_batch'] = edge_mask_batch
 
     return ObsBatch(
         dag_batch, 
         schedulable_stage_masks, 
         valid_prlsm_lim_masks
     )
+
+
+
+def collate_edge_mask_batches(edge_mask_batches, total_num_edges):
+    '''collates list of edge mask batches from each message passing path. Since the
+    message passing depth varies between observations, edge mask batches are padded
+    to the maximum depth.'''
+    max_depth = max(edge_mask_batch.shape[0] for edge_mask_batch in edge_mask_batches)
+    edge_mask_batch = np.zeros((max_depth, total_num_edges), dtype=bool)
+    i = 0
+    for mask_batch in edge_mask_batches:
+        depth, num_edges = mask_batch.shape
+        if depth > 0:
+            edge_mask_batch[:depth, i : i+num_edges] = mask_batch
+        i += num_edges
+    return edge_mask_batch
 
 
 
@@ -128,8 +138,8 @@ def collate_dag_batches(
         return ptr[1:] - ptr[:-1]
 
     def _counts_to_ptr(x):
-        ptr = x.cumsum(dim=0)
-        ptr = torch.cat([torch.tensor([0]), ptr], dim=0)
+        ptr = x.cumsum(0)
+        ptr = torch.cat([torch.tensor([0]), ptr], 0)
         return ptr
 
     data_list, num_dags_per_obs, num_nodes_per_dag = zip(*(
@@ -141,7 +151,9 @@ def collate_dag_batches(
         for dag_batch in dag_batches
     ))
 
-    # dag_batch = Batch.from_data_list(data_list)
+    # NOTE: `batch` attribute is not needed, but can be obtained as follows:
+    # dag_batch.batch = torch.arange(total_num_dags).repeat_interleave(num_nodes_per_dag)
+
     dag_batch = collate(Batch, data_list, add_batch=False)[0]
     
     # add some custom attributes for bookkeeping
@@ -152,9 +164,6 @@ def collate_dag_batches(
 
     dag_batch.ptr = _counts_to_ptr(dag_batch['num_nodes_per_dag'])
     dag_batch._num_graphs = dag_batch['num_dags_per_obs'].sum()
-    # dag_batch.batch = \
-    #     torch.arange(total_num_dags) \
-    #          .repeat_interleave(num_nodes_per_dag)
 
     return dag_batch
 

@@ -6,31 +6,28 @@ from .base_job_sequence import BaseJobSequenceGen
 from ..components import Job, Stage
 
 
-class TPCHJobSequenceGen(BaseJobSequenceGen):
-    query_base_path = 'spark_sched_sim/datagen/tpch_dataset'
-    tpch_sizes = ['2g','5g','10g','20g','50g','80g','100g']
-    num_queries = 22
 
+QUERY_BASE_PATH = 'spark_sched_sim/datagen/tpch_dataset'
+TPCH_SIZES = ['2g','5g','10g','20g','50g','80g','100g']
+NUM_QUERIES = 22
+
+
+class TPCHJobSequenceGen(BaseJobSequenceGen):
 
     def generate_job(self, job_id, t_arrival):
-        query_size = self.np_random.choice(self.tpch_sizes)
-        query_path = f'{self.query_base_path}/{query_size}'
-        query_num = 1 + self.np_random.integers(self.num_queries)
+        query_size = self.np_random.choice(TPCH_SIZES)
+        query_path = f'{QUERY_BASE_PATH}/{query_size}'
+        query_num = 1 + self.np_random.integers(NUM_QUERIES)
         
-        adj_matrix = \
-            np.load(f'{query_path}/adj_mat_{query_num}.npy', 
-                    allow_pickle=True)
-
-        task_durations = \
-            np.load(f'{query_path}/task_duration_{query_num}.npy', 
-                    allow_pickle=True).item()
+        adj_matrix = np.load(f'{query_path}/adj_mat_{query_num}.npy', allow_pickle=True)
+        task_durations = np.load(f'{query_path}/task_duration_{query_num}.npy', allow_pickle=True).item()
         
         assert adj_matrix.shape[0] == adj_matrix.shape[1]
         assert adj_matrix.shape[0] == len(task_durations)
 
-        n_stages = adj_matrix.shape[0]
+        num_stages = adj_matrix.shape[0]
         stages = []
-        for stage_id in range(n_stages):
+        for stage_id in range(num_stages):
             task_duration_data = task_durations[stage_id]
             e = next(iter(task_duration_data['first_wave']))
 
@@ -42,23 +39,20 @@ class TPCHJobSequenceGen(BaseJobSequenceGen):
             self._pre_process_task_duration(task_duration_data)
 
             # generate a node
-            stage = Stage(
+            stages += [Stage(
                 stage_id, 
                 job_id, 
                 num_tasks, 
                 task_duration_data, 
                 self.np_random
-            )
-            stages += [stage]
+            )]
 
         # generate DAG
-        dag = nx.convert_matrix.from_numpy_matrix(
-            adj_matrix, create_using=nx.DiGraph)
+        dag = nx.from_numpy_array(adj_matrix, create_using=nx.DiGraph)
         for _,_,d in dag.edges(data=True):
             d.clear()
-        job = Job(job_id, stages, dag, t_arrival, query_size, query_num)
         
-        return job
+        return Job(job_id, stages, dag, t_arrival, query_size, query_num)
 
 
 

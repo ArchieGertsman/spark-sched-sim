@@ -18,20 +18,15 @@ class Executor:
         # id of current operation this executor is executing, if any
         self.op_id: Optional[int] = None
 
-        # list of pairs [t, job_id], where
-        # `t` is the wall time that this executor
-        # was released from job with id `job_id`,
-        # or `None` if it has not been released
-        # yet. `job_id` is -1 if the executor is
-        # at the general pool.
+        # list of pairs [t, job_id], where `t` is the wall time that this executor
+        # was released from job with id `job_id`, or `None` if it has not been released
+        # yet. `job_id` is -1 if the executor is at the general pool.
         # NOTE: only used for rendering
         self.history: List[list] = [[None, -1]]
 
 
     def add_history(self, wall_time, job_id):
-        '''should be called whenever this executor is
-        released from a job
-        '''
+        '''should be called whenever this executor is released from a job'''
         if self.history is None:
             self.history = []
 

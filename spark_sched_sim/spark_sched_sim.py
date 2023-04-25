@@ -63,8 +63,7 @@ class SparkSchedSimEnv(Env):
                 quickly new jobs arrive into the system. This is the parameter
                 of an exponential distributions, and so its inverse is the
                 mean job inter-arrival time in ms.
-            moving_delay (float): time in ms it takes for a executor to move
-                between jobs
+            moving_delay (float): time in ms it takes for a executor to move between jobs
             render_mode (optional str): if set to 'human', then a visualization
                 of the simulation is rendred in real time
         '''
@@ -184,13 +183,6 @@ class SparkSchedSimEnv(Env):
         except:
             self.max_wall_time = np.inf
 
-        try:
-            self.datagen.num_job_arrivals = options['num_job_arrivals']
-            self.num_total_jobs = self.num_init_jobs + options['num_job_arrivals']
-        except:
-            # number of job arrivals hasn't changed
-            pass
-
         # simulation wall time in ms
         self.wall_time = 0
 
@@ -234,6 +226,8 @@ class SparkSchedSimEnv(Env):
 
         self._load_initial_jobs()
 
+        self.round_lens = [0]
+
         return self._observe(), self.info
 
 
@@ -250,10 +244,13 @@ class SparkSchedSimEnv(Env):
 
         self._take_action(action)
 
+        self.round_lens[-1] += 1
+
         if self.exec_state.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0:
-            # there are still scheduling decisions to be made, 
-            # so consult the agent again
+            # there are still scheduling decisions to be made, so consult the agent again
             return self._observe(), 0, False, False, self.info
+        
+        self.round_lens += [0]
             
         # commitment round has completed, now schedule the free executors
         self._commit_remaining_executors()
@@ -270,7 +267,7 @@ class SparkSchedSimEnv(Env):
 
         reward = self._calculate_reward(old_wall_time, old_active_job_ids)
         self.terminated = self.all_jobs_complete
-        self.truncated = (self.wall_time >= self.max_wall_time)
+        self.truncated = self.wall_time >= self.max_wall_time
 
         if not self.done:
             print('starting new scheduling round', flush=True)
@@ -301,7 +298,8 @@ class SparkSchedSimEnv(Env):
         job_ptr = [0]
         for job in self.jobs.values():
             base_stage_idx = job_ptr[-1]
-            edge_links += [base_stage_idx + np.vstack(job.dag.edges)]
+            edges = np.vstack(job.dag.edges)
+            edge_links += [base_stage_idx + edges]
             job_ptr += [base_stage_idx + job.num_stages]
         self.all_edge_links = np.vstack(edge_links)
         self.all_job_ptr = np.array(job_ptr)
@@ -448,16 +446,16 @@ class SparkSchedSimEnv(Env):
         valid_prlsm_lim_masks = []
         for i, executor_count in enumerate(executor_counts):
             min_prlsm_lim = executor_count + 1
-            max_prlsm_lim = executor_count + num_executors_to_schedule
+            # max_prlsm_lim = executor_count + num_executors_to_schedule
             if i == source_job_idx:
                 min_prlsm_lim -= num_executors_to_schedule
-                max_prlsm_lim -= num_executors_to_schedule
+                # max_prlsm_lim -= num_executors_to_schedule
 
             assert 0 < min_prlsm_lim
             assert     min_prlsm_lim <= self.num_executors + 1
 
             valid_prlsm_lim_mask = np.zeros(self.num_executors, dtype=bool)
-            valid_prlsm_lim_mask[(min_prlsm_lim-1):max_prlsm_lim] = 1
+            valid_prlsm_lim_mask[(min_prlsm_lim-1):] = 1
             valid_prlsm_lim_masks += [valid_prlsm_lim_mask]
 
         obs = {
@@ -556,8 +554,8 @@ class SparkSchedSimEnv(Env):
         self.exec_state.count_executor_arrival(stage.pool_key)
 
         if stage.num_remaining_tasks == 0:
-            # either the job has completed or the stage has become saturated by the time of this 
-            # arrival, so try to greedily find a backup stage for the executor
+            # the stage has become saturated by the time of this arrival, 
+            # so try to greedily find a backup stage for the executor
             self._try_backup_schedule(executor)
         elif stage not in job.frontier_stages:
             # stage's parents haven't completed yet
@@ -624,11 +622,7 @@ class SparkSchedSimEnv(Env):
             )
 
         # executor source may need to be updated
-        self._update_executor_source(
-            stage, 
-            had_commitment, 
-            did_job_frontier_change
-        )
+        self._update_executor_source(stage, had_commitment, did_job_frontier_change)
 
 
 
@@ -766,11 +760,7 @@ class SparkSchedSimEnv(Env):
         assert executor.is_free
         assert executor.job_id != stage.job_id
 
-        self.exec_state.move_executor_to_pool(
-            executor.id_, 
-            stage.pool_key, 
-            send=True
-        )
+        self.exec_state.move_executor_to_pool(executor.id_, stage.pool_key, send=True)
 
         if executor.job_id is not None:
             old_job = self.jobs[executor.job_id]
@@ -846,6 +836,11 @@ class SparkSchedSimEnv(Env):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
         print(f'job {job.id_} completed at time {self.wall_time*1e-3:.1f}s')
+
+        if len(self.exec_state._pools[job.pool_key]) > 0:
+            self._move_free_executors(job.pool_key)
+
+        assert len(self.exec_state._pools[job.pool_key]) == 0
         
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids.add(job.id_)
@@ -887,12 +882,15 @@ class SparkSchedSimEnv(Env):
 
 
 
-    def _get_free_source_executors(self):
-        source_executor_ids = self.exec_state.get_source_executors()
+    def _get_free_source_executors(self, pool_key=None):
+        if not pool_key:
+            executor_ids = self.exec_state.get_source_executors()
+        else:
+            executor_ids = self.exec_state._pools[pool_key]
 
         free_executor_ids = set((
             executor_id
-            for executor_id in iter(source_executor_ids)
+            for executor_id in iter(executor_ids)
             if self.executors[executor_id].is_free
         ))
 
@@ -931,7 +929,7 @@ class SparkSchedSimEnv(Env):
             return # don't move executors
 
         if executor_ids is None:
-            executor_ids = list(self._get_free_source_executors())
+            executor_ids = list(self._get_free_source_executors(src_pool_key))
         assert len(executor_ids) > 0
 
         job_id, stage_id = src_pool_key
@@ -989,8 +987,7 @@ class SparkSchedSimEnv(Env):
             self._send_executor(executor, stage)
             return
 
-        self.exec_state.move_executor_to_pool(
-            executor.id_, stage.pool_key)
+        self.exec_state.move_executor_to_pool(executor.id_, stage.pool_key)
 
         job = self.jobs[stage.job_id]
         if stage in job.frontier_stages:
@@ -1015,9 +1012,11 @@ class SparkSchedSimEnv(Env):
             return local_stages.pop()
 
         # now, try searching all other jobs
-        other_job_ids = \
-            [job_id for job_id in iter(self.active_job_ids)
-             if job_id != executor.job_id]
+        other_job_ids = [
+            job_id 
+            for job_id in iter(self.active_job_ids)
+            if job_id != executor.job_id
+        ]
         
         other_stages = \
             self._find_schedulable_stages(

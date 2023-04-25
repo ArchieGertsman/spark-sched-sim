@@ -87,46 +87,40 @@ class VPG(BaseAlg):
 
         self.agent.optim.zero_grad()
 
-        num_samples = 0
-        policy_loss_tot = 0.
-        entropy_loss_tot = 0.
+        # policy_loss_tot = 0.
+        # entropy_loss_tot = 0.
+        # value_loss_tot = 0.
+
+        policy_losses = []
+        entropy_losses = []
+        value_losses = []
 
         gen = zip(obsns_list, actions_list, returns_list, baselines_list, lgprobs_list)
         for obsns, actions, returns, baselines, old_lgprobs in gen:
-            num_samples += len(obsns)
             obsns = collate_obsns(obsns)
             actions = torch.tensor([list(act.values()) for act in actions])
             adv = torch.from_numpy(returns - baselines).float()
-            # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
             with torch.no_grad():
                 old_lgprobs = torch.tensor(old_lgprobs)
-                # diff = (1e-3 + 1e-7 * np.abs(old_lgprobs)) - torch.abs(lgprobs - old_lgprobs)
-                # print('DIFF', (diff < 0).sum().item(), diff.numel(), flush=True)
                 assert lgprobs.allclose(old_lgprobs)
 
-            policy_loss = -(lgprobs * adv).sum()
-            policy_loss_tot += policy_loss.item()
+            policy_loss = -(lgprobs * adv).mean()
+            policy_losses += [policy_loss.item()]
 
-            entropy_loss = -entropies.sum()
-            entropy_loss_tot += entropy_loss.item()
+            entropy_loss = -entropies.mean()
+            entropy_losses += [entropy_loss.item()]
 
-            loss = policy_loss + self.entropy_weight * entropy_loss # + .001 * logit_loss
+            value_losses += [(adv ** 2).mean().item()]
+
+            loss = policy_loss + self.entropy_weight * entropy_loss
             loss.backward()
-
-        # torch.nn.utils.clip_grad_norm_(
-        #     self.agent.actor.parameters(), 
-        #     .5,
-        #     error_if_nonfinite=True
-        # )
 
         self.agent.optim.step()
 
-        # for buff, rewards, times in zip(rollout_buffers, rewards_list, wall_times_list):
-        #     buff.sum_rewards = np.sum(rewards) / (times[-1] / (1e3 * 60))
-
-        return policy_loss_tot / num_samples, \
-               entropy_loss_tot / num_samples, \
-               0, \
+        return np.mean(policy_losses), \
+               np.mean(entropy_losses), \
+               np.mean(value_losses), \
                0

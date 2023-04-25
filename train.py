@@ -12,10 +12,10 @@ if __name__ == '__main__':
 
     VPG(
         env_kwargs,
-        num_iterations=1,
-        num_envs=4,
+        num_iterations=12000,
+        num_envs=16,
         log_dir='ignore/log/proc',
-        # summary_writer_dir='ignore/log/train/', 
+        summary_writer_dir='ignore/log/train/', 
         model_save_dir='ignore/models',
         optim_lr=.001,
         entropy_weight_init=1.,

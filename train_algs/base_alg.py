@@ -19,9 +19,7 @@ from .utils.device import device
 
 
 class BaseAlg(ABC):
-    '''Base class for training algorithms, which must
-    implement the abstract `_compute_loss` method
-    '''
+    '''Base class for training algorithms, which must implement the abstract `_learn_from_rollouts` method'''
 
     def __init__(
         self,
@@ -64,8 +62,6 @@ class BaseAlg(ABC):
         self.entropy_weight_decay = entropy_weight_decay
         self.entropy_weight_min = entropy_weight_min
 
-        # computes differential returns by default, which is
-        # helpful for maximizing average returns
         self.return_calc = ReturnsCalculator()
         self.gamma = gamma
 
@@ -87,34 +83,31 @@ class BaseAlg(ABC):
         self.procs = []
         self.conns = []
 
-        self.num_job_arrivals = 20
+        # # increases over iterations
+        # self.num_job_arrivals = 50
+
+        # self.mean_interarrival_time = 1 / env_kwargs['job_arrival_rate']
 
 
 
     def train(self) -> None:
         '''trains the model on different job arrival sequences. 
-        For each job sequence, 
+        For each job sequence:
         - multiple rollouts are collected in parallel, asynchronously
-        - the rollouts are gathered at the center, where model parameters
-            are updated, and
+        - the rollouts are gathered at the center, where model parameters are updated, and
         - new model parameters are scattered to the rollout executors
         '''
 
         self._setup()
 
         for i in range(self.num_iterations):
-            max_time = 1e6
-            # max_time = self.np_random_max_time.geometric(1/self.max_time_mean)
-            # max_time = self.np_random_max_time.triangular(0, 0, 2.5*self.max_time_mean)
-            # max_time = 1e6
+            max_time = self.np_random_max_time.geometric(1/self.max_time_mean)
+            max_time = max(max_time, 1e5)
+            # max_time = self.np_random_max_time.triangular(1e5, 1e5, 2.5*self.max_time_mean)
 
-            # max_time = np.inf
+            # max_time ~ Erlang(num_arrivals, mean_interarrival_time)
+            # max_time = self.np_random_max_time.gamma(self.num_job_arrivals, self.mean_interarrival_time)
             # max_time = 1e6
-            # num_job_arrivals = self.np_random_max_time.randint(
-            #     self.num_job_arrivals // 2,
-            #     min(self.num_job_arrivals * 2, 201)
-            # )
-            # num_job_arrivals = 30
 
             self._log_iteration_start(i, max_time)
 
@@ -125,14 +118,11 @@ class BaseAlg(ABC):
             
             # scatter
             env_seed = i
-            env_options = {
-                'max_wall_time': max_time #,
-                # 'num_job_arrivals': 20
-            }
+            env_options = {'max_wall_time': max_time}
             N = self.num_envs # // 2
             for j, conn in enumerate(self.conns):
-                # env_seed = i * N + (j % N)
                 env_seed = i
+                # env_seed = i * N + (j % N)
                 # env_seed = 4*i + int(4 * (j / self.num_envs))
                 conn.send((
                     actor_sd, 
@@ -168,8 +158,8 @@ class BaseAlg(ABC):
                     ep_lens[:N],
                     max_time,
                     approx_kl_div,
-                    value_loss,
-                    [buff.norm_return for buff in rollout_buffers if buff]
+                    value_loss#,
+                    # [buff.norm_return for buff in rollout_buffers if buff]
                 )
 
             self._update_vars(i)
@@ -190,19 +180,17 @@ class BaseAlg(ABC):
 
 
     def _setup(self) -> None:
-        # torch.autograd.set_detect_anomaly(True)
-
+        # logging
         shutil.rmtree(self.log_dir, ignore_errors=True)
         os.mkdir(self.log_dir)
         sys.stdout = open(f'{self.log_dir}/main.out', 'a')
+        self.summary_writer = SummaryWriter(self.summary_writer_path) \
+            if self.summary_writer_path else None
         
+        # torch
         print('cuda available:', torch.cuda.is_available())
-
         torch.multiprocessing.set_start_method('forkserver')
-        
-        self.summary_writer = None
-        if self.summary_writer_path:
-            self.summary_writer = SummaryWriter(self.summary_writer_path)
+        # torch.autograd.set_detect_anomaly(True)
 
         self.agent.build(device)
 
@@ -215,6 +203,8 @@ class BaseAlg(ABC):
 
         if self.summary_writer:
             self.summary_writer.close()
+
+        print('training complete.', flush=True)
 
 
 
@@ -269,25 +259,25 @@ class BaseAlg(ABC):
         ep_lens: list[int],
         max_time: float,
         approx_kl_div: float,
-        value_loss: float,
-        returns
+        value_loss: float #,
+        # returns
     ) -> None:
 
         episode_stats = {
             'avg job duration': np.mean([x for x in avg_job_durations if x is not None]),
-            'max wall time': max_time * 1e-3,
-            'completed jobs count': np.mean([x for x in completed_job_counts if x is not None]),
-            'job arrival count': np.mean([x for x in job_arrival_counts if x is not None]),
-            # 'avg num jobs': np.mean([x for x in avg_num_jobs if x is not None]),
-            # 'norm. -return': -np.mean(returns),
-            'rolling avg num jobs': -self.return_calc.avg_num_jobs,
+            'rolling avg num jobs': self.return_calc.avg_num_jobs,
             'policy loss': policy_loss,
             'entropy': entropy_loss,
+            'max time': max_time * 1e-3,
             'episode length': np.mean(ep_lens),
-            'max time mean': self.max_time_mean * 1e-3,
+            'completed jobs count': np.mean([x for x in completed_job_counts if x is not None]),
+            'job arrival count': np.mean([x for x in job_arrival_counts if x is not None]),
             'entropy weight': self.entropy_weight,
+            'value loss': value_loss
+            # 'avg num jobs': np.mean([x for x in avg_num_jobs if x is not None]),
+            # 'norm. -return': -np.mean(returns),
+            # 'max time mean': self.max_time_mean * 1e-3,
             # 'KL div': approx_kl_div,
-            # 'value loss': value_loss
         }
 
         for name, stat in episode_stats.items():
@@ -296,14 +286,14 @@ class BaseAlg(ABC):
 
 
     def _update_vars(self, iteration) -> None:
-        # geometrically increase the mean episode duration
+        # # geometrically increase the mean episode duration
         self.max_time_mean = min(
             self.max_time_mean * self.max_time_mean_growth, 
             self.max_time_mean_ceil
         )
 
-        if (iteration+1) % 10 == 0:
-            self.num_job_arrivals += 1
+        # if (iteration+1) % 50 == 0:
+        #     self.num_job_arrivals += 20
 
         # geometrically decrease the entropy weight
         self.entropy_weight = max(

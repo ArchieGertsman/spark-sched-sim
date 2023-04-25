@@ -1,6 +1,5 @@
 from typing import List, Optional
 
-from scipy.signal import lfilter
 import numpy as np
 
 
@@ -9,9 +8,9 @@ class ReturnsCalculator:
     def __init__(self):
         self.work_buff = []
         self.dt_buff = []
-        self.total_work = 0
-        self.total_time = 0
-        self.buffer_cap = 100000
+        self.total_work = 0 # sum of work buffer
+        self.total_time = 0 # sum of dt buffer
+        self.buff_cap = int(1e5)
         # self.avg_num_jobs = 0.
         # self.alpha = 1.
         # self.min_alpha = .08
@@ -28,40 +27,65 @@ class ReturnsCalculator:
 
     @property
     def avg_num_jobs(self):
+        '''estimate of the long-run average number of jobs in the system under the current policy'''
         return self.total_work / self.total_time
     
 
 
-    def calculate(self, 
+    def calculate(
+        self, 
         rewards_list: List[np.ndarray], 
         times_list: Optional[List[np.ndarray]] = None
     ) -> List[np.ndarray]:
 
         deltas_list = self._get_dt_list(times_list)
-
-        for rewards, deltas in zip(rewards_list, deltas_list):
-            for rew, dt in zip(rewards, deltas):
-                if dt == 0:
-                    continue
-                self.work_buff += [rew]
-                self.dt_buff += [dt]
-                self.total_work += rew
-                self.total_time += dt
-                if len(self.work_buff) > self.buffer_cap:
-                    self.total_work -= self.work_buff.pop(0)
-                    self.total_time -= self.dt_buff.pop(0)
+        self._update_buffers(rewards_list, deltas_list)
 
         diff_returns_list = []
-        for work, deltas in zip(rewards_list, deltas_list):
-            diff_returns = np.zeros_like(work)
+        for rew, deltas in zip(rewards_list, deltas_list):
+            diff_returns = np.zeros(len(rew))
             dr = 0
             for t in reversed(range(len(deltas))):
-                dr = work[t] - deltas[t] * self.avg_num_jobs + dr
+                work = -rew[t]
+                avg_work = deltas[t] * self.avg_num_jobs
+                diff_rew = -(work - avg_work)
+                dr = diff_rew + dr
                 diff_returns[t] = dr
             diff_returns_list += [diff_returns * 1e-5]
 
         return diff_returns_list
+    
 
+
+    @classmethod
+    def _get_dt_list(cls, times_list):
+        dt_list = []
+        for ts in times_list:
+            ts = np.concatenate([np.array([0.]), ts])
+            dt = ts[1:] - ts[:-1]
+            dt_list += [dt]
+        return dt_list
+    
+
+
+    def _update_buffers(self, rewards_list, deltas_list):
+        for rewards, deltas in zip(rewards_list, deltas_list):
+            for rew, dt in zip(rewards, deltas):
+                if dt == 0:
+                    continue
+
+                work = -rew
+                self.work_buff += [work]
+                self.total_work += work
+
+                self.dt_buff += [dt]
+                self.total_time += dt
+
+                if len(self.work_buff) > self.buff_cap:
+                    # discard old data
+                    self.total_work -= self.work_buff.pop(0)
+                    self.total_time -= self.dt_buff.pop(0)
+        
 
 
 
@@ -124,12 +148,3 @@ class ReturnsCalculator:
     #     self.avg_num_jobs += self.alpha * (new_avg - self.avg_num_jobs)
     #     self.alpha = max(self.alpha_scale * self.alpha, self.min_alpha)
 
-
-    @classmethod
-    def _get_dt_list(cls, times_list):
-        dt_list = []
-        for ts in times_list:
-            ts = np.concatenate([np.array([0.]), ts])
-            dt = ts[1:] - ts[:-1]
-            dt_list += [dt]
-        return dt_list

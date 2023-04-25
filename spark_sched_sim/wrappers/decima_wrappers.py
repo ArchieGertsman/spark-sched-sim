@@ -35,6 +35,7 @@ class DecimaObsWrapper(ObservationWrapper):
             'edge_mask_batch': MultiBinary((1,1))
         })
 
+        # cache message passing data, because it doesn't always change between observations
         self.num_nodes = -1
         self.edge_links = None
         self.edge_mask_batch = None
@@ -61,8 +62,9 @@ class DecimaObsWrapper(ObservationWrapper):
         nodes[:, 2] = np.repeat(executor_counts, num_nodes_per_dag) / self.num_executors
 
         num_remaining_tasks = obs['dag_batch']['data'].nodes[:, 0]
-        most_recent_duration = obs['dag_batch']['data'].nodes[:, 1]
         nodes[:, 3] = num_remaining_tasks / 200
+
+        most_recent_duration = obs['dag_batch']['data'].nodes[:, 1]
         nodes[:, 4] = num_remaining_tasks * most_recent_duration * 1e-5
 
         edge_links = obs['dag_batch']['data'].edge_links

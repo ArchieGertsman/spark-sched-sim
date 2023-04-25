@@ -140,6 +140,8 @@ def rollout_worker(
             num_completed_jobs = None
             num_job_arrivals = None
 
+        # print('ROUND LENS', env.unwrapped.round_lens, flush=True)
+
             
             
         #     rbh = \
@@ -155,23 +157,25 @@ def rollout_worker(
         #     print(job.query_size, job.query_num)
 
 
-        if rba:
-            ts = np.concatenate([np.array([0.]), rba.wall_times])
-            dt = ts[1:] - ts[:-1]
+        # if rba:
+        #     ts = np.concatenate([np.array([0.]), rba.wall_times])
+        #     dt = ts[1:] - ts[:-1]
+        #     # print('DT', dt.astype(int), flush=True)
+        #     np.save(f'{log_dir}/{rank}_dt.npy', dt.astype(int))
 
             # for i in range(200):
             #     print(dt[i])
-            print('BRUH', dt.mean(), dt.std(), flush=True)
+        #     # print('BRUH', dt.mean(), dt.std(), flush=True)
 
-            tau = 2e-5
-            rba.returns = np.zeros(len(rba))
-            r = 0
-            for t in reversed(range(len(rba))):
-                r = rba.rewards[t] + np.exp(-tau * dt[t]) * r
-                rba.returns[t] = r
+        #     tau = 2e-5
+        #     rba.returns = np.zeros(len(rba))
+        #     r = 0
+        #     for t in reversed(range(len(rba))):
+        #         r = rba.rewards[t] + np.exp(-tau * dt[t]) * r
+        #         rba.returns[t] = r
 
-            t_disc = (1 - np.exp(-tau * rba.wall_times[-1])) / tau
-            rba.norm_return = rba.returns[0] / t_disc
+        #     t_disc = (1 - np.exp(-tau * rba.wall_times[-1])) / tau
+        #     rba.norm_return = rba.returns[0] / t_disc
 
             
         # returns = []
