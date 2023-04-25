@@ -83,21 +83,24 @@ class DecimaScheduler(BaseScheduler):
         '''
         dag_batch, stage_to_job_map = graph_utils.obs_to_pyg(obs)
         dag_batch.to(self.device, non_blocking=True)
-        outputs = self.actor(dag_batch)
-        stage_scores, prlsm_lim_scores = [out.cpu() for out in outputs]
+        self.actor.embedding_forward(dag_batch)
 
-        # mask out invalid actions
+        stage_scores = self.actor.stage_forward().cpu()
         schedulable_stage_mask = torch.tensor(obs['schedulable_stage_mask'], dtype=bool)
-        valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
-        self._apply_mask(stage_scores, schedulable_stage_mask)
-        self._apply_mask(prlsm_lim_scores, valid_prlsm_lim_mask)
+        stage_idx, stage_lgprob = self._masked_sample(stage_scores, schedulable_stage_mask)
+        job_idx = stage_to_job_map[stage_idx]
 
-        action, lgprob = self._sample_action(
-            stage_scores, 
-            prlsm_lim_scores, 
-            stage_to_job_map, 
-            greedy
-        )
+        prlsm_lim_scores = self.actor.prlsm_lim_forward(job_idx).cpu()
+        valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
+        prlsm_lim, prlsm_lim_lgprob = self._masked_sample(prlsm_lim_scores, valid_prlsm_lim_mask[job_idx])
+
+        action = {
+            'stage_idx': stage_idx.item(),
+            'job_idx': job_idx.item(),
+            'prlsm_lim': prlsm_lim.item()
+        }
+
+        lgprob = stage_lgprob + prlsm_lim_lgprob
 
         return action, lgprob
 
@@ -110,44 +113,39 @@ class DecimaScheduler(BaseScheduler):
     ) -> tuple[Tensor, Tensor]:
         # save CPU copies of some bookkeeping attributes
         obs_ptr = obsns.dag_batch['obs_ptr']
-        job_ptr = obsns.dag_batch.ptr
         num_nodes_per_obs = obsns.dag_batch['num_nodes_per_obs']
-
-        # compute on GPU, then move outputs to CPU
-        obsns.dag_batch.to(self.device)
-        model_outputs = self.actor(obsns.dag_batch)
-        stage_scores, prlsm_lim_scores = [out.cpu() for out in model_outputs]
-
-        self._apply_mask(stage_scores, obsns.schedulable_stage_masks)
-        self._apply_mask(prlsm_lim_scores, obsns.valid_prlsm_lim_masks)
 
         # split columns of `actions` into separate tensors
         # NOTE: columns need to be cloned to avoid in-place operation
         stage_selections, job_selections, prlsm_lim_selections = [col.clone() for col in actions.T]
+        job_idx = job_selections + obs_ptr[:-1]
 
-        all_stage_probs, stage_lgprobs, stage_entropies = \
+        # compute on GPU, then move outputs to CPU
+        obsns.dag_batch.to(self.device)
+        self.actor.embedding_forward(obsns.dag_batch)
+        stage_scores = self.actor.stage_forward()
+        prlsm_lim_scores = self.actor.prlsm_lim_forward(job_idx)
+
+        stage_scores = self._apply_mask(stage_scores.cpu(), obsns.schedulable_stage_masks)
+        prlsm_lim_scores = self._apply_mask(prlsm_lim_scores.cpu(), obsns.valid_prlsm_lim_masks[job_idx])
+
+        stage_lgprobs, stage_entropies = \
             self._evaluate_node_actions(
-                stage_scores,
-                stage_selections,
+                stage_scores.cpu(), 
+                stage_selections, 
                 num_nodes_per_obs
             )
-
-        # prob job selected = sum(prob stage is selected for stage in job)
-        job_probs = segment_csr(all_stage_probs, job_ptr)
         
-        prlsm_lim_lgprobs, expected_prlsm_lim_entropies = \
-            self._evaluate_dag_actions(
-                prlsm_lim_scores, 
-                prlsm_lim_selections,
-                job_selections, 
-                job_probs,
-                obs_ptr
+        prlsm_lim_lgprobs, prlsm_lim_entropies = \
+            self._evaluate(
+                prlsm_lim_scores.cpu(), 
+                prlsm_lim_selections
             )
 
         # aggregate the evaluations for nodes and dags
         action_lgprobs = stage_lgprobs + prlsm_lim_lgprobs
 
-        action_entropies = stage_entropies + expected_prlsm_lim_entropies
+        action_entropies = stage_entropies + prlsm_lim_entropies
         action_entropies /= (self.num_executors * num_nodes_per_obs).log()
 
         return action_lgprobs, action_entropies
@@ -182,39 +180,23 @@ class DecimaScheduler(BaseScheduler):
     def _apply_mask(cls, t: Tensor, msk: Tensor) -> Tensor:
         '''masks model outputs in-place'''
         min_real = torch.finfo(t.dtype).min
-        t.masked_fill_(~msk, min_real)
+        return t.masked_fill(~msk, min_real)
 
 
 
     @classmethod
-    def _sample_action(cls, stage_scores, all_prlsm_lim_scores, stage_to_job_map, greedy):
-        # sample next stage to schedule
-        c_stage = Categorical(logits=stage_scores)
-        if greedy:
-            stage_idx = torch.argmax(stage_scores)
-        else:
-            stage_idx = c_stage.sample()
-        lgprob_stage = c_stage.log_prob(stage_idx)
+    def _masked_sample(cls, logits, mask):
+        logits = cls._apply_mask(logits, mask)
+        c = Categorical(logits=logits)
+        samp = c.sample()
+        lgprob = c.log_prob(samp)
+        return samp, lgprob
+    
 
-        # sample the parallelism limit, conditioned on the selected stage's job
-        job_idx = stage_to_job_map[stage_idx]
-        prlsm_lim_scores = all_prlsm_lim_scores[job_idx]
-        c_pl = Categorical(logits=prlsm_lim_scores)
-        if greedy:
-            prlsm_lim = torch.argmax(prlsm_lim_scores, dim=-1)
-        else:
-            prlsm_lim = c_pl.sample()
-        lgprob_pl = c_pl.log_prob(prlsm_lim)
-
-        lgprob = lgprob_stage + lgprob_pl
-
-        act = {
-            'stage_idx': stage_idx.item(),
-            'job_idx': job_idx.item(),
-            'prlsm_lim': prlsm_lim.item()
-        }
-        
-        return act, lgprob.item()
+    @classmethod
+    def _evaluate(cls, logits, selections):
+        c = Categorical(logits=logits)
+        return c.log_prob(selections), c.entropy()
 
 
 
@@ -254,21 +236,8 @@ class DecimaScheduler(BaseScheduler):
                     output, shape (num_actions,)
         '''
 
-        def _eval_node_actions(node_scores, node_selections):
-            c = Categorical(logits=node_scores)
-            node_lgprobs = c.log_prob(node_selections)
-            node_entropies = c.entropy()
-            return c.probs, node_lgprobs, node_entropies
-
         node_scores_split, node_selections_split, node_counts = \
-            cls._split_node_experience(
-                all_node_scores, 
-                all_node_selections, 
-                num_nodes_per_obs
-            )
-
-        # probability of each node getting selected; size = len(all_node_scores)
-        all_node_probs = []
+            cls._split_node_experience(all_node_scores, all_node_selections, num_nodes_per_obs)
 
         # log-probability of each node selection; size = len(all_node_selections)
         node_lgprobs = []
@@ -281,19 +250,12 @@ class DecimaScheduler(BaseScheduler):
         for node_scores, node_selections, node_count in gen:
             node_scores = node_scores.view(-1, node_count)
 
-            all_probs, lgprobs, entropies = _eval_node_actions(node_scores, node_selections)
+            lgprobs, entropies = cls._evaluate(node_scores, node_selections)
 
-            all_node_probs += [torch.flatten(all_probs)]
             node_lgprobs += [lgprobs]
             node_entropies += [entropies]
 
-        ## collate results
-        all_node_probs = torch.cat(all_node_probs)
-        node_lgprobs = torch.cat(node_lgprobs)
-        node_entropies = torch.cat(node_entropies)
-        # node_entropies /= 1 + torch.log(num_nodes_per_obs) # normalize
-
-        return all_node_probs, node_lgprobs, node_entropies
+        return torch.cat(node_lgprobs), torch.cat(node_entropies)
 
 
 
@@ -334,35 +296,6 @@ class DecimaScheduler(BaseScheduler):
 
 
 
-    def _evaluate_dag_actions(
-        self,
-        all_prlsm_lim_scores, 
-        prlsm_lim_selections,
-        job_selections, 
-        job_probs,
-        obs_ptr
-    ):
-        # distribution over parallelism limits, conditioned on each sample's selected job
-        job_selections += obs_ptr[:-1]
-        c = Categorical(logits=all_prlsm_lim_scores[job_selections])
-        prlsm_lim_lgprobs = c.log_prob(prlsm_lim_selections)
-
-        # can't have rows where all the entries are
-        # -inf when computing entropy, so for all such 
-        # rows, set the first entry to be 0. then the 
-        # entropy for these rows becomes 0.
-        inf_counts = torch.isinf(all_prlsm_lim_scores).sum(1)
-        allinf_rows = (inf_counts == all_prlsm_lim_scores.shape[1])
-        all_prlsm_lim_scores[allinf_rows, 0] = 0
-
-        all_prlsm_lim_entropies = Categorical(logits=all_prlsm_lim_scores).entropy()
-        expected_prlsm_lim_entropies = segment_csr(job_probs * all_prlsm_lim_entropies, obs_ptr)
-        # expected_prlsm_lim_entropies /= np.log(self.num_executors) # normalize
-        
-        return prlsm_lim_lgprobs, expected_prlsm_lim_entropies
-
-
-
 
 class ActorNetwork(nn.Module):
     
@@ -374,23 +307,36 @@ class ActorNetwork(nn.Module):
         for name, param in self.named_parameters():
             if 'bias' in name:
                 param.data.zero_()
-        
 
-        
-    def forward(self, dag_batch: Batch):
+        self.state = {}
+
+
+
+    def embedding_forward(self, dag_batch):
+        assert self.state == {}
         dag_batch['num_nodes_per_dag'] = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
 
-        node_embeddings, dag_summaries, global_summaries = self.encoder(dag_batch)
+        self.state['dag_batch'] = dag_batch
+        (self.state['node_embeddings'], 
+         self.state['dag_summaries'], 
+         self.state['global_summaries']) = \
+            self.encoder(dag_batch)
 
-        node_scores, dag_scores = \
-            self.policy_network(
-                dag_batch,
-                node_embeddings, 
-                dag_summaries, 
-                global_summaries
-            )
 
-        return node_scores, dag_scores
+    
+    def stage_forward(self):
+        assert self.state != {}
+        return self.policy_network.stage_forward(**self.state)
+    
+
+
+    def prlsm_lim_forward(self, job_idx):
+        assert self.state != {}
+        prlsm_lim_scores = self.policy_network.prlsm_lim_forward(job_idx, **self.state)
+
+        self.state.clear()
+
+        return prlsm_lim_scores
     
 
 
@@ -500,34 +446,10 @@ class PolicyNetwork(nn.Module):
         self.num_executors = num_executors
         self.mlp_node_score = MLP(5 + (3 * dim_embed), [32, 16, 8, 1], activation_layer=ACT_FN)
         self.mlp_dag_score = MLP(3 + (2 * dim_embed) + 1, [32, 16, 8, 1], activation_layer=ACT_FN)
-        
-
-
-    def forward(
-        self,   
-        dag_batch, 
-        node_embeddings,
-        dag_summaries, 
-        global_summaries
-    ):
-        node_scores = self._compute_node_scores(
-            dag_batch, 
-            node_embeddings, 
-            dag_summaries, 
-            global_summaries
-        )
-
-        dag_scores = self._compute_dag_scores(
-            dag_batch,
-            dag_summaries, 
-            global_summaries
-        )
-
-        return node_scores, dag_scores
 
     
     
-    def _compute_node_scores(
+    def stage_forward(
         self, 
         dag_batch,
         node_embeddings, 
@@ -574,21 +496,27 @@ class PolicyNetwork(nn.Module):
     
     
     
-    def _compute_dag_scores(
+    def prlsm_lim_forward(
         self, 
+        job_idx,
         dag_batch,
         dag_summaries, 
-        global_summaries
+        global_summaries,
+        **kwargs
     ):
         dag_idxs = dag_batch.ptr[:-1]
         dag_features = dag_batch.x[dag_idxs, 0:3]
+        batch_size = job_idx.numel()
 
         executor_actions = torch.arange(self.num_executors) / self.num_executors
-        executor_actions = executor_actions.repeat(dag_batch.num_graphs) \
-                                           .unsqueeze(1) \
-                                           .to(dag_features.device)
+        executor_actions = executor_actions.repeat(batch_size).unsqueeze(1).to(dag_features.device)
 
-        # add skip connection to original dag features
+        dag_features = dag_features[job_idx]
+        dag_summaries = dag_summaries[job_idx]
+        if batch_size == 1:
+            dag_features = dag_features.unsqueeze(0)
+            dag_summaries = dag_summaries.unsqueeze(0)
+
         dag_features_merged = torch.cat([dag_features, dag_summaries], dim=1)
 
         num_total_actions = executor_actions.shape[0]
@@ -599,17 +527,10 @@ class PolicyNetwork(nn.Module):
                 output_size=num_total_actions,
                 dim=0
             )
-        
-        if hasattr(dag_batch, 'num_dags_per_obs'):
-            # batch of observations
-            num_dags_per_obs = dag_batch['num_dags_per_obs']
-        else:
-            # single observation
-            num_dags_per_obs = dag_batch.num_graphs
 
         global_summaries_repeat = \
             global_summaries.repeat_interleave(
-                num_dags_per_obs * self.num_executors, 
+                self.num_executors, 
                 output_size=num_total_actions,
                 dim=0
             )
@@ -625,7 +546,6 @@ class PolicyNetwork(nn.Module):
 
         dag_scores = self.mlp_dag_score(dag_inputs)
 
-        return dag_scores.squeeze(-1) \
-                         .view(dag_batch.num_graphs, self.num_executors)
+        return dag_scores.squeeze(-1).view(batch_size, self.num_executors)
 
     

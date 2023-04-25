@@ -58,7 +58,7 @@ def obs_to_pyg(obs: ObsType) -> Batch:
     # NOTE: `node_to_dag_map` is exactly the `batch` attribute in PyG `Batch`
     # objects, but that attribute is not needed in the forward pass, so it's
     # left out of the `Batch` object and named more descriptively.
-    node_to_dag_map = np.repeat(np.arange(num_active_jobs), num_nodes_per_dag)
+    node_to_dag_map = torch.from_numpy(np.repeat(np.arange(num_active_jobs), num_nodes_per_dag))
 
     x = obs_dag_batch['data'].nodes
     edge_links = obs_dag_batch['data'].edge_links
