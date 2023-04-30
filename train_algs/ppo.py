@@ -139,7 +139,7 @@ class PPO(BaseAlg):
             gen = zip(obsns_list, actions_list, old_lgprobs_list, returns_list, baselines_list)
             for obsns, actions, old_lgprobs, returns, baselines in gen:
                 obsns = collate_obsns(obsns)
-                actions = torch.tensor([list(act.values()) for act in actions])
+                actions = torch.tensor(actions)
                 old_lgprobs = torch.tensor(old_lgprobs)
                 adv = torch.from_numpy(returns - baselines).float()
 

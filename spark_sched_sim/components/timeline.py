@@ -1,27 +1,19 @@
 import heapq
 import itertools
-from typing import NamedTuple, Any
-
-from .job import Job
-from .stage import Stage
-from .task import Task
-from .executor import Executor
+from enum import Enum, auto
+from dataclasses import dataclass
 
 
-# scheduling event objects
+@dataclass
+class TimelineEvent:
+    class Type(Enum):
+        JOB_ARRIVAL = auto()
+        TASK_COMPLETION = auto()
+        EXECUTOR_ARRIVAL = auto()
 
-class JobArrival(NamedTuple):
-    job: Job
-    
+    type: Type
 
-class TaskCompletion(NamedTuple):
-    stage: Stage
-    task: Task
-
-
-class ExecutorArrival(NamedTuple):
-    executor: Executor
-    stage: Stage
+    data: dict
 
 
 

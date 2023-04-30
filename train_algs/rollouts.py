@@ -37,12 +37,12 @@ class RolloutBuffer:
         self.actions += [action]
         self.rewards += [reward]
         self.lgprobs += [lgprob]
-        self.last_obs = None
-        self.values = None
-        self.sd = None
-        self.returns = None
-        self.value_loss = None
-        self.baselines = None
+        # self.last_obs = None
+        # self.values = None
+        # self.sd = None
+        # self.returns = None
+        # self.value_loss = None
+        # self.baselines = None
 
 
     def __len__(self):
@@ -104,7 +104,7 @@ def rollout_worker(
     print('GREEDY:', greedy)
     
     while data := conn.recv():
-        actor_sd, _, env_seed, env_options = data
+        actor_sd, env_seed, env_options = data
 
         print('ENV SEED:', env_seed)
 
@@ -126,6 +126,8 @@ def rollout_worker(
         try:
             with Profiler(), HiddenPrints():
                 rba, obs = collect_rollout(env, agent, greedy, obs)
+
+            print(rba.actions, flush=True)
                 
             avg_job_duration = metrics.avg_job_duration(env) * 1e-3
             avg_num_jobs = metrics.avg_num_jobs(env)
@@ -240,6 +242,7 @@ def rollout_worker(
         # rollout_buffer.value_loss = np.mean(value_losses)
 
         # send rollout buffer and stats to center
+
         conn.send((
             rba,
             avg_job_duration, 
@@ -263,7 +266,7 @@ def collect_rollout(
 
     while not done:
         if isinstance(agent, DecimaScheduler):
-            action, lgprob = agent.schedule(obs, greedy)
+            action, lgprob = agent.schedule(obs)#, greedy)
         else:
             action = agent(obs)
             lgprob = 0
@@ -272,7 +275,7 @@ def collect_rollout(
 
         done = (terminated or truncated)
 
-        rollout_buffer.add(obs, info['wall_time'], action, lgprob, reward)
+        rollout_buffer.add(obs, info['wall_time'], list(action.values()), lgprob, reward)
 
         obs = new_obs
 

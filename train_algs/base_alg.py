@@ -3,6 +3,8 @@ from typing import Optional, Iterable
 import shutil
 import os
 import sys
+from copy import deepcopy
+import json
 
 import numpy as np
 import torch
@@ -35,7 +37,7 @@ class BaseAlg(ABC):
         model_save_freq: int,
         optim_class: torch.optim.Optimizer,
         optim_lr: float,
-        max_grad_norm: float,
+        max_grad_norm: Optional[float],
         gamma: float,
         max_time_mean_init: float,
         max_time_mean_growth: float,
@@ -83,11 +85,6 @@ class BaseAlg(ABC):
         self.procs = []
         self.conns = []
 
-        # # increases over iterations
-        # self.num_job_arrivals = 50
-
-        # self.mean_interarrival_time = 1 / env_kwargs['job_arrival_rate']
-
 
 
     def train(self) -> None:
@@ -100,33 +97,30 @@ class BaseAlg(ABC):
 
         self._setup()
 
-        for i in range(self.num_iterations):
-            max_time = self.np_random_max_time.geometric(1/self.max_time_mean)
-            max_time = max(max_time, 1e5)
-            # max_time = self.np_random_max_time.triangular(1e5, 1e5, 2.5*self.max_time_mean)
+        # every n'th iteration, save the best model from the past n iterations,
+        # where `n = self.model_save_freq`
+        best_state = None
 
-            # max_time ~ Erlang(num_arrivals, mean_interarrival_time)
-            # max_time = self.np_random_max_time.gamma(self.num_job_arrivals, self.mean_interarrival_time)
-            # max_time = 1e6
+        for i in range(self.num_iterations):
+            max_time = self.np_random_max_time.exponential(self.max_time_mean)
+            max_time = max(max_time, 1e5)
 
             self._log_iteration_start(i, max_time)
 
-            actor_sd = self.agent.actor.state_dict()
-            critic_sd = None # self.agent.critic.state_dict()
-            if (i+1) % self.model_save_freq == 0:
-                torch.save(actor_sd, f'{self.model_save_path}/model.pt')
+            actor_sd = deepcopy(self.agent.actor.state_dict())
+            # critic_sd = None # self.agent.critic.state_dict()
             
             # scatter
             env_seed = i
             env_options = {'max_wall_time': max_time}
-            N = self.num_envs # // 2
+            # N = self.num_envs # // 2
             for j, conn in enumerate(self.conns):
                 env_seed = i
                 # env_seed = i * N + (j % N)
                 # env_seed = 4*i + int(4 * (j / self.num_envs))
                 conn.send((
                     actor_sd, 
-                    critic_sd,
+                    # critic_sd,
                     env_seed, 
                     env_options
                 ))
@@ -134,35 +128,53 @@ class BaseAlg(ABC):
             # gather
             (rollout_buffers,
              avg_job_durations,
-             avg_num_jobs,
+             _,
              completed_job_counts,
              job_arrival_counts) = \
                 zip(*[conn.recv() for conn in self.conns])
 
+            # update parameters
             with Profiler():
                 policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
-                self.agent.lr_scheduler.step()
                 torch.cuda.synchronize()
+
+            # check if model is the current best
+            if not best_state or self.return_calc.avg_num_jobs < best_state['avg_num_jobs']:
+                best_state = {
+                    'iteration': i,
+                    'avg_num_jobs': np.round(self.return_calc.avg_num_jobs, 3),
+                    'state_dict': actor_sd,
+                    'max_time': int(max_time * 1e-3),
+                    'max_time_mean': int(self.max_time_mean * 1e-3),
+                    'completed_job_count': int(np.mean(completed_job_counts))
+                }
+
+            if (i+1) % self.model_save_freq == 0:
+                dir = f'{self.model_save_path}/{i+1}'
+                os.mkdir(dir)
+                best_sd = best_state.pop('state_dict')
+                torch.save(best_sd, f'{dir}/model.pt')
+                with open(f'{dir}/state.json', 'w') as fp:
+                    json.dump(best_state, fp)
+                best_state = None
 
             if self.summary_writer:
                 ep_lens = [len(buff) for buff in rollout_buffers if buff]
                 self._write_stats(
                     i,
-                    np.abs(policy_loss),
-                    np.abs(entropy_loss),
-                    avg_job_durations[:N],
-                    avg_num_jobs[:N],
-                    completed_job_counts[:N],
-                    job_arrival_counts[:N],
-                    ep_lens[:N],
+                    policy_loss,
+                    entropy_loss,
+                    value_loss,
+                    avg_job_durations,
+                    completed_job_counts,
+                    job_arrival_counts,
+                    ep_lens,
                     max_time,
-                    approx_kl_div,
-                    value_loss#,
-                    # [buff.norm_return for buff in rollout_buffers if buff]
+                    approx_kl_div
                 )
 
-            self._update_vars(i)
+            self._update_hyperparams(i)
 
         self._cleanup()
 
@@ -186,7 +198,11 @@ class BaseAlg(ABC):
         sys.stdout = open(f'{self.log_dir}/main.out', 'a')
         self.summary_writer = SummaryWriter(self.summary_writer_path) \
             if self.summary_writer_path else None
-        
+
+        # model checkpoints
+        shutil.rmtree(self.model_save_path, ignore_errors=True)
+        os.mkdir(self.model_save_path)
+
         # torch
         print('cuda available:', torch.cuda.is_available())
         torch.multiprocessing.set_start_method('forkserver')
@@ -246,38 +262,37 @@ class BaseAlg(ABC):
         [proc.join() for proc in self.procs]
 
 
-
     def _write_stats(
         self,
         epoch: int,
         policy_loss: float,
         entropy_loss: float,
+        value_loss: float,
         avg_job_durations: list[float],
-        avg_num_jobs,
         completed_job_counts: list[int],
         job_arrival_counts: list[int],
         ep_lens: list[int],
         max_time: float,
-        approx_kl_div: float,
-        value_loss: float #,
+        approx_kl_div: float
+        # avg_num_jobs,
         # returns
     ) -> None:
 
         episode_stats = {
+            'policy loss': np.abs(policy_loss),
+            'entropy': np.abs(entropy_loss),
+            'value loss': value_loss,
             'avg job duration': np.mean([x for x in avg_job_durations if x is not None]),
-            'rolling avg num jobs': self.return_calc.avg_num_jobs,
-            'policy loss': policy_loss,
-            'entropy': entropy_loss,
-            'max time': max_time * 1e-3,
-            'episode length': np.mean(ep_lens),
             'completed jobs count': np.mean([x for x in completed_job_counts if x is not None]),
             'job arrival count': np.mean([x for x in job_arrival_counts if x is not None]),
+            'episode length': np.mean(ep_lens),
+            'max time': max_time * 1e-3,
+            'rolling avg num jobs': self.return_calc.avg_num_jobs,
             'entropy weight': self.entropy_weight,
-            'value loss': value_loss
+            'KL div': approx_kl_div
             # 'avg num jobs': np.mean([x for x in avg_num_jobs if x is not None]),
             # 'norm. -return': -np.mean(returns),
             # 'max time mean': self.max_time_mean * 1e-3,
-            # 'KL div': approx_kl_div,
         }
 
         for name, stat in episode_stats.items():
@@ -285,7 +300,7 @@ class BaseAlg(ABC):
 
 
 
-    def _update_vars(self, iteration) -> None:
+    def _update_hyperparams(self, iteration) -> None:
         # # geometrically increase the mean episode duration
         self.max_time_mean = min(
             self.max_time_mean * self.max_time_mean_growth, 

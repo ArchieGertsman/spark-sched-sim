@@ -51,6 +51,8 @@ class Job:
         # count of stages who have no remaining tasks
         self.saturated_stage_count = 0
 
+        self.init_frontier()
+
 
 
     @property
@@ -154,6 +156,7 @@ class Job:
 
 
     def add_local_executor(self, executor):
+        assert executor.task is None
         self.local_executors.add(executor.id_)
         executor.job_id = self.id_
 
@@ -162,27 +165,4 @@ class Job:
     def remove_local_executor(self, executor):
         self.local_executors.remove(executor.id_)
         executor.job_id = None
-
-
-
-    def assign_executor(self, executor, stage, wall_time):
-        assert stage.num_saturated_tasks < stage.num_tasks
-
-        task = stage.start_on_next_task()
-
-        if stage.num_remaining_tasks == 0:
-            self.saturated_stage_count += 1
-            
-        executor.task = task
-        task.executor_id = executor.id_
-        task.t_accepted = wall_time
-        return task
-
-
-
-    def add_task_completion(self, stage, task, executor, wall_time):
-        assert not stage.completed
-        stage.add_task_completion()
-
         executor.task = None
-        task.t_completed = wall_time

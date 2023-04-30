@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from ..components.timeline import Timeline, JobArrival
+from ..components.timeline import Timeline, TimelineEvent
 from ..components import Job
 
 
@@ -17,14 +17,20 @@ class BaseJobSequenceGen(ABC):
         self.num_init_jobs = num_init_jobs
         self.num_job_arrivals = num_job_arrivals
         self.mean_interarrival_time = 1 / job_arrival_rate
+        self.np_random = None
 
 
 
-    def new_timeline(self, np_random: np.random.RandomState) -> Timeline:
+    def reset(self, np_random: np.random.RandomState):
+        self.np_random = np_random
+
+
+
+    def new_timeline(self) -> Timeline:
         '''Fills timeline with job arrivals, which follow a Poisson process 
         parameterized by `job_arrival_rate`
         '''
-        self.np_random = np_random
+        assert self.np_random
         timeline = Timeline()
 
         # wall time of current arrival
@@ -33,11 +39,17 @@ class BaseJobSequenceGen(ABC):
         for job_id in range(self.num_init_jobs + self.num_job_arrivals):
             if job_id >= self.num_init_jobs:
                 # sample time in ms until next arrival
-                t += np_random.exponential(self.mean_interarrival_time)
-
+                t += self.np_random.exponential(self.mean_interarrival_time)
+                
             job = self.generate_job(job_id, t)
-            timeline.push(t, JobArrival(job))
-        
+            timeline.push(
+                t, 
+                TimelineEvent(
+                    type = TimelineEvent.Type.JOB_ARRIVAL, 
+                    data = {'job': job}
+                )
+            )
+
         return timeline
 
 

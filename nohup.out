@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/arkadiy2/gym-dagsched/train.py", line 13, in <module>
+    VPG(
+  File "/home/arkadiy2/gym-dagsched/train_algs/base_alg.py", line 139, in train
+    self._learn_from_rollouts(rollout_buffers)
+  File "/home/arkadiy2/gym-dagsched/train_algs/vpg.py", line 99, in _learn_from_rollouts
+    assert lgprobs.allclose(torch.tensor(old_lgprobs))
+AssertionError

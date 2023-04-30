@@ -30,7 +30,7 @@ class VPG(BaseAlg):
         model_save_freq: int = 20,
         optim_class: torch.optim.Optimizer = torch.optim.Adam,
         optim_lr: float = 3e-4,
-        max_grad_norm: float = .5,
+        max_grad_norm: Optional[float] = None,
         gamma: float = .99,
         max_time_mean_init: float = np.inf,
         max_time_mean_growth: float = 0.,
@@ -85,42 +85,32 @@ class VPG(BaseAlg):
         returns_list = self.return_calc(rewards_list, wall_times_list)
         baselines_list = compute_baselines(wall_times_list, returns_list)
 
-        self.agent.optim.zero_grad()
-
-        # policy_loss_tot = 0.
-        # entropy_loss_tot = 0.
-        # value_loss_tot = 0.
-
+        total_loss = 0
         policy_losses = []
         entropy_losses = []
-        value_losses = []
 
         gen = zip(obsns_list, actions_list, returns_list, baselines_list, lgprobs_list)
         for obsns, actions, returns, baselines, old_lgprobs in gen:
             obsns = collate_obsns(obsns)
-            actions = torch.tensor([list(act.values()) for act in actions])
-            adv = torch.from_numpy(returns - baselines).float()
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            actions = torch.tensor(actions)
             lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
             with torch.no_grad():
-                old_lgprobs = torch.tensor(old_lgprobs)
-                assert lgprobs.allclose(old_lgprobs)
+                assert lgprobs.allclose(torch.tensor(old_lgprobs))
 
-            policy_loss = -(lgprobs * adv).mean()
+            adv = torch.from_numpy(returns - baselines).float()
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            policy_loss = -(lgprobs * adv).sum()
             policy_losses += [policy_loss.item()]
 
-            entropy_loss = -entropies.mean()
-            entropy_losses += [entropy_loss.item()]
+            entropy_loss = -entropies.sum()
+            entropy_losses += [entropy_loss.item() / adv.numel()]
 
-            value_losses += [(adv ** 2).mean().item()]
+            total_loss += policy_loss + self.entropy_weight * entropy_loss
 
-            loss = policy_loss + self.entropy_weight * entropy_loss
-            loss.backward()
-
-        self.agent.optim.step()
-
+        self.agent.update_parameters(total_loss)
+        
         return np.mean(policy_losses), \
                np.mean(entropy_losses), \
-               np.mean(value_losses), \
+               0, \
                0

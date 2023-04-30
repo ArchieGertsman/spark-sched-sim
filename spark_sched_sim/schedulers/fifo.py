@@ -7,7 +7,7 @@ from .base import HeuristicScheduler
 class FIFOScheduler(HeuristicScheduler):
 
     def __init__(self, num_executors, fair=True):
-        name = 'FIFO ' + ('(fair)' if fair else '(greedy)')
+        name = 'Dynamic Partition' if fair else 'FIFO'
         super().__init__(name)
         self.num_executors = num_executors
         self.fair = fair

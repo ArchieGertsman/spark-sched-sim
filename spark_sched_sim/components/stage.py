@@ -20,14 +20,13 @@ class Stage:
         id: int, 
         job_id: int, 
         num_tasks: int, 
-        task_duration_data: object, 
-        np_random: np.random.RandomState
+        task_duration_data: object
     ):
         self.id_ = id
 
         self.job_id = job_id
 
-        self.task_duration_gen = TaskDurationGen(task_duration_data, np_random)
+        self.task_duration_data = task_duration_data
 
         self.most_recent_duration = self._rough_task_duration(task_duration_data)
 
@@ -100,6 +99,7 @@ class Stage:
 
 
     def start_on_next_task(self):
+        assert self.num_saturated_tasks < self.num_tasks
         task = self.remaining_tasks.pop()
         self.num_remaining_tasks -= 1
         self.num_processing_tasks += 1

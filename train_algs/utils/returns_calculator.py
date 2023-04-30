@@ -10,7 +10,7 @@ class ReturnsCalculator:
         self.dt_buff = []
         self.total_work = 0 # sum of work buffer
         self.total_time = 0 # sum of dt buffer
-        self.buff_cap = int(1e5)
+        self.buff_cap = int(2e5)
         # self.avg_num_jobs = 0.
         # self.alpha = 1.
         # self.min_alpha = .08
@@ -49,9 +49,9 @@ class ReturnsCalculator:
                 work = -rew[t]
                 avg_work = deltas[t] * self.avg_num_jobs
                 diff_rew = -(work - avg_work)
-                dr = diff_rew + dr
+                dr += diff_rew
                 diff_returns[t] = dr
-            diff_returns_list += [diff_returns * 1e-5]
+            diff_returns_list += [diff_returns]
 
         return diff_returns_list
     

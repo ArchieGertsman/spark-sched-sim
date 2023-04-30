@@ -2,18 +2,13 @@ import os
 import shutil
 import sys
 
-
-import pandas as pd
 import numpy as np
 import torch
 from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from spark_sched_sim.wrappers.decima_wrappers import (
-    DecimaObsWrapper,
-    DecimaActWrapper
-)
+from spark_sched_sim.wrappers.decima_wrappers import DecimaObsWrapper, DecimaActWrapper
 from spark_sched_sim.metrics import avg_job_duration
 from train_algs.utils.hidden_prints import HiddenPrints
 from spark_sched_sim.schedulers import DecimaScheduler, FIFOScheduler, CPTScheduler
@@ -24,32 +19,32 @@ def main():
 
     print('testing', flush=True)
 
-    num_tests = 10
+    num_tests = 1
 
     num_executors = 50
 
     # should be greater than the number of epochs the
     # model was trained on, so that the job sequences
     # are unseen
-    base_seed = 500 # NOTE: model does awful on 503
+    base_seed = 0
 
-    model_dir = 'ignore/models'
+    model_dir = 'ignore/models/1000'
     model_name = 'model.pt'
 
     fifo_scheduler = FIFOScheduler(num_executors)
     scpt_scheduler = CPTScheduler(num_executors)
     lcpt_scheduler = CPTScheduler(num_executors, by_shortest=False)
-    decima_scheduler = \
-        DecimaScheduler(
-            num_executors,
-            training_mode=False, 
-            state_dict_path=f'{model_dir}/{model_name}'
-        )
+    # decima_scheduler = \
+    #     DecimaScheduler(
+    #         num_executors,
+    #         training_mode=False, 
+    #         state_dict_path=f'{model_dir}/{model_name}'
+    #     )
 
     env_kwargs = {
         'num_executors': num_executors,
         'num_init_jobs': 1,
-        'num_job_arrivals': 100,
+        'num_job_arrivals': 200,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
@@ -60,9 +55,9 @@ def main():
 
     test_instances = [
         (fifo_scheduler, base_env, num_tests, base_seed),
-        (scpt_scheduler, base_env, num_tests, base_seed),
-        (lcpt_scheduler, base_env, num_tests, base_seed),
-        (decima_scheduler, wrapped_env, num_tests, base_seed)
+        # (scpt_scheduler, base_env, num_tests, base_seed),
+        # (lcpt_scheduler, base_env, num_tests, base_seed),
+        # (decima_scheduler, wrapped_env, num_tests, base_seed)
     ]
 
     # run tests in parallel using multiprocessing
@@ -81,7 +76,7 @@ def main():
 
 
 def test(instance):
-    sys.stdout = open(f'ignore/log/proc1/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc_test/main.out', 'a')
     torch.set_num_threads(1)
 
     sched, env, num_tests, base_seed = instance
@@ -94,7 +89,7 @@ def test(instance):
         with HiddenPrints():
             run_episode(env, sched, base_seed + i)
 
-        result = avg_job_duration(env)*1e-3
+        result = avg_job_duration(env) * 1e-3
         avg_job_durations += [result]
         print(f'{sched.name}: test {i+1}, avj={result:.1f}s', flush=True)
 
@@ -169,10 +164,10 @@ def visualize_results(
 
 
 def setup():
-    shutil.rmtree('ignore/log/proc1/', ignore_errors=True)
-    os.mkdir('ignore/log/proc1/')
+    shutil.rmtree('ignore/log/proc_test/', ignore_errors=True)
+    os.mkdir('ignore/log/proc_test/')
 
-    sys.stdout = open(f'ignore/log/proc1/main.out', 'a')
+    sys.stdout = open(f'ignore/log/proc_test/main.out', 'a')
 
     set_start_method('forkserver')
 

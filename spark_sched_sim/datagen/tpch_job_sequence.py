@@ -15,9 +15,9 @@ NUM_QUERIES = 22
 class TPCHJobSequenceGen(BaseJobSequenceGen):
 
     def generate_job(self, job_id, t_arrival):
+        query_num = 1 + self.np_random.integers(NUM_QUERIES)
         query_size = self.np_random.choice(TPCH_SIZES)
         query_path = f'{QUERY_BASE_PATH}/{query_size}'
-        query_num = 1 + self.np_random.integers(NUM_QUERIES)
         
         adj_matrix = np.load(f'{query_path}/adj_mat_{query_num}.npy', allow_pickle=True)
         task_durations = np.load(f'{query_path}/task_duration_{query_num}.npy', allow_pickle=True).item()
@@ -43,8 +43,7 @@ class TPCHJobSequenceGen(BaseJobSequenceGen):
                 stage_id, 
                 job_id, 
                 num_tasks, 
-                task_duration_data, 
-                self.np_random
+                task_duration_data
             )]
 
         # generate DAG
