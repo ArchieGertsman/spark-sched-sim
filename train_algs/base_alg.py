@@ -38,7 +38,6 @@ class BaseAlg(ABC):
         optim_class: torch.optim.Optimizer,
         optim_lr: float,
         max_grad_norm: Optional[float],
-        gamma: float,
         max_time_mean_init: float,
         max_time_mean_growth: float,
         max_time_mean_ceil: float,
@@ -65,7 +64,6 @@ class BaseAlg(ABC):
         self.entropy_weight_min = entropy_weight_min
 
         self.return_calc = ReturnsCalculator()
-        self.gamma = gamma
 
         self.env_kwargs = env_kwargs
 
@@ -114,7 +112,7 @@ class BaseAlg(ABC):
             
             # scatter
             env_seed = i
-            env_options = {'max_wall_time': max_time}
+            env_options = {'time_limit': max_time}
             for conn in self.conns:
                 env_seed = i
                 conn.send((
@@ -135,7 +133,7 @@ class BaseAlg(ABC):
                 policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
                 
-                # return params to CPU before scattering to rollout workers
+                # return params to CPU before scattering state dict to rollout workers
                 self.agent.actor.cpu()
 
             # check if model is the current best
@@ -150,13 +148,7 @@ class BaseAlg(ABC):
                 }
 
             if (i+1) % self.model_save_freq == 0:
-                dir = f'{self.model_save_path}/{i+1}'
-                os.mkdir(dir)
-                best_sd = best_state.pop('state_dict')
-                torch.save(best_sd, f'{dir}/model.pt')
-                with open(f'{dir}/state.json', 'w') as fp:
-                    json.dump(best_state, fp)
-                best_state = None
+                self._save_best_model(i, best_state)
 
             if self.summary_writer:
                 ep_lens = [len(buff) for buff in rollout_buffers if buff]
@@ -173,7 +165,7 @@ class BaseAlg(ABC):
                     approx_kl_div
                 )
 
-            self._update_hyperparams(i)
+            self._update_hyperparams()
 
         self._cleanup()
 
@@ -207,7 +199,7 @@ class BaseAlg(ABC):
         torch.multiprocessing.set_start_method('forkserver')
         # torch.autograd.set_detect_anomaly(True)
 
-        self.agent.build()
+        self.agent.train()
 
         self._start_rollout_workers()
 
@@ -229,6 +221,17 @@ class BaseAlg(ABC):
         if max_time < np.inf:
             print_str += f' (max wall time = {max_time*1e-3:.1f}s)'
         print(print_str, flush=True)
+
+
+
+    def _save_best_model(self, i, best_state):
+        dir = f'{self.model_save_path}/{i+1}'
+        os.mkdir(dir)
+        best_sd = best_state.pop('state_dict')
+        torch.save(best_sd, f'{dir}/model.pt')
+        with open(f'{dir}/state.json', 'w') as fp:
+            json.dump(best_state, fp)
+        best_state = None
 
 
 
@@ -293,14 +296,14 @@ class BaseAlg(ABC):
 
 
 
-    def _update_hyperparams(self, iteration) -> None:
+    def _update_hyperparams(self) -> None:
         # geometrically increase the mean episode duration
         self.max_time_mean = min(
             self.max_time_mean * self.max_time_mean_growth, 
             self.max_time_mean_ceil
         )
 
-        # geometrically decrease the entropy weight
+        # arithmetically decrease the entropy weight
         self.entropy_weight = max(
             self.entropy_weight - self.entropy_weight_decay,
             self.entropy_weight_min

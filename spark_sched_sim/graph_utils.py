@@ -1,12 +1,10 @@
-from typing import NamedTuple
 from torch import Tensor
 from gymnasium.core import ObsType
 from numpy import ndarray
 
 import numpy as np
 import torch
-from torch_geometric.data import Data, Batch
-from torch_geometric.data.collate import collate
+from torch_geometric.data import Data, Batch, collate as pyg_collate
 from torch_scatter import segment_csr
 import networkx as nx
 
@@ -48,17 +46,17 @@ def subgraph(edge_links: ndarray, node_mask: ndarray) -> ndarray:
 
 
 
-def obs_to_pyg(obs: ObsType) -> Batch:
+def obs_to_torch(obs: ObsType) -> Batch:
     '''converts an env observation to a PyG `Batch` object'''
     obs_dag_batch = obs['dag_batch']
     ptr = np.array(obs_dag_batch['ptr'])
     num_nodes_per_dag = ptr[1:] - ptr[:-1]
     num_active_jobs = len(num_nodes_per_dag)
 
-    # NOTE: `node_to_dag_map` is exactly the `batch` attribute in PyG `Batch`
+    # NOTE: `stage_to_job_map` is exactly the `batch` attribute in PyG `Batch`
     # objects, but that attribute is not needed in the forward pass, so it's
     # left out of the `Batch` object and named more descriptively.
-    node_to_dag_map = torch.from_numpy(np.repeat(np.arange(num_active_jobs), num_nodes_per_dag))
+    stage_to_job_map = torch.from_numpy(np.repeat(np.arange(num_active_jobs), num_nodes_per_dag))
 
     x = obs_dag_batch['data'].nodes
     edge_links = obs_dag_batch['data'].edge_links
@@ -69,24 +67,23 @@ def obs_to_pyg(obs: ObsType) -> Batch:
         _num_graphs=num_active_jobs
     )
     dag_batch['edge_mask_batch'] = torch.from_numpy(obs['edge_mask_batch'])
+    dag_batch['num_nodes_per_dag'] = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
 
-    return dag_batch, node_to_dag_map
-
-
-
-class ObsBatch(NamedTuple):
-    dag_batch: Batch
-    schedulable_stage_masks: Tensor
-    valid_prlsm_lim_masks: Tensor
-
+    return {
+        'dag_batch': dag_batch,
+        'stage_mask': torch.tensor(obs['stage_mask'], dtype=bool),
+        'exec_mask': torch.from_numpy(obs['exec_mask']),
+        'stage_to_job_map': stage_to_job_map
+    }
 
 
-def collate_obsns(obsns: list[ObsType]) -> ObsBatch:
-    dag_batches, schedulable_stage_masks, valid_prlsm_lim_masks, edge_mask_batches = zip(*(
+
+def collate_obsns(obsns: list[ObsType]):
+    dag_batches, stage_masks, exec_masks, edge_mask_batches = zip(*(
         (
             obs['dag_batch'], 
-            obs['schedulable_stage_mask'], 
-            obs['valid_prlsm_lim_mask'],
+            obs['stage_mask'], 
+            obs['exec_mask'],
             obs['edge_mask_batch']
         ) 
         for obs in obsns
@@ -96,14 +93,11 @@ def collate_obsns(obsns: list[ObsType]) -> ObsBatch:
     dag_batch['edge_mask_batch'] = \
         collate_edge_mask_batches(edge_mask_batches, dag_batch.edge_index.shape[1])
 
-    schedulable_stage_masks = torch.from_numpy(np.concatenate(schedulable_stage_masks).astype(bool))
-    valid_prlsm_lim_masks = torch.from_numpy(np.vstack(valid_prlsm_lim_masks))
-
-    return ObsBatch(
-        dag_batch, 
-        schedulable_stage_masks, 
-        valid_prlsm_lim_masks
-    )
+    return {
+        'dag_batch': dag_batch,
+        'stage_mask': torch.from_numpy(np.concatenate(stage_masks).astype(bool)),
+        'exec_mask': torch.from_numpy(np.vstack(exec_masks))
+    }
 
 
 
@@ -154,7 +148,7 @@ def collate_dag_batches(
     # NOTE: `batch` attribute is not needed, but can be obtained as follows:
     # dag_batch.batch = torch.arange(total_num_dags).repeat_interleave(num_nodes_per_dag)
 
-    dag_batch = collate(Batch, data_list, add_batch=False)[0]
+    dag_batch = pyg_collate.collate(Batch, data_list, add_batch=False)[0]
     
     # add some custom attributes for bookkeeping
     dag_batch['num_dags_per_obs'] = torch.tensor(num_dags_per_obs)

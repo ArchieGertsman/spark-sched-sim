@@ -14,7 +14,7 @@ import numpy as np
 
 from spark_sched_sim.wrappers.decima_wrappers import DecimaActWrapper, DecimaObsWrapper
 from spark_sched_sim.schedulers import DecimaScheduler
-from spark_sched_sim.graph_utils import ObsBatch, collate_obsns
+from spark_sched_sim.graph_utils import collate_obsns
 from .utils.device import device
 from .utils.profiler import Profiler
 from .utils.hidden_prints import HiddenPrints
@@ -57,7 +57,6 @@ def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
     env = gym.make(env_id, **env_kwargs)
     env = DecimaObsWrapper(DecimaActWrapper(env))
     agent = DecimaScheduler(env_kwargs['num_executors'])
-    agent.build(device='cpu')
 
     # IMPORTANT! Each worker needs to produce unique 
     # rollouts, which are determined by the rng seed
@@ -86,7 +85,7 @@ def rollout_worker(
         obs, _ = env.reset(seed=env_seed, options=env_options)
         
         try:
-            with Profiler(), HiddenPrints():
+            with Profiler(): #, HiddenPrints():
                 rollout_buffer, obs = collect_rollout(env, agent, obs)
             avg_job_duration = metrics.avg_job_duration(env) * 1e-3
             num_completed_jobs = env.num_completed_jobs

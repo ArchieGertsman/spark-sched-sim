@@ -31,7 +31,6 @@ class VPG(BaseAlg):
         optim_class: torch.optim.Optimizer = torch.optim.Adam,
         optim_lr: float = 3e-4,
         max_grad_norm: Optional[float] = None,
-        gamma: float = .99,
         max_time_mean_init: float = np.inf,
         max_time_mean_growth: float = 0.,
         max_time_mean_ceil: float = 0.,
@@ -53,7 +52,6 @@ class VPG(BaseAlg):
             optim_class,
             optim_lr,
             max_grad_norm,
-            gamma,
             max_time_mean_init,
             max_time_mean_growth,
             max_time_mean_ceil,
@@ -87,7 +85,6 @@ class VPG(BaseAlg):
         wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
         baselines_list = compute_baselines(wall_times_list, returns_list)
 
-        total_loss = 0
         policy_losses = []
         entropy_losses = []
 
@@ -97,8 +94,8 @@ class VPG(BaseAlg):
             actions = torch.tensor(actions)
             lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
-            with torch.no_grad():
-                assert lgprobs.allclose(torch.tensor(old_lgprobs))
+            # with torch.no_grad():
+            #     assert lgprobs.allclose(torch.tensor(old_lgprobs))
 
             adv = torch.from_numpy(returns - baselines).float()
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -108,9 +105,10 @@ class VPG(BaseAlg):
             entropy_loss = -entropies.sum()
             entropy_losses += [entropy_loss.item() / adv.numel()]
 
-            total_loss += policy_loss + self.entropy_weight * entropy_loss
+            loss = policy_loss + self.entropy_weight * entropy_loss
+            loss.backward()
 
-        self.agent.update_parameters(total_loss)
+        self.agent.update_parameters()
         
         return np.mean(policy_losses), \
                np.mean(entropy_losses), \

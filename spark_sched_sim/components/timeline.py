@@ -22,14 +22,14 @@ class TimelineEvent:
 class Timeline:
     def __init__(self):
         # priority queue
-        self.pq = []
+        self._pq = []
 
         # tie breaker
-        self.counter = itertools.count()
+        self._counter = itertools.count()
 
 
     def __len__(self):
-        return len(self.pq)
+        return len(self._pq)
     
 
     @property
@@ -39,24 +39,28 @@ class Timeline:
 
     def peek(self):
         try:
-            key, _, item = self.pq[0]
+            key, _, item = self._pq[0]
             return key, item
         except:
             return None, None
 
 
     def push(self, key, item):
-        heapq.heappush(self.pq, (key, next(self.counter), item))
+        heapq.heappush(self._pq, (key, next(self._counter), item))
         
 
     def pop(self):
-        if len(self.pq) > 0:
-            key, _, item = heapq.heappop(self.pq)
+        if len(self._pq) > 0:
+            key, _, item = heapq.heappop(self._pq)
             return key, item
         else:
             return None, None
         
 
     def reset(self):
-        self.pq = []
-        self.counter = itertools.count()
+        self._pq = []
+        self._counter = itertools.count()
+
+    
+    def events(self):
+        return (event for (*_, event) in self._pq)

@@ -28,32 +28,25 @@ class DecimaScheduler(BaseScheduler):
 
     def __init__(
         self,
-        num_executors: int,
-        training_mode: bool = True,
-        state_dict_path: str = None,
-        dim_embed: int = 8,
-        optim_class: torch.optim.Optimizer = torch.optim.Adam,
-        optim_lr: float = .001,
-        max_grad_norm: Optional[float] = None
+        num_executors,
+        state_dict_path = None,
+        dim_embed = 8,
+        optim_class = torch.optim.Adam,
+        optim_lr = .001,
+        max_grad_norm = None
     ):
-        super().__init__('Decima')
+        name = 'Decima'
+        if state_dict_path:
+            name += f':{state_dict_path}'
+        super().__init__(name)
 
         self.actor = ActorNetwork(num_executors, dim_embed)
-
-        self.num_executors = num_executors
-
-        self.optim_class = optim_class
-
-        self.optim_lr = optim_lr
-
         if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path, map_location=self.device)
+            state_dict = torch.load(state_dict_path)
             self.actor.load_state_dict(state_dict)
-
-        self.actor.train(training_mode)
-
-        self.training_mode = training_mode
-
+        self.num_executors = num_executors
+        self.optim_class = optim_class
+        self.optim_lr = optim_lr
         self.max_grad_norm = max_grad_norm
 
 
@@ -64,12 +57,10 @@ class DecimaScheduler(BaseScheduler):
 
 
 
-    def build(self, device: torch.device = None) -> None:
-        if device is not None:
-            self.actor.to(device)
-
-        params = self.actor.parameters()
-        self.optim = self.optim_class(params, lr=self.optim_lr)
+    def train(self):
+        '''call only on an instance that is about to be trained'''
+        self.actor.train()
+        self.optim = self.optim_class(self.actor.parameters(), lr=self.optim_lr)
 
 
 
@@ -78,28 +69,30 @@ class DecimaScheduler(BaseScheduler):
         '''assumes that `DecimaObsWrapper` is providing observations of the environment 
         and `DecimaActWrapper` is receiving actions returned from here.
         '''
-        dag_batch, stage_to_job_map = graph_utils.obs_to_pyg(obs)
+        obs_tensor_dict = graph_utils.obs_to_torch(obs)
+
+        dag_batch = obs_tensor_dict['dag_batch']
         dag_batch.to(self.device, non_blocking=True)
-        self.actor.embedding_forward(dag_batch)
 
-        # first: select a stage
-        stage_scores = self.actor.stage_forward().cpu()
-        schedulable_stage_mask = torch.tensor(obs['schedulable_stage_mask'], dtype=bool)
-        stage_idx, stage_lgprob = self._masked_sample(stage_scores, schedulable_stage_mask)
-        job_idx = stage_to_job_map[stage_idx]
+        # 1. compute embeddings
+        embedding_dict = self.actor.encoder.forward(dag_batch)
 
-        # second: select a parallelism limit, conditioned on the selected stage's job
-        prlsm_lim_scores = self.actor.prlsm_lim_forward(job_idx).cpu()
-        valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
-        prlsm_lim, prlsm_lim_lgprob = self._masked_sample(prlsm_lim_scores, valid_prlsm_lim_mask[job_idx])
+        # 2. select a stage
+        stage_scores = self.actor.stage_policy_network.forward(dag_batch, embedding_dict).cpu()
+        stage_idx, stage_lgprob = self._masked_sample(stage_scores, obs_tensor_dict['stage_mask'])
+        job_idx = obs_tensor_dict['stage_to_job_map'][stage_idx]
+
+        # 3. select the number of executors to add to that stage, conditioned on that stage's job
+        exec_scores = self.actor.exec_policy_network.forward(dag_batch, embedding_dict, job_idx).cpu()
+        num_exec, exec_lgprob = self._masked_sample(exec_scores, obs_tensor_dict['exec_mask'])
 
         action = {
             'stage_idx': stage_idx.item(),
             'job_idx': job_idx.item(),
-            'prlsm_lim': prlsm_lim.item()
+            'num_exec': num_exec.item()
         }
 
-        lgprob = stage_lgprob + prlsm_lim_lgprob
+        lgprob = stage_lgprob + exec_lgprob
 
         return action, lgprob.item()
 
@@ -107,24 +100,25 @@ class DecimaScheduler(BaseScheduler):
 
     def evaluate_actions(
         self, 
-        obsns: graph_utils.ObsBatch,
+        obsns_dict: dict,
         actions: Tensor
     ) -> tuple[Tensor, Tensor]:
         # split columns of `actions` into separate tensors
         # NOTE: columns need to be cloned to avoid in-place operation
-        stage_selections, job_idx, prlsm_lim_selections = [col.clone() for col in actions.T]
+        stage_selections, job_indices, exec_selections = [col.clone() for col in actions.T]
 
-        num_nodes_per_obs = obsns.dag_batch['num_nodes_per_obs']
-        obs_ptr = obsns.dag_batch['obs_ptr']
-        job_idx += obs_ptr[:-1]
+        dag_batch = obsns_dict['dag_batch']
+        num_nodes_per_obs = dag_batch['num_nodes_per_obs']
+        obs_ptr = dag_batch['obs_ptr']
+        job_indices += obs_ptr[:-1]
 
-        obsns.dag_batch.to(self.device)
-        self.actor.embedding_forward(obsns.dag_batch)
-        stage_scores = self.actor.stage_forward()
-        prlsm_lim_scores = self.actor.prlsm_lim_forward(job_idx)
+        dag_batch.to(self.device)
+        embedding_dict = self.actor.encoder.forward(dag_batch)
+        stage_scores = self.actor.stage_policy_network.forward(dag_batch, embedding_dict)
+        exec_scores = self.actor.exec_policy_network.forward(dag_batch, embedding_dict, job_indices)
 
-        stage_scores = self._apply_mask(stage_scores.cpu(), obsns.schedulable_stage_masks)
-        prlsm_lim_scores = self._apply_mask(prlsm_lim_scores.cpu(), obsns.valid_prlsm_lim_masks[job_idx])
+        stage_scores = self._apply_mask(stage_scores.cpu(), obsns_dict['stage_mask'])
+        exec_scores = self._apply_mask(exec_scores.cpu(), obsns_dict['exec_mask'])
 
         stage_lgprobs, stage_entropies = \
             self._evaluate_node_actions(
@@ -135,8 +129,8 @@ class DecimaScheduler(BaseScheduler):
         
         prlsm_lim_lgprobs, prlsm_lim_entropies = \
             self._evaluate(
-                prlsm_lim_scores, 
-                prlsm_lim_selections
+                exec_scores, 
+                exec_selections
             )
 
         # aggregate the evaluations for nodes and dags
@@ -192,6 +186,7 @@ class DecimaScheduler(BaseScheduler):
         lgprob = c.log_prob(samp)
         return samp, lgprob
     
+
 
     @classmethod
     def _evaluate(cls, logits, selections):
@@ -265,43 +260,14 @@ class ActorNetwork(nn.Module):
     def __init__(self, num_executors: int, dim_embed: int):
         super().__init__()
         self.encoder = EncoderNetwork(dim_embed)
-        self.policy_network = PolicyNetwork(num_executors, dim_embed)
+        self.stage_policy_network = StagePolicyNetwork(dim_embed)
+        self.exec_policy_network = ExecPolicyNetwork(dim_embed, num_executors)
 
+        # initialize all biases to be zero
         for name, param in self.named_parameters():
             if 'bias' in name:
                 param.data.zero_()
-
-        self.state = {}
-
-
-
-    def embedding_forward(self, dag_batch):
-        assert self.state == {}
-        dag_batch['num_nodes_per_dag'] = dag_batch.ptr[1:] - dag_batch.ptr[:-1]
-
-        self.state['dag_batch'] = dag_batch
-        (self.state['node_embeddings'], 
-         self.state['dag_summaries'], 
-         self.state['global_summaries']) = \
-            self.encoder(dag_batch)
-
-
     
-    def stage_forward(self):
-        assert self.state != {}
-        return self.policy_network.stage_forward(**self.state)
-    
-
-
-    def prlsm_lim_forward(self, job_idx):
-        assert self.state != {}
-        prlsm_lim_scores = self.policy_network.prlsm_lim_forward(job_idx, **self.state)
-
-        self.state.clear()
-
-        return prlsm_lim_scores
-    
-
 
 
 class EncoderNetwork(nn.Module):
@@ -321,14 +287,16 @@ class EncoderNetwork(nn.Module):
         self.mlp_glob_msg = MLP(dim_embed, [16, 8, dim_embed], activation_layer=ACT_FN)
 
 
-
     def forward(self, dag_batch):
         node_embeddings = self._embed_nodes(dag_batch)
         dag_summaries = self._summarize_dags(dag_batch, node_embeddings)
         global_summaries = self._summarize_global_states(dag_batch, dag_summaries)
-        return node_embeddings, dag_summaries, global_summaries
+        return {
+            'node_embeddings': node_embeddings,
+            'dag_summaries': dag_summaries,
+            'global_summaries': global_summaries
+        }
     
-
 
     def _embed_nodes(self, dag_batch):
         # preprocess node features
@@ -369,7 +337,6 @@ class EncoderNetwork(nn.Module):
         return x
     
 
-
     def _summarize_dags(self, dag_batch, node_embeddings):
         # add skip connection to original input
         x = torch.cat([dag_batch.x, node_embeddings], dim=1)
@@ -381,7 +348,6 @@ class EncoderNetwork(nn.Module):
         x = segment_csr(x, dag_batch.ptr)
 
         return x
-
 
 
     def _summarize_global_states(self, dag_batch, dag_summaries):
@@ -400,29 +366,23 @@ class EncoderNetwork(nn.Module):
         
         
         
+class StagePolicyNetwork(nn.Module):
 
-class PolicyNetwork(nn.Module):
-
-    def __init__(self, num_executors, dim_embed):
+    def __init__(self, dim_embed):
         super().__init__()
         self.dim_embed = dim_embed
-        self.num_executors = num_executors
         self.mlp_node_score = MLP(5 + (3 * dim_embed), [32, 16, 8, 1], activation_layer=ACT_FN)
-        self.mlp_dag_score = MLP(3 + (2 * dim_embed) + 1, [32, 16, 8, 1], activation_layer=ACT_FN)
 
     
-    
-    def stage_forward(
+    def forward(
         self, 
         dag_batch,
-        node_embeddings, 
-        dag_summaries, 
-        global_summaries
+        embedding_dict
     ):
         num_nodes = dag_batch.x.shape[0]
 
         dag_summaries_repeat = \
-            dag_summaries.repeat_interleave(
+            embedding_dict['dag_summaries'].repeat_interleave(
                 dag_batch['num_nodes_per_dag'],
                 output_size=num_nodes,
                 dim=0
@@ -436,7 +396,7 @@ class PolicyNetwork(nn.Module):
             num_nodes_per_obs = dag_batch.x.shape[0]
         
         global_summaries_repeat = \
-            global_summaries.repeat_interleave(
+            embedding_dict['global_summaries'].repeat_interleave(
                 num_nodes_per_obs,
                 output_size=num_nodes,
                 dim=0
@@ -446,7 +406,7 @@ class PolicyNetwork(nn.Module):
         node_inputs = torch.cat(
             [
                 dag_batch.x, 
-                node_embeddings, 
+                embedding_dict['node_embeddings'], 
                 dag_summaries_repeat, 
                 global_summaries_repeat
             ], 
@@ -456,16 +416,24 @@ class PolicyNetwork(nn.Module):
         node_scores = self.mlp_node_score(node_inputs)
 
         return node_scores.squeeze(-1)
+
+    
+
+
+class ExecPolicyNetwork(nn.Module):
+
+    def __init__(self, dim_embed, num_executors):
+        super().__init__()
+        self.dim_embed = dim_embed
+        self.num_executors = num_executors
+        self.mlp_dag_score = MLP(3 + (2 * dim_embed) + 1, [32, 16, 8, 1], activation_layer=ACT_FN)
     
     
-    
-    def prlsm_lim_forward(
+    def forward(
         self, 
-        job_idx,
         dag_batch,
-        dag_summaries, 
-        global_summaries,
-        **kwargs
+        embedding_dict,
+        job_idx
     ):
         dag_idxs = dag_batch.ptr[:-1]
         dag_features = dag_batch.x[dag_idxs, 0:3]
@@ -475,7 +443,7 @@ class PolicyNetwork(nn.Module):
         executor_actions = executor_actions.repeat(batch_size).unsqueeze(1).to(dag_features.device)
 
         dag_features = dag_features[job_idx]
-        dag_summaries = dag_summaries[job_idx]
+        dag_summaries = embedding_dict['dag_summaries'][job_idx]
         if batch_size == 1:
             dag_features = dag_features.unsqueeze(0)
             dag_summaries = dag_summaries.unsqueeze(0)
@@ -492,7 +460,7 @@ class PolicyNetwork(nn.Module):
             )
 
         global_summaries_repeat = \
-            global_summaries.repeat_interleave(
+            embedding_dict['global_summaries'].repeat_interleave(
                 self.num_executors, 
                 output_size=num_total_actions,
                 dim=0
@@ -510,5 +478,3 @@ class PolicyNetwork(nn.Module):
         dag_scores = self.mlp_dag_score(dag_inputs)
 
         return dag_scores.squeeze(-1).view(batch_size, self.num_executors)
-
-    

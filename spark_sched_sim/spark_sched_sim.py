@@ -33,7 +33,7 @@ except:
 
 
 
-NUM_NODE_FEATURES = 2
+NUM_NODE_FEATURES = 3
 RENDER_FPS = 30
 
 
@@ -45,8 +45,7 @@ class SparkSchedSimEnv(Env):
     def __init__(
         self,
         num_executors: int,
-        num_init_jobs: int,
-        num_job_arrivals: int,
+        job_arrival_cap: int,
         job_arrival_rate: float,
         moving_delay: float,
         render_mode: Optional[str] = None
@@ -55,9 +54,8 @@ class SparkSchedSimEnv(Env):
         Args:
             num_executors (int): number of simulated executors. More executors
                 means a higher possible level of parallelism.
-            num_init_jobs (int): number of jobs in the system at time t=0
-            num_job_arrivals: (int): number of jobs that arrive throughout
-                the simulation, according to a Poisson process
+            job_arrival_cap: (int): limit on the number of jobs that arrive throughout
+                the simulation
             job_arrival_rate (float): non-negative number that controls how
                 quickly new jobs arrive into the system. This is the parameter
                 of an exponential distributions, and so its inverse is the
@@ -68,16 +66,11 @@ class SparkSchedSimEnv(Env):
         '''
         self.wall_time = 0
 
-        num_total_jobs = num_init_jobs + num_job_arrivals
-        self.num_init_jobs = num_init_jobs
-
         self.num_executors = num_executors
-        self.num_total_jobs = num_total_jobs
         self.moving_delay = moving_delay
 
         self.datagen = TPCHJobSequenceGen(
-            num_init_jobs,
-            num_job_arrivals,
+            job_arrival_cap,
             job_arrival_rate
         )
 
@@ -96,7 +89,7 @@ class SparkSchedSimEnv(Env):
             assert PYGAME_AVAILABLE, 'pygame is unavailable'
             self.renderer = Renderer(
                 self.num_executors, 
-                self.num_total_jobs, 
+                job_arrival_cap, 
                 render_fps=self.metadata['render_fps']
             )
         else:
@@ -109,13 +102,13 @@ class SparkSchedSimEnv(Env):
             'stage_idx': Discrete(1, start=-1),
 
             # parallelism limit selection
-            'prlsm_lim': Discrete(num_executors, start=1)
+            'num_exec': Discrete(num_executors, start=1)
         })
 
         self.observation_space = Dict({
             'dag_batch': Dict({
                 # shape: (num active stages) x (num node features)
-                # stage features: num remaining tasks, most recent task duration
+                # stage features: num remaining tasks, most recent task duration, is stage schedulable
                 # edge features: none
                 'data': Graph(node_space=Box(0, np.inf, (NUM_NODE_FEATURES,)), 
                               edge_space=Discrete(1)),
@@ -129,20 +122,12 @@ class SparkSchedSimEnv(Env):
                 'ptr': Sequence(Discrete(1)),
             }),
 
-            # length: num active stages
-            # `mask[i]` = 1 if stage `i` is schedulable, 0 otherwise
-            'schedulable_stage_mask': Sequence(Discrete(2)),
-
-            # shape: (num active jobs, num executors)
-            # `mask[job_idx][l]` = 1 if parallism limit `l` is valid for that job
-            'valid_prlsm_lim_mask': Sequence(MultiBinary(self.num_executors)),
-
             # integer that represents how many executors need to be scheduled
             'num_executors_to_schedule': Discrete(num_executors+1),
 
             # index of job who is releasing executors, if any.
             # set to `self.num_total_jobs` if source is general pool.
-            'source_job_idx': Discrete(num_total_jobs+1),
+            'source_job_idx': Discrete(job_arrival_cap+1),
 
             # length: num active jobs
             # count of executors associated with each active job,
@@ -154,7 +139,7 @@ class SparkSchedSimEnv(Env):
 
     @property
     def all_jobs_complete(self):
-        return self.num_completed_jobs == self.num_total_jobs
+        return self.num_completed_jobs == len(self.jobs.keys())
 
 
 
@@ -186,9 +171,9 @@ class SparkSchedSimEnv(Env):
         super().reset(seed=seed)
 
         try:
-            self.max_wall_time = options['max_wall_time']
+            self.time_limit = options['time_limit']
         except:
-            self.max_wall_time = np.inf
+            self.time_limit = np.inf
 
         # simulation wall time in ms
         self.wall_time = 0
@@ -200,11 +185,11 @@ class SparkSchedSimEnv(Env):
         self.task_duration_gen.reset(self.np_random)
 
         # priority queue of scheduling events, indexed by wall time
-        self.timeline = self.datagen.new_timeline(self.max_wall_time)
+        self.timeline = self.datagen.new_timeline(self.time_limit)
 
         # timeline is initially filled with all the job arrival events, so extract 
         # all the job objects from there
-        self.jobs = {i: event.data['job'] for i, (*_, event) in enumerate(self.timeline.pq)}
+        self.jobs = {i: event.data['job'] for i, event in enumerate(self.timeline.events())}
 
         self.executors = [Executor(i) for i in range(self.num_executors)]
         self.exec_tracker.reset()
@@ -237,37 +222,6 @@ class SparkSchedSimEnv(Env):
     def step(self, action):
         assert not self.done
 
-        # s = sum(
-        #     len(pool) 
-        #     for key, pool in self.exec_tracker._pools.items() 
-        #     if key and key[0] in self.active_job_ids + [None]
-        # ) + sum(self.exec_tracker._num_moving_to_stage.values())
-        # t = sum(
-        #     len(pool) 
-        #     for key, pool in self.exec_tracker._pools.items() 
-        #     if not key or key[0] not in self.active_job_ids + [None]
-        # )
-        # print(s, t, flush=True)
-
-
-        # exec_ids = list(chain(*[
-        #     pool
-        #     for key, pool in self.exec_tracker._pools.items() 
-        #     if key and key[0] in self.active_job_ids + [None]
-        # ]))
-        # exec_ids_set = set(exec_ids)
-        # assert len(exec_ids_set) == len(exec_ids)
-        # set_diff = set(list(range(self.num_executors))) - exec_ids_set
-        # if len(set_diff) > 0:
-        #     print('set diff', set_diff, flush=True)
-
-        # print(
-        #     f'step {self.wall_time*1e-3:.1f}',
-        #     self.exec_tracker.get_source(), 
-        #     self.exec_tracker.num_executors_to_schedule(), 
-        #     flush=True
-        # )
-
         self._take_action(action)
 
         if self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0:
@@ -289,7 +243,7 @@ class SparkSchedSimEnv(Env):
 
         reward = self._calculate_reward(old_wall_time, old_active_job_ids)
         self.terminated = self.all_jobs_complete
-        self.truncated = self.wall_time >= self.max_wall_time
+        self.truncated = self.wall_time >= self.time_limit
 
         if not self.done:
             # print('starting new scheduling round', flush=True)
@@ -344,8 +298,8 @@ class SparkSchedSimEnv(Env):
 
 
     def _take_action(self, action):
-        # print('raw action', action)
-        
+        # print('raw action', action, flush=True)
+    
         assert self.action_space.contains(action), 'invalid action'
 
         if action['stage_idx'] == -1:
@@ -357,14 +311,9 @@ class SparkSchedSimEnv(Env):
         stage = self.stage_selection_map[action['stage_idx']]
         assert stage in self.schedulable_stages, 'the selected stage is not currently schedulable'
 
-        job_executor_count = self.exec_tracker.total_executor_count(stage.job_id)
-        num_executors_to_schedule = self.exec_tracker.num_executors_to_schedule()
-        source_job_id = self.exec_tracker.source_job_id()
-
-        num_executors = action['prlsm_lim'] - job_executor_count
-        if stage.job_id == source_job_id:
-            num_executors += num_executors_to_schedule
-        assert num_executors >= 1, 'the selected parallelism limit is too low for the job'
+        num_executors = action['num_exec']
+        assert num_executors >= 1
+        assert num_executors <= self.exec_tracker.num_executors_to_schedule()
 
         # print('action:', stage.pool_key, num_executors)
 
@@ -404,12 +353,9 @@ class SparkSchedSimEnv(Env):
 
         while not self.timeline.empty:
             self.wall_time, event = self.timeline.pop()
-            # try:
             self.handle_event[event.type](**event.data)
-            # except:
-            #     raise Exception('invalid event')
 
-            src = self.exec_tracker.get_source()
+            # src = self.exec_tracker.get_source()
             # print(src, self.exec_tracker._pools[src])
 
             if self.exec_tracker.num_executors_to_schedule() == 0:
@@ -428,12 +374,10 @@ class SparkSchedSimEnv(Env):
 
 
     def _observe(self):
-        # print('obs', self.exec_tracker.source_job_id(), self.exec_tracker.num_executors_to_schedule(), flush=True)
         self.stage_selection_map.clear()
         
         nodes = []
         ptr = [0]
-        schedulable_stage_mask = []
         active_stage_mask = np.zeros(self.num_total_stages, dtype=bool)
         executor_counts = []
         source_job_idx = len(self.active_job_ids)
@@ -452,9 +396,7 @@ class SparkSchedSimEnv(Env):
             for stage in job.active_stages:
                 self.stage_selection_map[len(nodes)] = stage
                 
-                nodes += [(stage.num_remaining_tasks, stage.most_recent_duration)]
-                
-                schedulable_stage_mask += [1] if stage.schedulable else [0]
+                nodes += [(stage.num_remaining_tasks, stage.most_recent_duration, stage.schedulable)]
                 stage.schedulable = False
 
                 active_stage_mask[self.all_job_ptr[job_id] + stage.id_] = 1
@@ -474,26 +416,11 @@ class SparkSchedSimEnv(Env):
 
         num_executors_to_schedule = self.exec_tracker.num_executors_to_schedule()
 
-        valid_prlsm_lim_masks = []
-        for i, executor_count in enumerate(executor_counts):
-            min_prlsm_lim = executor_count + 1
-            if i == source_job_idx:
-                min_prlsm_lim -= num_executors_to_schedule
-
-            assert 0 < min_prlsm_lim
-            assert     min_prlsm_lim <= self.num_executors + 1
-
-            valid_prlsm_lim_mask = np.zeros(self.num_executors, dtype=bool)
-            valid_prlsm_lim_mask[(min_prlsm_lim-1):] = 1
-            valid_prlsm_lim_masks += [valid_prlsm_lim_mask]
-
         obs = {
             'dag_batch': {
                 'data': GraphInstance(nodes, edges, edge_links),
                 'ptr': ptr
             },
-            'schedulable_stage_mask': schedulable_stage_mask,
-            'valid_prlsm_lim_mask': valid_prlsm_lim_masks,
             'num_executors_to_schedule': num_executors_to_schedule,
             'source_job_idx': source_job_idx,
             'executor_counts': executor_counts
@@ -676,9 +603,9 @@ class SparkSchedSimEnv(Env):
         if it's larger
         '''
         executor_demand = self._get_executor_demand(stage)
-        num_source_executors = self.exec_tracker.num_executors_to_schedule()
+        # num_source_executors = self.exec_tracker.num_executors_to_schedule()
 
-        num_executors_adjusted = min(num_executors, executor_demand, num_source_executors)
+        num_executors_adjusted = min(num_executors, executor_demand) #, num_source_executors)
 
         assert num_executors_adjusted > 0
         # print('num_executors adjustment:', f'{num_executors} -> {num_executors_adjusted}')

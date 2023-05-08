@@ -34,30 +34,22 @@ class TaskDurationGen:
         if executor.is_idle:
             # the executor was just sitting idly or moving between jobs, so it needs time to warm up
             try:
-                duration = self._sample('fresh_durations', executor_key)
-                print(1, flush=True)
-                return duration
+                return self._sample('fresh_durations', executor_key)
             except:
-                print(2, flush=True)
                 return self._sample('first_wave', executor_key, warmup=True)
         
 
         if executor.task.stage_id == task.stage_id:
             # the executor is continuing work on the same stage, which is relatively fast
             try:
-                duration = self._sample('rest_wave', executor_key)
-                print(3, flush=True)
-                return duration
+                return self._sample('rest_wave', executor_key)
             except:
                 pass
 
         # the executor is new to this stage (or 'rest_wave' data was not available)
         try:
-            duration = self._sample('first_wave', executor_key)
-            print(4, flush=True)
-            return duration
+            return self._sample('first_wave', executor_key)
         except:
-            print(5, flush=True)
             return self._sample('fresh_durations', executor_key)
 
 
