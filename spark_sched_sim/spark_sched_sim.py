@@ -1,6 +1,7 @@
 from typing import Optional
 from bisect import bisect_left, bisect_right
 from copy import deepcopy
+from itertools import chain
 
 import numpy as np
 from gymnasium import Env
@@ -193,34 +194,30 @@ class SparkSchedSimEnv(Env):
         self.wall_time = 0
 
         self.terminated = False
-
         self.truncated = False
         
-        # priority queue of scheduling events, indexed by wall time
         self.datagen.reset(self.np_random)
         self.task_duration_gen.reset(self.np_random)
 
-        self.timeline = self.datagen.new_timeline()
-
-        self.executors = [Executor(i) for i in range(self.num_executors)]
-
-        self.exec_tracker.reset()
+        # priority queue of scheduling events, indexed by wall time
+        self.timeline = self.datagen.new_timeline(self.max_wall_time)
 
         # timeline is initially filled with all the job arrival events, so extract 
         # all the job objects from there
         self.jobs = {i: event.data['job'] for i, (*_, event) in enumerate(self.timeline.pq)}
 
+        self.executors = [Executor(i) for i in range(self.num_executors)]
+        self.exec_tracker.reset()
+
         # a fast way of obtaining the edge links for an observation is to start out with 
         # all of them in a big array, and then to induce a subgraph based on the current 
         # set of active nodes
         self._reset_edge_links()
-
         self.num_total_stages = self.all_job_ptr[-1]
 
         # must be ordered
         # TODO: use ordered set
         self.active_job_ids = []
-
         self.completed_job_ids = set()
 
         # maintains the stages that have already been selected during the current scheduling 
@@ -233,16 +230,36 @@ class SparkSchedSimEnv(Env):
 
         self._load_initial_jobs()
 
-        self.round_lens = [0]
-
-        self.num_completed_tasks = 0
-
         return self._observe(), self.info
 
 
 
     def step(self, action):
         assert not self.done
+
+        # s = sum(
+        #     len(pool) 
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if key and key[0] in self.active_job_ids + [None]
+        # ) + sum(self.exec_tracker._num_moving_to_stage.values())
+        # t = sum(
+        #     len(pool) 
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if not key or key[0] not in self.active_job_ids + [None]
+        # )
+        # print(s, t, flush=True)
+
+
+        # exec_ids = list(chain(*[
+        #     pool
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if key and key[0] in self.active_job_ids + [None]
+        # ]))
+        # exec_ids_set = set(exec_ids)
+        # assert len(exec_ids_set) == len(exec_ids)
+        # set_diff = set(list(range(self.num_executors))) - exec_ids_set
+        # if len(set_diff) > 0:
+        #     print('set diff', set_diff, flush=True)
 
         # print(
         #     f'step {self.wall_time*1e-3:.1f}',
@@ -253,13 +270,9 @@ class SparkSchedSimEnv(Env):
 
         self._take_action(action)
 
-        self.round_lens[-1] += 1
-
         if self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0:
             # there are still scheduling decisions to be made, so consult the agent again
             return self._observe(), 0, False, False, self.info
-        
-        self.round_lens += [0]
             
         # commitment round has completed, now schedule the free executors
         self._commit_remaining_executors()
@@ -278,9 +291,9 @@ class SparkSchedSimEnv(Env):
         self.terminated = self.all_jobs_complete
         self.truncated = self.wall_time >= self.max_wall_time
 
-        # if not self.done:
-        #     print('starting new scheduling round', flush=True)
-        #     assert self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0
+        if not self.done:
+            # print('starting new scheduling round', flush=True)
+            assert self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0
         # else:
         #     print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
 
@@ -391,10 +404,10 @@ class SparkSchedSimEnv(Env):
 
         while not self.timeline.empty:
             self.wall_time, event = self.timeline.pop()
-            try:
-                self.handle_event[event.type](**event.data)
-            except:
-                raise Exception('invalid event')
+            # try:
+            self.handle_event[event.type](**event.data)
+            # except:
+            #     raise Exception('invalid event')
 
             src = self.exec_tracker.get_source()
             # print(src, self.exec_tracker._pools[src])
@@ -539,6 +552,7 @@ class SparkSchedSimEnv(Env):
         executor.add_history(self.wall_time, job.id_)
 
         self.exec_tracker.count_executor_arrival(stage.pool_key)
+        self.exec_tracker.move_executor_to_pool(executor.id_, job.pool_key)
 
         self._move_executor_to_stage(executor, stage)
 
@@ -551,7 +565,6 @@ class SparkSchedSimEnv(Env):
         executor = self.executors[task.executor_id]
 
         job = self.jobs[stage.job_id]
-        # job.add_task_completion(stage, task, executor, self.wall_time)
         assert not stage.completed
         stage.add_task_completion()
         task.t_completed = self.wall_time
@@ -744,6 +757,7 @@ class SparkSchedSimEnv(Env):
         
         # print('moving exec', flush=True)
 
+        # self.exec_tracker.send_executor_to_stage(executor.id_, stage.pool_key)
         self.exec_tracker.move_executor_to_pool(executor.id_, stage.pool_key, send=True)
 
         if executor.job_id is not None:
@@ -820,7 +834,7 @@ class SparkSchedSimEnv(Env):
     def _process_job_completion(self, job):
         '''performs some bookkeeping when a job completes'''
         assert job.id_ in self.jobs
-        # print(f'job {job.id_} completed at time {self.wall_time*1e-3:.1f}s')
+        # print(f'job completion: {job.id_} at time {self.wall_time*1e-3:.1f}s')
 
         # if there are any executors still local to this job, then remove them
         if len(self.exec_tracker._pools[job.pool_key]) > 0:
@@ -938,7 +952,7 @@ class SparkSchedSimEnv(Env):
 
         # no backup stage found, so move executor to job or general pool depending on 
         # whether or not the executor's job is saturated
-        self._move_idle_executors((executor.job_id, None), [executor.id_])
+        self._move_idle_executors(self.exec_tracker._executor_locations[executor.id_], [executor.id_])
 
 
 
@@ -1009,15 +1023,6 @@ class SparkSchedSimEnv(Env):
         job_ids = set(old_active_job_ids) | set(self.active_job_ids)
 
         # print('calc reward', len(job_ids), old_wall_time, self.wall_time)
-
-        # tau = 2e-5
-        # total_discounted_work = 0
-        # for job_id in iter(job_ids):
-        #     job = self.jobs[job_id]
-        #     delta_start = max(job.t_arrival, old_wall_time) - old_wall_time
-        #     delta_end = min(job.t_completed, self.wall_time) - old_wall_time
-        #     total_discounted_work += np.exp(-tau * delta_start) - np.exp(-tau * delta_end)
-        # return -total_discounted_work / tau
 
         total_work = 0
         for job_id in iter(job_ids):

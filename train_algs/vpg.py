@@ -83,6 +83,8 @@ class VPG(BaseAlg):
             )) 
 
         returns_list = self.return_calc(rewards_list, wall_times_list)
+
+        wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
         baselines_list = compute_baselines(wall_times_list, returns_list)
 
         total_loss = 0

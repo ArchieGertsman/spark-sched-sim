@@ -11,11 +11,11 @@ class BaseJobSequenceGen(ABC):
     def __init__(
         self, 
         num_init_jobs: int, 
-        num_job_arrivals: int, 
+        job_arrival_cap: int, 
         job_arrival_rate: float
     ):
         self.num_init_jobs = num_init_jobs
-        self.num_job_arrivals = num_job_arrivals
+        self.job_arrival_cap = job_arrival_cap
         self.mean_interarrival_time = 1 / job_arrival_rate
         self.np_random = None
 
@@ -26,7 +26,7 @@ class BaseJobSequenceGen(ABC):
 
 
 
-    def new_timeline(self) -> Timeline:
+    def new_timeline(self, max_time) -> Timeline:
         '''Fills timeline with job arrivals, which follow a Poisson process 
         parameterized by `job_arrival_rate`
         '''
@@ -36,10 +36,13 @@ class BaseJobSequenceGen(ABC):
         # wall time of current arrival
         t = 0
 
-        for job_id in range(self.num_init_jobs + self.num_job_arrivals):
+        for job_id in range(self.num_init_jobs + self.job_arrival_cap):
             if job_id >= self.num_init_jobs:
                 # sample time in ms until next arrival
                 t += self.np_random.exponential(self.mean_interarrival_time)
+
+            if t >= max_time:
+                break
                 
             job = self.generate_job(job_id, t)
             timeline.push(

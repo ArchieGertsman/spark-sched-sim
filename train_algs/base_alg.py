@@ -108,19 +108,17 @@ class BaseAlg(ABC):
             self._log_iteration_start(i, max_time)
 
             actor_sd = deepcopy(self.agent.actor.state_dict())
-            # critic_sd = None # self.agent.critic.state_dict()
+
+            # move params to GPU for learning
+            self.agent.actor.to(device, non_blocking=True)
             
             # scatter
             env_seed = i
             env_options = {'max_wall_time': max_time}
-            # N = self.num_envs # // 2
-            for j, conn in enumerate(self.conns):
+            for conn in self.conns:
                 env_seed = i
-                # env_seed = i * N + (j % N)
-                # env_seed = 4*i + int(4 * (j / self.num_envs))
                 conn.send((
                     actor_sd, 
-                    # critic_sd,
                     env_seed, 
                     env_options
                 ))
@@ -128,7 +126,6 @@ class BaseAlg(ABC):
             # gather
             (rollout_buffers,
              avg_job_durations,
-             _,
              completed_job_counts,
              job_arrival_counts) = \
                 zip(*[conn.recv() for conn in self.conns])
@@ -137,7 +134,9 @@ class BaseAlg(ABC):
             with Profiler():
                 policy_loss, entropy_loss, value_loss, approx_kl_div = \
                     self._learn_from_rollouts(rollout_buffers)
-                torch.cuda.synchronize()
+                
+                # return params to CPU before scattering to rollout workers
+                self.agent.actor.cpu()
 
             # check if model is the current best
             if not best_state or self.return_calc.avg_num_jobs < best_state['avg_num_jobs']:
@@ -208,7 +207,7 @@ class BaseAlg(ABC):
         torch.multiprocessing.set_start_method('forkserver')
         # torch.autograd.set_detect_anomaly(True)
 
-        self.agent.build(device)
+        self.agent.build()
 
         self._start_rollout_workers()
 
@@ -245,7 +244,6 @@ class BaseAlg(ABC):
                 target=rollout_worker, 
                 args=(
                     rank, 
-                    self.num_envs, 
                     conn_sub, 
                     self.env_kwargs, 
                     self.log_dir
@@ -274,8 +272,6 @@ class BaseAlg(ABC):
         ep_lens: list[int],
         max_time: float,
         approx_kl_div: float
-        # avg_num_jobs,
-        # returns
     ) -> None:
 
         episode_stats = {
@@ -290,9 +286,6 @@ class BaseAlg(ABC):
             'rolling avg num jobs': self.return_calc.avg_num_jobs,
             'entropy weight': self.entropy_weight,
             'KL div': approx_kl_div
-            # 'avg num jobs': np.mean([x for x in avg_num_jobs if x is not None]),
-            # 'norm. -return': -np.mean(returns),
-            # 'max time mean': self.max_time_mean * 1e-3,
         }
 
         for name, stat in episode_stats.items():
@@ -301,14 +294,11 @@ class BaseAlg(ABC):
 
 
     def _update_hyperparams(self, iteration) -> None:
-        # # geometrically increase the mean episode duration
+        # geometrically increase the mean episode duration
         self.max_time_mean = min(
             self.max_time_mean * self.max_time_mean_growth, 
             self.max_time_mean_ceil
         )
-
-        # if (iteration+1) % 50 == 0:
-        #     self.num_job_arrivals += 20
 
         # geometrically decrease the entropy weight
         self.entropy_weight = max(

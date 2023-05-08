@@ -2,9 +2,9 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from .schedulers import RandomScheduler, DecimaScheduler
-from .wrappers import DecimaObsWrapper, DecimaActWrapper
-from .graph_utils import collate_dag_batches, subgraph
+from spark_sched_sim.schedulers import RandomScheduler, DecimaScheduler
+from spark_sched_sim.wrappers import DecimaObsWrapper, DecimaActWrapper
+from spark_sched_sim.graph_utils import collate_dag_batches, subgraph
 
 
 NUM_EXEC = 50
@@ -32,7 +32,7 @@ def check_obs(env, obs):
         assert np.allclose(x[1], stage.most_recent_duration)
 
 
-    print('EXEC COUNTS', [env.exec_state.total_executor_count(job_id) for job_id in env.active_job_ids], flush=True)
+    print('EXEC COUNTS', [env.exec_tracker.total_executor_count(job_id) for job_id in env.active_job_ids], flush=True)
 
     # now compare all active stages
     i = 0
@@ -65,14 +65,14 @@ def check_obs(env, obs):
 
 def check_wrapped_obs(env, obs):
     data = obs['dag_batch']['data']
-    src_job_id = env.exec_state.source_job_id()
+    src_job_id = env.exec_tracker.source_job_id()
     i = 0
     for job_id in env.active_job_ids:
         active_stages = env.jobs[job_id].active_stages
         for stage, x in zip(active_stages, data.nodes[i : i + len(active_stages)]):
-            assert np.allclose(x[0], env.exec_state.num_executors_to_schedule() / env.num_executors)
+            assert np.allclose(x[0], env.exec_tracker.num_executors_to_schedule() / env.num_executors)
             assert np.allclose(x[1], 2 * int(job_id == src_job_id) - 1)
-            assert np.allclose(x[2], env.exec_state.total_executor_count(job_id) / env.num_executors)
+            assert np.allclose(x[2], env.exec_tracker.total_executor_count(job_id) / env.num_executors)
             assert np.allclose(x[3], stage.num_remaining_tasks / 200)
             assert np.allclose(x[4], stage.num_remaining_tasks * stage.most_recent_duration * 1e-5)
         i += len(active_stages)

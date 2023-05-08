@@ -13,7 +13,7 @@ if __name__ == '__main__':
     VPG(
         env_kwargs,
         num_iterations=1,
-        num_envs=16,
+        num_envs=4,
         log_dir='ignore/log/proc',
         summary_writer_dir='ignore/log/train/', 
         model_save_dir='ignore/models',

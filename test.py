@@ -23,17 +23,17 @@ def main():
 
     num_executors = 50
 
-    # should be greater than the number of epochs the
-    # model was trained on, so that the job sequences
-    # are unseen
-    base_seed = 0
+    # should be greater than the number of epochs the model was trained on, 
+    # so that the job sequences are unseen
+    base_seed = 20000
 
-    model_dir = 'ignore/models/1000'
-    model_name = 'model.pt'
 
     fifo_scheduler = FIFOScheduler(num_executors)
     scpt_scheduler = CPTScheduler(num_executors)
     lcpt_scheduler = CPTScheduler(num_executors, by_shortest=False)
+    
+    # model_dir = 'ignore/models/1000'
+    # model_name = 'model.pt'
     # decima_scheduler = \
     #     DecimaScheduler(
     #         num_executors,
@@ -44,7 +44,7 @@ def main():
     env_kwargs = {
         'num_executors': num_executors,
         'num_init_jobs': 1,
-        'num_job_arrivals': 200,
+        'num_job_arrivals': 1000,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
