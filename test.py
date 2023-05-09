@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 
 from spark_sched_sim.wrappers.decima_wrappers import DecimaObsWrapper, DecimaActWrapper
 from spark_sched_sim.metrics import avg_job_duration
-from train_algs.utils.hidden_prints import HiddenPrints
-from spark_sched_sim.schedulers import DecimaScheduler, FIFOScheduler, CPTScheduler
+from trainers.utils import HiddenPrints
+from spark_sched_sim.schedulers import *
 
 
 def main():
@@ -28,10 +28,9 @@ def main():
     base_seed = 20000
 
 
-    fifo_scheduler = FIFOScheduler(num_executors)
-    scpt_scheduler = CPTScheduler(num_executors)
-    lcpt_scheduler = CPTScheduler(num_executors, by_shortest=False)
-    
+    fifo_scheduler = RoundRobinScheduler(num_executors, dynamic_partition=False)
+    fair_scheduler = RoundRobinScheduler(num_executors, dynamic_partition=True)
+    random_scheduler = RandomScheduler()
     # model_dir = 'ignore/models/1000'
     # model_name = 'model.pt'
     # decima_scheduler = \
@@ -43,20 +42,19 @@ def main():
 
     env_kwargs = {
         'num_executors': num_executors,
-        'num_init_jobs': 1,
-        'num_job_arrivals': 1000,
+        'job_arrival_cap': 500,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
 
     env_id = 'spark_sched_sim:SparkSchedSimEnv-v0'
     base_env = gym.make(env_id, **env_kwargs)
-    wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
+    # wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
 
     test_instances = [
         (fifo_scheduler, base_env, num_tests, base_seed),
-        # (scpt_scheduler, base_env, num_tests, base_seed),
-        # (lcpt_scheduler, base_env, num_tests, base_seed),
+        (fair_scheduler, base_env, num_tests, base_seed),
+        (random_scheduler, base_env, num_tests, base_seed),
         # (decima_scheduler, wrapped_env, num_tests, base_seed)
     ]
 

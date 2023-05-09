@@ -18,6 +18,9 @@ from ..graph_utils import construct_message_passing_masks
 
 
 class DecimaObsWrapper(ObservationWrapper):
+    '''transforms observations in preparation for the Decima model. Is also responsible
+    for constructing message passing paths in the form of edge masks.
+    '''
     
     def __init__(self, env):
         super().__init__(env)
@@ -45,43 +48,19 @@ class DecimaObsWrapper(ObservationWrapper):
 
     
     def observation(self, obs):
-        ptr = np.array(obs['dag_batch']['ptr'])
-        num_nodes_per_dag = ptr[1:] - ptr[:-1]
-        num_nodes = obs['dag_batch']['data'].nodes.shape[0]
-        executor_counts = obs['executor_counts']
-        num_active_jobs = len(executor_counts)
-        num_executors_to_schedule = obs['num_executors_to_schedule']
+        self._check_msg_passing_cache(obs)
 
-        # build node features
-        nodes = np.zeros((num_nodes, 5), dtype=np.float32)
+        data = obs['dag_batch']['data']
 
-        nodes[:, 0] = num_executors_to_schedule / self.num_executors
-
-        nodes[:, 1] = -1
-        if obs['source_job_idx'] < num_active_jobs:
-            i = obs['source_job_idx']
-            nodes[ptr[i] : ptr[i+1], 1] = 1
-
-        nodes[:, 2] = np.repeat(executor_counts, num_nodes_per_dag) / self.num_executors
-
-        num_remaining_tasks = obs['dag_batch']['data'].nodes[:, 0]
-        nodes[:, 3] = num_remaining_tasks / 200
-
-        most_recent_duration = obs['dag_batch']['data'].nodes[:, 1]
-        nodes[:, 4] = num_remaining_tasks * most_recent_duration * 1e-5
-
-        edge_links = obs['dag_batch']['data'].edge_links
-        self._check_cache(num_nodes, edge_links)
         graph_instance = \
             GraphInstance(
-                nodes=nodes, 
-                edges=obs['dag_batch']['data'].edges, 
-                edge_links=obs['dag_batch']['data'].edge_links
+                nodes=self._build_node_features(obs), 
+                edges=data.edges, 
+                edge_links=data.edge_links
             )
-
-        stage_mask = obs['dag_batch']['data'].nodes[:, 2].astype(bool)
+        stage_mask = data.nodes[:, 2].astype(bool)
         exec_mask = np.zeros(self.num_executors, dtype=bool)
-        exec_mask[:num_executors_to_schedule] = True
+        exec_mask[:obs['num_executors_to_schedule']] = True
 
         obs = {
             'dag_batch': {
@@ -93,23 +72,58 @@ class DecimaObsWrapper(ObservationWrapper):
             'edge_mask_batch': self.msg_passing_cache['edge_mask_batch']
         }
 
-        self.observation_space['dag_batch']['ptr'].feature_space.n = num_nodes+1
+        # update dimensions of spaces
+        self.observation_space['dag_batch']['ptr'].feature_space.n = data.nodes.shape[0]+1
         self.observation_space['edge_mask_batch'].n = obs['edge_mask_batch'].shape
 
         return obs
     
 
 
-    def _check_cache(self, num_nodes, edge_links):
+    def _build_node_features(self, obs):
+        data = obs['dag_batch']['data']
+        num_nodes = data.nodes.shape[0]
+        
+        nodes = np.zeros((num_nodes, 5), dtype=np.float32)
+
+        num_executors_to_schedule = obs['num_executors_to_schedule']
+        nodes[:, 0] = num_executors_to_schedule / self.num_executors
+
+        ptr = np.array(obs['dag_batch']['ptr'])
+        executor_counts = obs['executor_counts']
+        num_active_jobs = len(executor_counts)
+        nodes[:, 1] = -1
+        if obs['source_job_idx'] < num_active_jobs:
+            i = obs['source_job_idx']
+            nodes[ptr[i] : ptr[i+1], 1] = 1
+
+        num_nodes_per_dag = ptr[1:] - ptr[:-1]
+        nodes[:, 2] = np.repeat(executor_counts, num_nodes_per_dag) / self.num_executors
+
+        num_remaining_tasks = data.nodes[:, 0]
+        nodes[:, 3] = num_remaining_tasks / 200
+
+        most_recent_duration = data.nodes[:, 1]
+        nodes[:, 4] = num_remaining_tasks * most_recent_duration * 1e-5
+
+        return nodes
+    
+
+
+    def _check_msg_passing_cache(self, obs):
+        data = obs['dag_batch']['data']
+        num_nodes = data.nodes.shape[0]
+
         if self.msg_passing_cache['edge_links'] is None or \
            num_nodes != self.msg_passing_cache['num_nodes'] or \
-           not np.array_equal(edge_links, self.msg_passing_cache['edge_links']):
+           not np.array_equal(data.edge_links, self.msg_passing_cache['edge_links']):
             # dag batch has changed, so synchronize the cache
             self.msg_passing_cache = {
                 'num_nodes': num_nodes,
-                'edge_links': edge_links,
-                'edge_mask_batch': construct_message_passing_masks(edge_links, num_nodes)
+                'edge_links': data.edge_links,
+                'edge_mask_batch': construct_message_passing_masks(data.edge_links, num_nodes)
             }
+
 
 
 
@@ -123,7 +137,6 @@ class DecimaActWrapper(ActionWrapper):
             'job_idx': Discrete(1),
             'num_exec': Discrete(env.num_executors)
         })
-
 
 
     def action(self, act):

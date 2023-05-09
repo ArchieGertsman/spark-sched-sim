@@ -1,24 +1,14 @@
-from typing import Iterable, List, Tuple, Any
 import sys
 from multiprocessing.connection import Connection
-from copy import deepcopy
 
 import gymnasium as gym
 from gymnasium.core import ObsType, ActType
-from gymnasium.wrappers.normalize import NormalizeReward
-from torch.utils.data import Dataset, DataLoader
-from torch import Tensor
 import torch
-import torch.nn.functional as F
-import numpy as np
 
 from spark_sched_sim.wrappers.decima_wrappers import DecimaActWrapper, DecimaObsWrapper
 from spark_sched_sim.schedulers import DecimaScheduler
-from spark_sched_sim.graph_utils import collate_obsns
-from .utils.device import device
-from .utils.profiler import Profiler
-from .utils.hidden_prints import HiddenPrints
 from spark_sched_sim import metrics
+from .utils import Profiler, HiddenPrints
 
 
 
@@ -46,7 +36,7 @@ class RolloutBuffer:
 
 ## rollout workers
 
-def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
+def setup_rollout_worker(rank, env_kwargs, model_kwargs, log_dir):
     # log each of the processes to separate files
     sys.stdout = open(f'{log_dir}/{rank}.out', 'a')
 
@@ -56,7 +46,7 @@ def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
     env_id = 'spark_sched_sim:SparkSchedSimEnv-v0'
     env = gym.make(env_id, **env_kwargs)
     env = DecimaObsWrapper(DecimaActWrapper(env))
-    agent = DecimaScheduler(env_kwargs['num_executors'])
+    agent = DecimaScheduler(env_kwargs['num_executors'], **model_kwargs)
 
     # IMPORTANT! Each worker needs to produce unique 
     # rollouts, which are determined by the rng seed
@@ -66,16 +56,8 @@ def setup_rollout_worker(rank: int, env_kwargs: dict, log_dir: str) -> None:
 
 
 
-def rollout_worker(
-    rank: int, 
-    conn: Connection, 
-    env_kwargs: dict,
-    log_dir: str
-) -> None:
-    '''collects rollouts and trains the model by communicating 
-    with the main process and other workers
-    '''
-    env, agent = setup_rollout_worker(rank, env_kwargs, log_dir)
+def rollout_worker(rank, conn, env_kwargs, model_kwargs, log_dir):
+    env, agent = setup_rollout_worker(rank, env_kwargs, model_kwargs, log_dir)
     
     while data := conn.recv():
         actor_sd, env_seed, env_options = data
@@ -85,7 +67,7 @@ def rollout_worker(
         obs, _ = env.reset(seed=env_seed, options=env_options)
         
         try:
-            with Profiler(): #, HiddenPrints():
+            with Profiler(), HiddenPrints():
                 rollout_buffer, obs = collect_rollout(env, agent, obs)
             avg_job_duration = metrics.avg_job_duration(env) * 1e-3
             num_completed_jobs = env.num_completed_jobs
@@ -104,18 +86,15 @@ def rollout_worker(
         
 
 def collect_rollout(env, agent, obs):
-    done = False
-
     rollout_buffer = RolloutBuffer()
+    
     wall_time = 0
-
-    while not done:
-        action, lgprob = agent.schedule(obs)
+    terminated = truncated = False
+    while not (terminated or truncated):
+        action, lgprob = agent(obs)
 
         new_obs, reward, terminated, truncated, info = env.step(action)
         next_wall_time = info['wall_time']
-
-        done = (terminated or truncated)
 
         rollout_buffer.add(obs, wall_time, list(action.values()), lgprob, reward)
 

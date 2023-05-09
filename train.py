@@ -1,28 +1,41 @@
-from train_algs import *
+from torch.optim import Adam
+
+from trainers import VPG
 
 
 if __name__ == '__main__':
-    env_kwargs = {
-        'num_executors': 50,
-        'job_arrival_cap': 200,
-        'job_arrival_rate': 1/25000,
-        'moving_delay': 2000.
-    }
+    trainer = VPG(
+        num_iterations=1,
+        num_envs=4,
+        log_options={
+            'proc_dir': 'ignore/log/proc',
+            'tensorboard_dir': 'ignore/log/train/'
+        },
+        model_save_options={
+            'dir': 'ignore/models',
+            'freq': 100
+        },
+        time_limit_options={
+            'init': 2e6,
+            'factor': 1.0008,
+            'ceil': 2e7
+        },
+        entropy_options={
+            'init': 1.,
+            'delta': 1e-3,
+            'floor': 1e-4
+        },
+        env_kwargs={
+            'num_executors': 50,
+            'job_arrival_cap': 200,
+            'job_arrival_rate': 1/25000,
+            'moving_delay': 2000.
+        },
+        model_kwargs={
+            'dim_embed': 8,
+            'optim_class': Adam,
+            'optim_lr': .001
+        }
+    )
 
-    VPG(
-        env_kwargs,
-        num_iterations=10000,
-        num_envs=16,
-        log_dir='ignore/log/proc',
-        summary_writer_dir='ignore/log/train/', 
-        model_save_dir='ignore/models',
-        optim_lr=.001,
-        entropy_weight_init=1.,
-        entropy_weight_decay=1e-3,
-        entropy_weight_min=1e-4,
-        max_time_mean_init=2e6,
-        max_time_mean_growth=1.0008,
-        max_time_mean_ceil=2e7,
-        seed=2147483647,
-        model_save_freq=100
-    ).train()
+    trainer.train()

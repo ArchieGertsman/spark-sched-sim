@@ -1,6 +1,5 @@
 from torch import Tensor
 from gymnasium.core import ObsType
-from numpy import ndarray
 
 import numpy as np
 import torch
@@ -25,7 +24,7 @@ def make_edge_mask(edge_links, node_mask):
 
 
 
-def subgraph(edge_links: ndarray, node_mask: ndarray) -> ndarray:
+def subgraph(edge_links, node_mask):
     '''
     Minimal numpy version of PyG's subgraph utility function
     Args:
@@ -92,11 +91,13 @@ def collate_obsns(obsns: list[ObsType]):
     dag_batch = collate_dag_batches(dag_batches)
     dag_batch['edge_mask_batch'] = \
         collate_edge_mask_batches(edge_mask_batches, dag_batch.edge_index.shape[1])
+    stage_mask = torch.from_numpy(np.concatenate(stage_masks).astype(bool))
+    exec_mask = torch.from_numpy(np.vstack(exec_masks))
 
     return {
         'dag_batch': dag_batch,
-        'stage_mask': torch.from_numpy(np.concatenate(stage_masks).astype(bool)),
-        'exec_mask': torch.from_numpy(np.vstack(exec_masks))
+        'stage_mask': stage_mask,
+        'exec_mask': exec_mask
     }
 
 
@@ -117,9 +118,7 @@ def collate_edge_mask_batches(edge_mask_batches, total_num_edges):
 
 
 
-def collate_dag_batches(
-    dag_batches: list[ObsType]
-) -> tuple[Batch, Tensor, Tensor]:
+def collate_dag_batches(dag_batches: list[ObsType]) -> Batch:
     '''collates the dag batches from each observation into one large dag batch'''
     _to_pyg = lambda raw_data: \
         Data(

@@ -1,16 +1,16 @@
 import numpy as np
 
-from .base import HeuristicScheduler
+from .scheduler import HeuristicScheduler
 
 
 
-class FIFOScheduler(HeuristicScheduler):
+class RoundRobinScheduler(HeuristicScheduler):
 
-    def __init__(self, num_executors, fair=True):
-        name = 'Dynamic Partition' if fair else 'FIFO'
+    def __init__(self, num_executors, dynamic_partition=True):
+        name = 'Fair' if dynamic_partition else 'FIFO'
         super().__init__(name)
         self.num_executors = num_executors
-        self.fair = fair
+        self.dynamic_partition = dynamic_partition
 
     
 
@@ -18,21 +18,23 @@ class FIFOScheduler(HeuristicScheduler):
         obs = self.preprocess_obs(obs)
         num_active_jobs = len(obs.executor_counts)
 
-        if self.fair:
+        if self.dynamic_partition:
             executor_cap = self.num_executors / max(1, num_active_jobs)
             executor_cap = int(np.ceil(executor_cap))
         else:
             executor_cap = self.num_executors
 
+        # first, try to find a stage in the same job that is releasing executers
         if obs.source_job_idx < num_active_jobs:
             selected_stage_idx = self.find_stage(obs, obs.source_job_idx)
 
             if selected_stage_idx != -1:
                 return {
                     'stage_idx': selected_stage_idx,
-                    'prlsm_lim': obs.executor_counts[obs.source_job_idx]
+                    'num_exec': obs.num_executors_to_schedule
                 }
 
+        # search through jobs by order of arrival.
         for j in range(num_active_jobs):
             if obs.executor_counts[j] >= executor_cap or \
                j == obs.source_job_idx:
@@ -42,15 +44,17 @@ class FIFOScheduler(HeuristicScheduler):
             if selected_stage_idx == -1:
                 continue
 
-            prlsm_lim = obs.executor_counts[j] + obs.num_executors_to_schedule
-            prlsm_lim = min(executor_cap, prlsm_lim)
+            num_exec = min(
+                obs.num_executors_to_schedule,
+                executor_cap - obs.executor_counts[j]
+            )
             return {
                 'stage_idx': selected_stage_idx,
-                'prlsm_lim': prlsm_lim
+                'num_exec': num_exec
             }
 
         # didn't find any stages to schedule
         return {
             'stage_idx': -1,
-            'prlsm_lim': obs.num_executors_to_schedule
+            'num_exec': obs.num_executors_to_schedule
         }

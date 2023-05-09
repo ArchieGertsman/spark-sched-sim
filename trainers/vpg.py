@@ -5,59 +5,39 @@ import numpy as np
 import torch
 import torch.profiler
 
-from .base_alg import BaseAlg
-from .rollouts import RolloutBuffer
+from .trainer import Trainer
+from .rollout_worker import RolloutBuffer
+from .utils import compute_baselines
 from spark_sched_sim.graph_utils import collate_obsns
-from .utils.baselines import compute_baselines
 
 
 
 
-class VPG(BaseAlg):
+class VPG(Trainer):
     '''Vanilla Policy Gradient'''
 
     def __init__(
         self,
-        env_kwargs: dict,
-        num_iterations: int = 500,
-        num_epochs: int = 4,
-        batch_size: Optional[int] = 512,
-        num_envs: int = 4,
-        seed: int = 42,
-        log_dir: str = 'log',
-        summary_writer_dir: Optional[str] = None,
-        model_save_dir: str = 'models',
-        model_save_freq: int = 20,
-        optim_class: torch.optim.Optimizer = torch.optim.Adam,
-        optim_lr: float = 3e-4,
-        max_grad_norm: Optional[float] = None,
-        max_time_mean_init: float = np.inf,
-        max_time_mean_growth: float = 0.,
-        max_time_mean_ceil: float = 0.,
-        entropy_weight_init: float = 1.,
-        entropy_weight_decay: float = 1e-3,
-        entropy_weight_min: float = 1e-4
+        num_iterations,
+        num_envs,
+        log_options,
+        model_save_options,
+        time_limit_options,
+        entropy_options,
+        env_kwargs,
+        model_kwargs,
+        seed=42
     ):  
         super().__init__(
-            env_kwargs,
             num_iterations,
-            num_epochs,
-            batch_size,
             num_envs,
-            seed,
-            log_dir,
-            summary_writer_dir,
-            model_save_dir,
-            model_save_freq,
-            optim_class,
-            optim_lr,
-            max_grad_norm,
-            max_time_mean_init,
-            max_time_mean_growth,
-            max_time_mean_ceil,
-            entropy_weight_init,
-            entropy_weight_decay,
-            entropy_weight_min
+            log_options,
+            model_save_options,
+            time_limit_options,
+            entropy_options,
+            env_kwargs,
+            model_kwargs,
+            seed
         )
     
 
@@ -110,7 +90,4 @@ class VPG(BaseAlg):
 
         self.agent.update_parameters()
         
-        return np.mean(policy_losses), \
-               np.mean(entropy_losses), \
-               0, \
-               0
+        return np.mean(policy_losses), np.mean(entropy_losses)

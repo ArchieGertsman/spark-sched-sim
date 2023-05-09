@@ -7,7 +7,7 @@ from gymnasium.core import ObsType, ActType
 
 
 
-class BaseScheduler(ABC):
+class Scheduler(ABC):
     def __init__(self, name: str):
         self.name = name
 
@@ -29,21 +29,21 @@ class BaseScheduler(ABC):
 class HeuristicObs(NamedTuple):
     G: nx.DiGraph
     job_ptr: np.ndarray
-    frontier_stage_mask: np.ndarray
-    schedulable_stage_mask: np.ndarray
+    frontier_stages: set
+    schedulable_stages: set
     executor_counts: np.ndarray
     num_executors_to_schedule: int
     source_job_idx: int
 
 
 
-class HeuristicScheduler(BaseScheduler):
+class HeuristicScheduler(Scheduler):
 
     @classmethod
     def preprocess_obs(cls, obs):
-        G, frontier_stage_mask = cls._make_nx_graph(obs['dag_batch']['data'])
+        G, frontier_stages = cls._make_nx_graph(obs['dag_batch']['data'])
         job_ptr = np.array(obs['dag_batch']['ptr'])
-        schedulable_stage_mask = np.array(obs['schedulable_stage_mask'])
+        schedulable_stages = set(obs['dag_batch']['data'].nodes[:, 2].astype(bool).nonzero()[0])
         executor_counts = np.array(obs['executor_counts'])
         num_executors_to_schedule = obs['num_executors_to_schedule']
         source_job_idx = obs['source_job_idx']
@@ -51,8 +51,8 @@ class HeuristicScheduler(BaseScheduler):
         return HeuristicObs(
             G,
             job_ptr,
-            frontier_stage_mask,
-            schedulable_stage_mask,
+            frontier_stages,
+            schedulable_stages,
             executor_counts,
             num_executors_to_schedule,
             source_job_idx
@@ -75,25 +75,23 @@ class HeuristicScheduler(BaseScheduler):
 
         G.add_edges_from(dag_batch_data.edge_links)
 
-        frontier_stage_mask = np.array([(G.in_degree[i] == 0) for i in G.nodes])
-        return G, frontier_stage_mask
+        frontier_stages = set([(G.in_degree[i] == 0) for i in G.nodes])
+        return G, frontier_stages
 
     
 
     @classmethod
     def find_stage(cls, obs, job_idx):
-        '''searches for a schedulable stage in
-        a given job, prioritizing frontier stages
-        '''
+        '''searches for a schedulable stage in a given job, prioritizing frontier stages'''
         stage_idx_start = obs.job_ptr[job_idx]
         stage_idx_end = obs.job_ptr[job_idx+1]
 
         selected_stage_idx = -1
         for i in range(stage_idx_start, stage_idx_end):
-            if not obs.schedulable_stage_mask[i]:
+            if not i in obs.schedulable_stages:
                 continue
 
-            if obs.frontier_stage_mask[i]:
+            if i in obs.frontier_stages:
                 return i
 
             if selected_stage_idx == -1:

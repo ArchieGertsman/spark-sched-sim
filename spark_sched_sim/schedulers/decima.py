@@ -6,10 +6,9 @@ import torch.nn as nn
 from torch.distributions import Categorical
 from torchvision.ops import MLP
 from torch_scatter import segment_csr
-import numpy as np
 from gymnasium.core import ObsType, ActType
 
-from .base import BaseScheduler
+from .scheduler import Scheduler
 from spark_sched_sim import graph_utils
 
 
@@ -20,19 +19,20 @@ NUM_DAG_FEATURES = 2
 
 NUM_GLOBAL_FEATURES = 1
 
-ACT_FN = lambda inplace, neg_slope=.2: nn.LeakyReLU(neg_slope, inplace)
+LEAKY_RELU = lambda inplace, neg_slope=.2: nn.LeakyReLU(neg_slope, inplace)
 
 
 
-class DecimaScheduler(BaseScheduler):
+class DecimaScheduler(Scheduler):
 
     def __init__(
         self,
         num_executors,
+        dim_embed,
+        optim_class,
+        optim_lr,
+        act_fn=LEAKY_RELU,
         state_dict_path = None,
-        dim_embed = 8,
-        optim_class = torch.optim.Adam,
-        optim_lr = .001,
         max_grad_norm = None
     ):
         name = 'Decima'
@@ -40,7 +40,7 @@ class DecimaScheduler(BaseScheduler):
             name += f':{state_dict_path}'
         super().__init__(name)
 
-        self.actor = ActorNetwork(num_executors, dim_embed)
+        self.actor = ActorNetwork(num_executors, dim_embed, act_fn)
         if state_dict_path is not None:
             state_dict = torch.load(state_dict_path)
             self.actor.load_state_dict(state_dict)
@@ -52,7 +52,7 @@ class DecimaScheduler(BaseScheduler):
 
 
     @property
-    def device(self) -> torch.device:
+    def device(self):
         return next(self.actor.parameters()).device
 
 
@@ -98,11 +98,7 @@ class DecimaScheduler(BaseScheduler):
 
 
 
-    def evaluate_actions(
-        self, 
-        obsns_dict: dict,
-        actions: Tensor
-    ) -> tuple[Tensor, Tensor]:
+    def evaluate_actions(self, obsns_dict: dict, actions: Tensor) -> tuple[Tensor, Tensor]:
         # split columns of `actions` into separate tensors
         # NOTE: columns need to be cloned to avoid in-place operation
         stage_selections, job_indices, exec_selections = [col.clone() for col in actions.T]
@@ -143,7 +139,7 @@ class DecimaScheduler(BaseScheduler):
 
 
 
-    def update_parameters(self, loss=None) -> None:
+    def update_parameters(self, loss=None):
         if loss:
             # accumulate gradients
             loss.backward()
@@ -171,7 +167,7 @@ class DecimaScheduler(BaseScheduler):
     ## internal methods
 
     @classmethod
-    def _apply_mask(cls, t: Tensor, msk: Tensor) -> Tensor:
+    def _apply_mask(cls, t, msk):
         '''masks model outputs in-place'''
         min_real = torch.finfo(t.dtype).min
         return t.masked_fill(~msk, min_real)
@@ -196,14 +192,9 @@ class DecimaScheduler(BaseScheduler):
 
 
     @classmethod
-    def _evaluate_node_actions(
-        cls,
-        all_node_scores: Tensor,
-        all_node_selections: Tensor,
-        num_nodes_per_obs: Tensor
-    ) -> Tuple[Tensor, Tensor]:
+    def _evaluate_node_actions(cls, node_scores, node_selections, num_nodes_per_obs):
         node_scores_split, node_selections_split, node_counts = \
-            cls._split_node_experience(all_node_scores, all_node_selections, num_nodes_per_obs)
+            cls._split_node_experience(node_scores, node_selections, num_nodes_per_obs)
 
         # evaluate actions for each chunk, vectorized
         node_lgprobs, node_entropies = zip(*[
@@ -218,12 +209,7 @@ class DecimaScheduler(BaseScheduler):
 
 
     @classmethod
-    def _split_node_experience(
-        cls,
-        all_node_scores: Tensor, 
-        all_node_selections: Tensor, 
-        num_nodes_per_obs: Tensor
-    ) -> Tuple[Iterable[Tensor], Iterable[Tensor], Tensor]:
+    def _split_node_experience(cls, node_scores, node_selections, num_nodes_per_obs):
         '''splits the node score/selection batches into subbatches, where each 
         each sample within a subbatch has the same node count.
         '''
@@ -245,10 +231,10 @@ class DecimaScheduler(BaseScheduler):
         chunk_sizes = ptr[1:] - ptr[:-1]
 
         # split node scores into subbatches
-        node_scores_split = torch.split(all_node_scores, list(chunk_sizes * node_counts))
+        node_scores_split = torch.split(node_scores, list(chunk_sizes * node_counts))
 
         # split node selections into subbatches
-        node_selections_split = torch.split(all_node_selections, list(chunk_sizes))
+        node_selections_split = torch.split(node_selections, list(chunk_sizes))
 
         return node_scores_split, node_selections_split, node_counts
 
@@ -257,11 +243,11 @@ class DecimaScheduler(BaseScheduler):
 
 class ActorNetwork(nn.Module):
     
-    def __init__(self, num_executors: int, dim_embed: int):
+    def __init__(self, num_executors: int, dim_embed: int, act_fn):
         super().__init__()
-        self.encoder = EncoderNetwork(dim_embed)
-        self.stage_policy_network = StagePolicyNetwork(dim_embed)
-        self.exec_policy_network = ExecPolicyNetwork(dim_embed, num_executors)
+        self.encoder = EncoderNetwork(dim_embed, act_fn)
+        self.stage_policy_network = StagePolicyNetwork(dim_embed, act_fn)
+        self.exec_policy_network = ExecPolicyNetwork(dim_embed, num_executors, act_fn)
 
         # initialize all biases to be zero
         for name, param in self.named_parameters():
@@ -272,19 +258,19 @@ class ActorNetwork(nn.Module):
 
 class EncoderNetwork(nn.Module):
 
-    def __init__(self, dim_embed):
+    def __init__(self, dim_embed, act_fn):
         super().__init__()
 
         # node embeddings
-        self.mlp_node_prep = MLP(5, [16, 8, dim_embed], activation_layer=ACT_FN)
-        self.mlp_node_msg = MLP(8, [16, 8, dim_embed], activation_layer=ACT_FN)
-        self.mlp_node_update = MLP(8, [16, 8, dim_embed], activation_layer=ACT_FN)
+        self.mlp_node_prep = MLP(5, [16, 8, dim_embed], activation_layer=act_fn)
+        self.mlp_node_msg = MLP(dim_embed, [16, 8, dim_embed], activation_layer=act_fn)
+        self.mlp_node_update = MLP(dim_embed, [16, 8, dim_embed], activation_layer=act_fn)
 
         # dag summaries
-        self.mlp_dag_msg = MLP(5 + dim_embed, [16, 8, dim_embed], activation_layer=ACT_FN)
+        self.mlp_dag_msg = MLP(5 + dim_embed, [16, 8, dim_embed], activation_layer=act_fn)
 
         # global summaries
-        self.mlp_glob_msg = MLP(dim_embed, [16, 8, dim_embed], activation_layer=ACT_FN)
+        self.mlp_glob_msg = MLP(dim_embed, [16, 8, dim_embed], activation_layer=act_fn)
 
 
     def forward(self, dag_batch):
@@ -368,17 +354,13 @@ class EncoderNetwork(nn.Module):
         
 class StagePolicyNetwork(nn.Module):
 
-    def __init__(self, dim_embed):
+    def __init__(self, dim_embed, act_fn):
         super().__init__()
         self.dim_embed = dim_embed
-        self.mlp_node_score = MLP(5 + (3 * dim_embed), [32, 16, 8, 1], activation_layer=ACT_FN)
+        self.mlp_node_score = MLP(5 + (3 * dim_embed), [32, 16, 8, 1], activation_layer=act_fn)
 
     
-    def forward(
-        self, 
-        dag_batch,
-        embedding_dict
-    ):
+    def forward(self, dag_batch, embedding_dict):
         num_nodes = dag_batch.x.shape[0]
 
         dag_summaries_repeat = \
@@ -422,28 +404,23 @@ class StagePolicyNetwork(nn.Module):
 
 class ExecPolicyNetwork(nn.Module):
 
-    def __init__(self, dim_embed, num_executors):
+    def __init__(self, dim_embed, num_executors, act_fn):
         super().__init__()
         self.dim_embed = dim_embed
         self.num_executors = num_executors
-        self.mlp_dag_score = MLP(3 + (2 * dim_embed) + 1, [32, 16, 8, 1], activation_layer=ACT_FN)
+        self.mlp_dag_score = MLP(3 + (2 * dim_embed) + 1, [32, 16, 8, 1], activation_layer=act_fn)
     
     
-    def forward(
-        self, 
-        dag_batch,
-        embedding_dict,
-        job_idx
-    ):
+    def forward(self, dag_batch, embedding_dict, job_indices):
         dag_idxs = dag_batch.ptr[:-1]
         dag_features = dag_batch.x[dag_idxs, 0:3]
-        batch_size = job_idx.numel()
+        batch_size = job_indices.numel()
 
         executor_actions = torch.arange(self.num_executors) / self.num_executors
         executor_actions = executor_actions.repeat(batch_size).unsqueeze(1).to(dag_features.device)
 
-        dag_features = dag_features[job_idx]
-        dag_summaries = embedding_dict['dag_summaries'][job_idx]
+        dag_features = dag_features[job_indices]
+        dag_summaries = embedding_dict['dag_summaries'][job_indices]
         if batch_size == 1:
             dag_features = dag_features.unsqueeze(0)
             dag_summaries = dag_summaries.unsqueeze(0)

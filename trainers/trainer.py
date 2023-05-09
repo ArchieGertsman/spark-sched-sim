@@ -12,76 +12,48 @@ from torch.multiprocessing import Pipe, Process
 from torch.utils.tensorboard import SummaryWriter
 
 from spark_sched_sim.schedulers import DecimaScheduler
-from .rollouts import RolloutBuffer, rollout_worker
-from .utils.profiler import Profiler
-from .utils.returns_calculator import ReturnsCalculator
-from .utils.device import device
+from .rollout_worker import RolloutBuffer, rollout_worker
+from .utils import Profiler, ReturnsCalculator, device
 
 
 
 
-class BaseAlg(ABC):
-    '''Base class for training algorithms, which must implement the abstract `_learn_from_rollouts` method'''
+class Trainer(ABC):
+    '''Base training algorithm class. Each algorithm must implement the abstract method 
+    `_learn_from_rollouts` 
+    '''
 
     def __init__(
         self,
-        env_kwargs: dict,
-        num_iterations: int,
-        num_epochs: int,
-        batch_size: Optional[int],
-        num_envs: int,
-        seed: int,
-        log_dir: str,
-        summary_writer_dir: Optional[str],
-        model_save_dir: str,
-        model_save_freq: int,
-        optim_class: torch.optim.Optimizer,
-        optim_lr: float,
-        max_grad_norm: Optional[float],
-        max_time_mean_init: float,
-        max_time_mean_growth: float,
-        max_time_mean_ceil: float,
-        entropy_weight_init: float,
-        entropy_weight_decay: float,
-        entropy_weight_min: float
+        num_iterations,
+        num_envs,
+        log_options,
+        model_save_options,
+        time_limit_options,
+        entropy_options,
+        env_kwargs,
+        model_kwargs,
+        seed
     ):  
         self.num_iterations = num_iterations
-        self.num_epochs = num_epochs
-        self.batch_size = batch_size
         self.num_envs = num_envs
+        self.log_options = log_options
+        self.model_save_options = model_save_options
+        self.env_kwargs = env_kwargs
+        self.model_kwargs = model_kwargs
 
-        self.log_dir = log_dir
-        self.summary_writer_path = summary_writer_dir
-        self.model_save_path = model_save_dir
-        self.model_save_freq = model_save_freq
+        self.time_limit_options = time_limit_options
+        self.time_limit_mean = time_limit_options['init']
 
-        self.max_time_mean = max_time_mean_init
-        self.max_time_mean_growth = max_time_mean_growth
-        self.max_time_mean_ceil = max_time_mean_ceil
-
-        self.entropy_weight = entropy_weight_init
-        self.entropy_weight_decay = entropy_weight_decay
-        self.entropy_weight_min = entropy_weight_min
+        self.entropy_options = entropy_options
+        self.entropy_weight = entropy_options['init']
 
         self.return_calc = ReturnsCalculator()
 
-        self.env_kwargs = env_kwargs
-
         torch.manual_seed(seed)
-        self.np_random_max_time = np.random.RandomState(seed)
-        self.dataloader_gen = torch.Generator()
-        self.dataloader_gen.manual_seed(seed)
+        self.np_random_time_limit = np.random.RandomState(seed)
 
-        self.agent = \
-            DecimaScheduler(
-                env_kwargs['num_executors'],
-                optim_class=optim_class,
-                optim_lr=optim_lr,
-                max_grad_norm=max_grad_norm
-            )
-
-        self.procs = []
-        self.conns = []
+        self.agent = DecimaScheduler(env_kwargs['num_executors'], **model_kwargs)
 
 
 
@@ -90,7 +62,7 @@ class BaseAlg(ABC):
         For each job sequence:
         - multiple rollouts are collected in parallel, asynchronously
         - the rollouts are gathered at the center, where model parameters are updated, and
-        - new model parameters are scattered to the rollout executors
+        - new model parameters are scattered to the rollout workers
         '''
 
         self._setup()
@@ -100,10 +72,9 @@ class BaseAlg(ABC):
         best_state = None
 
         for i in range(self.num_iterations):
-            max_time = self.np_random_max_time.exponential(self.max_time_mean)
-            max_time = max(max_time, 1e5)
+            time_limit = self._sample_time_limit()
 
-            self._log_iteration_start(i, max_time)
+            self._log_iteration_start(i, time_limit)
 
             actor_sd = deepcopy(self.agent.actor.state_dict())
 
@@ -112,9 +83,8 @@ class BaseAlg(ABC):
             
             # scatter
             env_seed = i
-            env_options = {'time_limit': max_time}
+            env_options = {'time_limit': time_limit}
             for conn in self.conns:
-                env_seed = i
                 conn.send((
                     actor_sd, 
                     env_seed, 
@@ -130,7 +100,7 @@ class BaseAlg(ABC):
 
             # update parameters
             with Profiler():
-                policy_loss, entropy_loss, value_loss, approx_kl_div = \
+                policy_loss, entropy_loss = \
                     self._learn_from_rollouts(rollout_buffers)
                 
                 # return params to CPU before scattering state dict to rollout workers
@@ -142,12 +112,12 @@ class BaseAlg(ABC):
                     'iteration': i,
                     'avg_num_jobs': np.round(self.return_calc.avg_num_jobs, 3),
                     'state_dict': actor_sd,
-                    'max_time': int(max_time * 1e-3),
-                    'max_time_mean': int(self.max_time_mean * 1e-3),
+                    'time_limit': int(time_limit * 1e-3),
+                    'time_limit_mean': int(self.time_limit_mean * 1e-3),
                     'completed_job_count': int(np.mean(completed_job_counts))
                 }
 
-            if (i+1) % self.model_save_freq == 0:
+            if (i+1) % self.model_save_options['freq'] == 0:
                 self._save_best_model(i, best_state)
 
             if self.summary_writer:
@@ -156,13 +126,11 @@ class BaseAlg(ABC):
                     i,
                     policy_loss,
                     entropy_loss,
-                    value_loss,
                     avg_job_durations,
                     completed_job_counts,
                     job_arrival_counts,
                     ep_lens,
-                    max_time,
-                    approx_kl_div
+                    time_limit
                 )
 
             self._update_hyperparams()
@@ -184,15 +152,19 @@ class BaseAlg(ABC):
 
     def _setup(self) -> None:
         # logging
-        shutil.rmtree(self.log_dir, ignore_errors=True)
-        os.mkdir(self.log_dir)
-        sys.stdout = open(f'{self.log_dir}/main.out', 'a')
-        self.summary_writer = SummaryWriter(self.summary_writer_path) \
-            if self.summary_writer_path else None
+        proc_log_dir = self.log_options['proc_dir']
+        shutil.rmtree(proc_log_dir, ignore_errors=True)
+        os.mkdir(proc_log_dir)
+        sys.stdout = open(f'{proc_log_dir}/main.out', 'a')
+        
+        try:
+            self.summary_writer = SummaryWriter(self.log_options['tensorboard_dir'])
+        except:
+            self.summary_writer = None
 
         # model checkpoints
-        shutil.rmtree(self.model_save_path, ignore_errors=True)
-        os.mkdir(self.model_save_path)
+        shutil.rmtree(self.model_save_options['dir'], ignore_errors=True)
+        os.mkdir(self.model_save_options['dir'])
 
         # torch
         print('cuda available:', torch.cuda.is_available())
@@ -216,16 +188,17 @@ class BaseAlg(ABC):
 
 
     @classmethod
-    def _log_iteration_start(cls, i, max_time):
+    def _log_iteration_start(cls, i, time_limit):
         print_str = f'training on sequence {i+1}'
-        if max_time < np.inf:
-            print_str += f' (max wall time = {max_time*1e-3:.1f}s)'
+        if time_limit < np.inf:
+            print_str += f' (max wall time = {time_limit*1e-3:.1f}s)'
         print(print_str, flush=True)
 
 
 
     def _save_best_model(self, i, best_state):
-        dir = f'{self.model_save_path}/{i+1}'
+        save_path = self.model_save_options['dir']
+        dir = f'{save_path}/{i+1}'
         os.mkdir(dir)
         best_sd = best_state.pop('state_dict')
         torch.save(best_sd, f'{dir}/model.pt')
@@ -249,7 +222,8 @@ class BaseAlg(ABC):
                     rank, 
                     conn_sub, 
                     self.env_kwargs, 
-                    self.log_dir
+                    self.model_kwargs,
+                    self.log_options['proc_dir']
                 )
             )
 
@@ -263,32 +237,29 @@ class BaseAlg(ABC):
         [proc.join() for proc in self.procs]
 
 
+
     def _write_stats(
         self,
         epoch: int,
         policy_loss: float,
         entropy_loss: float,
-        value_loss: float,
         avg_job_durations: list[float],
         completed_job_counts: list[int],
         job_arrival_counts: list[int],
         ep_lens: list[int],
-        max_time: float,
-        approx_kl_div: float
+        time_limit: float
     ) -> None:
 
         episode_stats = {
             'policy loss': np.abs(policy_loss),
             'entropy': np.abs(entropy_loss),
-            'value loss': value_loss,
             'avg job duration': np.mean([x for x in avg_job_durations if x is not None]),
             'completed jobs count': np.mean([x for x in completed_job_counts if x is not None]),
             'job arrival count': np.mean([x for x in job_arrival_counts if x is not None]),
             'episode length': np.mean(ep_lens),
-            'max time': max_time * 1e-3,
+            'max time': time_limit * 1e-3,
             'rolling avg num jobs': self.return_calc.avg_num_jobs,
-            'entropy weight': self.entropy_weight,
-            'KL div': approx_kl_div
+            'entropy weight': self.entropy_weight
         }
 
         for name, stat in episode_stats.items():
@@ -296,15 +267,25 @@ class BaseAlg(ABC):
 
 
 
+    def _sample_time_limit(self):
+        time_limit = self.np_random_time_limit.exponential(self.time_limit_mean)
+
+        # not too short
+        time_limit = max(time_limit, 1e5)
+
+        return time_limit
+
+
+
     def _update_hyperparams(self) -> None:
         # geometrically increase the mean episode duration
-        self.max_time_mean = min(
-            self.max_time_mean * self.max_time_mean_growth, 
-            self.max_time_mean_ceil
+        self.time_limit_mean = min(
+            self.time_limit_mean * self.time_limit_options['factor'], 
+            self.time_limit_options['ceil']
         )
 
         # arithmetically decrease the entropy weight
         self.entropy_weight = max(
-            self.entropy_weight - self.entropy_weight_decay,
-            self.entropy_weight_min
+            self.entropy_weight - self.entropy_options['delta'],
+            self.entropy_options['floor']
         )

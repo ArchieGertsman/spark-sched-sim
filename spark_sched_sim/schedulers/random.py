@@ -1,6 +1,6 @@
 import numpy as np
 
-from .base import HeuristicScheduler
+from .scheduler import HeuristicScheduler
 
 
 
@@ -31,13 +31,10 @@ class RandomScheduler(HeuristicScheduler):
             else:
                 job_idxs.remove(j)
 
-        prlsm_lim = obs.executor_counts[j] + \
-            self.np_random.randint(1, obs.num_executors_to_schedule + 1)
-        if j == obs.source_job_idx:
-            prlsm_lim -= obs.num_executors_to_schedule
+        num_exec = self.np_random.randint(1, obs.num_executors_to_schedule + 1)
 
         return {
             'stage_idx': stage_idx,
-            'prlsm_lim': prlsm_lim
+            'num_exec': num_exec
         }
         
