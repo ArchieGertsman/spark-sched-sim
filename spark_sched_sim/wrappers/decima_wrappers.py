@@ -107,7 +107,7 @@ class DecimaActWrapper(ActionWrapper):
 
         self.action_space = Dict({
             'stage_idx': Discrete(1),
-            'job_idx': Discrete(env.num_total_jobs),
+            'job_idx': Discrete(1),
             'prlsm_lim': Discrete(env.num_executors)
         })
 

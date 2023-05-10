@@ -41,16 +41,13 @@ class ExecutorTracker:
         }
 
         # pool key A -> 
-        #   (pool key B -> 
-        #       number of commitments from 
-        #       pool A to pool B)
+        #   (pool key B -> number of commitments from pool A to pool B)
         self._commitments = {
             None: {},
             GENERAL_POOL_KEY: {}
         }
 
-        # pool key -> total number of outgoing commitments
-        # from this pool
+        # pool key -> total number of outgoing commitments from this pool
         self._num_commitments_from = {
             None: 0,
             GENERAL_POOL_KEY: 0
@@ -64,9 +61,8 @@ class ExecutorTracker:
         # stage pool key -> number of executors moving to stage
         self._num_moving_to_stage = {}
 
-        # job id -> size of job's pool plus the total number
-        # of external commitments and executors moving to any 
-        # of its stages
+        # job id -> size of job's pool plus the total number of external commitments 
+        # and executors moving to any of its stages
         self._total_executor_count = {
             None: 0
         }
@@ -198,28 +194,20 @@ class ExecutorTracker:
 
 
 
-    def move_executor_to_pool(self, 
-                            executor_id, 
-                            new_pool_key, 
-                            send=False):
+    def move_executor_to_pool(self, executor_id, new_pool_key, send=False):
         old_pool_key = self._executor_locations[executor_id]
-
         if old_pool_key is not None:
-            # remove executor from old pool
             self._pools[old_pool_key].remove(executor_id)
             self._executor_locations[executor_id] = None
 
         if not send:
-            # directly move executor into new pool
             self._executor_locations[executor_id] = new_pool_key
             self._pools[new_pool_key].add(executor_id)
             return
-
-        # send executor to pool
+        
         self._num_moving_to_stage[new_pool_key] += 1
 
-        old_job_id = old_pool_key[0] \
-                     if old_pool_key is not None else None
+        old_job_id = old_pool_key[0] if old_pool_key is not None else None
         new_job_id = new_pool_key[0]
         assert old_job_id != new_job_id
         

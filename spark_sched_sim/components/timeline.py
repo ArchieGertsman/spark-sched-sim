@@ -60,3 +60,7 @@ class Timeline:
     def reset(self):
         self.pq = []
         self.counter = itertools.count()
+
+
+    def events(self):
+        return (event for *_, event in self.pq)

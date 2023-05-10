@@ -25,7 +25,11 @@ from .datagen.tpch_job_sequence import TPCHJobSequenceGen
 from .datagen.task_duration import TaskDurationGen
 from . import graph_utils
 from . import metrics
-from .components.renderer import Renderer
+try:
+    from .components.renderer import Renderer
+    PYGAME_AVAILABLE = True
+except:
+    PYGAME_AVAILABLE = False
 
 
 
@@ -41,8 +45,9 @@ class SparkSchedSimEnv(Env):
     def __init__(
         self,
         num_executors: int,
+        num_init_jobs: int,
+        num_job_arrivals: int,
         job_arrival_rate: float,
-        job_arrival_cap: int,
         moving_delay: float,
         render_mode: Optional[str] = None
     ):
@@ -50,36 +55,52 @@ class SparkSchedSimEnv(Env):
         Args:
             num_executors (int): number of simulated executors. More executors
                 means a higher possible level of parallelism.
+            num_init_jobs (int): number of jobs in the system at time t=0
+            num_job_arrivals: (int): number of jobs that arrive throughout
+                the simulation, according to a Poisson process
             job_arrival_rate (float): non-negative number that controls how
                 quickly new jobs arrive into the system. This is the parameter
                 of an exponential distributions, and so its inverse is the
                 mean job inter-arrival time in ms.
-            job_arrival_cap (int): maximum number of job arrivals
             moving_delay (float): time in ms it takes for a executor to move between jobs
             render_mode (optional str): if set to 'human', then a visualization
                 of the simulation is rendred in real time
         '''
         self.wall_time = 0
+
+        num_total_jobs = num_init_jobs + num_job_arrivals
+        self.num_init_jobs = num_init_jobs
+
         self.num_executors = num_executors
+        self.num_total_jobs = num_total_jobs
         self.moving_delay = moving_delay
 
-        # number of times the environment has been reset. Used as a random seed.
-        self.reset_count = 0
+        self.datagen = TPCHJobSequenceGen(
+            num_init_jobs,
+            num_job_arrivals,
+            job_arrival_rate
+        )
 
-        self.datagen = TPCHJobSequenceGen(job_arrival_rate, job_arrival_cap)
         self.task_duration_gen = TaskDurationGen(self.num_executors)
+
         self.exec_tracker = ExecutorTracker(num_executors)
 
-        # for conveniently handling timeline events:
-        #   `self.handle_event[event.type](**event.data)`
         self.handle_event = {
             TimelineEvent.Type.JOB_ARRIVAL: self._handle_job_arrival,
             TimelineEvent.Type.EXECUTOR_ARRIVAL: self._handle_executor_arrival,
             TimelineEvent.Type.TASK_COMPLETION: self._handle_task_completion
         }
 
-        self.renderer = Renderer(self.num_executors, render_fps=self.metadata['render_fps']) \
-            if render_mode == 'human' else None
+        self.render_mode = render_mode
+        if render_mode == 'human':
+            assert PYGAME_AVAILABLE, 'pygame is unavailable'
+            self.renderer = Renderer(
+                self.num_executors, 
+                self.num_total_jobs, 
+                render_fps=self.metadata['render_fps']
+            )
+        else:
+            self.renderer = None
 
         self.action_space = Dict({
             # stage selection
@@ -120,8 +141,8 @@ class SparkSchedSimEnv(Env):
             'num_executors_to_schedule': Discrete(num_executors+1),
 
             # index of job who is releasing executors, if any.
-            # set to `self.job_cap` if source is general pool.
-            'source_job_idx': Discrete(1),
+            # set to `self.num_total_jobs` if source is general pool.
+            'source_job_idx': Discrete(num_total_jobs+1),
 
             # length: num active jobs
             # count of executors associated with each active job,
@@ -133,7 +154,7 @@ class SparkSchedSimEnv(Env):
 
     @property
     def all_jobs_complete(self):
-        return self.num_completed_jobs == len(self.jobs.keys())
+        return self.num_completed_jobs == self.num_total_jobs
 
 
 
@@ -162,48 +183,36 @@ class SparkSchedSimEnv(Env):
 
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=(seed or self.reset_count))
-        
-        self.reset_count += 1
-        self.wall_time = 0 # wall time since last reset in ms
+        super().reset(seed=seed)
+
+        try:
+            self.max_wall_time = options['max_wall_time']
+        except:
+            self.max_wall_time = np.inf
+
+        # simulation wall time in ms
+        self.wall_time = 0
+
         self.terminated = False
         self.truncated = False
-
-        if 'mean_time_limit' in options:
-            mean_time_limit = options['mean_time_limit']
-            self.time_limit = self.np_random.exponential(mean_time_limit)
-        elif 'time_limit' in options:
-            self.time_limit = options['time_limit']
-        else:
-            self.time_limit = np.inf
         
-        print('time limit:', self.time_limit, flush=True)
-        
-        self.executors = [Executor(exec_id) for exec_id in range(self.num_executors)]
-
         self.datagen.reset(self.np_random)
         self.task_duration_gen.reset(self.np_random)
+
+        # priority queue of scheduling events, indexed by wall time
+        self.timeline = self.datagen.new_timeline(self.max_wall_time)
+
+        # timeline is initially filled with all the job arrival events, so extract 
+        # all the job objects from there
+        self.jobs = {i: event.data['job'] for i, (*_, event) in enumerate(self.timeline.pq)}
+
+        self.executors = [Executor(i) for i in range(self.num_executors)]
         self.exec_tracker.reset()
 
-        # priority queue of scheduling events, indexed by wall time. Initially filled with all the 
-        # job arrival events, of which there are at most `self.job_cap`.
-        self.timeline = self.datagen.new_timeline(self.time_limit)
-
-        # extract all the job objects from the initial timeline
-        self.jobs = {job_id: event.data['job'] for job_id, event in enumerate(self.timeline.events())}
-        num_jobs_arrivals = len(self.jobs.keys())
-        print('num job arrivals:', num_jobs_arrivals, flush=True)
-
-        self.observation_space['source_job_idx'].n = num_jobs_arrivals
-        if self.renderer:
-            self.renderer.reset(num_jobs_arrivals)
-        
         # a fast way of obtaining the edge links for an observation is to start out with 
         # all of them in a big array, and then to induce a subgraph based on the current 
         # set of active nodes
-        edge_links, job_ptr = self._reset_edge_links()
-        self.all_edge_links = np.vstack(edge_links)
-        self.all_job_ptr = np.array(job_ptr)
+        self._reset_edge_links()
         self.num_total_stages = self.all_job_ptr[-1]
 
         # must be ordered
@@ -227,6 +236,31 @@ class SparkSchedSimEnv(Env):
 
     def step(self, action):
         assert not self.done
+
+        # s = sum(
+        #     len(pool) 
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if key and key[0] in self.active_job_ids + [None]
+        # ) + sum(self.exec_tracker._num_moving_to_stage.values())
+        # t = sum(
+        #     len(pool) 
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if not key or key[0] not in self.active_job_ids + [None]
+        # )
+        # print(s, t, flush=True)
+
+
+        # exec_ids = list(chain(*[
+        #     pool
+        #     for key, pool in self.exec_tracker._pools.items() 
+        #     if key and key[0] in self.active_job_ids + [None]
+        # ]))
+        # exec_ids_set = set(exec_ids)
+        # assert len(exec_ids_set) == len(exec_ids)
+        # set_diff = set(list(range(self.num_executors))) - exec_ids_set
+        # if len(set_diff) > 0:
+        #     print('set diff', set_diff, flush=True)
+
         # print(
         #     f'step {self.wall_time*1e-3:.1f}',
         #     self.exec_tracker.get_source(), 
@@ -255,7 +289,7 @@ class SparkSchedSimEnv(Env):
 
         reward = self._calculate_reward(old_wall_time, old_active_job_ids)
         self.terminated = self.all_jobs_complete
-        self.truncated = self.wall_time >= self.time_limit
+        self.truncated = self.wall_time >= self.max_wall_time
 
         if not self.done:
             # print('starting new scheduling round', flush=True)
@@ -263,7 +297,7 @@ class SparkSchedSimEnv(Env):
         # else:
         #     print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
 
-        if self.renderer:
+        if self.render_mode == 'human':
             self._render_frame()
 
         # if the episode isn't done, then start a new scheduling 
@@ -289,7 +323,8 @@ class SparkSchedSimEnv(Env):
             edges = np.vstack(job.dag.edges)
             edge_links += [base_stage_idx + edges]
             job_ptr += [base_stage_idx + job.num_stages]
-        return edge_links, job_ptr
+        self.all_edge_links = np.vstack(edge_links)
+        self.all_job_ptr = np.array(job_ptr)
 
 
 

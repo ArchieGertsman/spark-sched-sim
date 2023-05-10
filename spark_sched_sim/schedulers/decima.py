@@ -36,7 +36,10 @@ class DecimaScheduler(BaseScheduler):
         optim_lr: float = .001,
         max_grad_norm: Optional[float] = None
     ):
-        super().__init__('Decima')
+        name = 'Decima'
+        if state_dict_path:
+            name += f':{state_dict_path}'
+        super().__init__(name)
 
         self.actor = ActorNetwork(num_executors, dim_embed)
 
@@ -74,7 +77,7 @@ class DecimaScheduler(BaseScheduler):
 
 
     @torch.no_grad()
-    def schedule(self, obs: ObsType) -> ActType:
+    def schedule(self, obs: ObsType, greedy=False) -> ActType:
         '''assumes that `DecimaObsWrapper` is providing observations of the environment 
         and `DecimaActWrapper` is receiving actions returned from here.
         '''
@@ -85,13 +88,13 @@ class DecimaScheduler(BaseScheduler):
         # first: select a stage
         stage_scores = self.actor.stage_forward().cpu()
         schedulable_stage_mask = torch.tensor(obs['schedulable_stage_mask'], dtype=bool)
-        stage_idx, stage_lgprob = self._masked_sample(stage_scores, schedulable_stage_mask)
+        stage_idx, stage_lgprob = self._masked_sample(stage_scores, schedulable_stage_mask, greedy)
         job_idx = stage_to_job_map[stage_idx]
 
         # second: select a parallelism limit, conditioned on the selected stage's job
         prlsm_lim_scores = self.actor.prlsm_lim_forward(job_idx).cpu()
         valid_prlsm_lim_mask = torch.from_numpy(np.vstack(obs['valid_prlsm_lim_mask']))
-        prlsm_lim, prlsm_lim_lgprob = self._masked_sample(prlsm_lim_scores, valid_prlsm_lim_mask[job_idx])
+        prlsm_lim, prlsm_lim_lgprob = self._masked_sample(prlsm_lim_scores, valid_prlsm_lim_mask[job_idx], greedy)
 
         action = {
             'stage_idx': stage_idx.item(),
@@ -164,6 +167,7 @@ class DecimaScheduler(BaseScheduler):
                 )
             except:
                 print('infinite grad; skipping update.')
+                self.optim.zero_grad()
                 return
 
         # update model parameters
@@ -185,10 +189,13 @@ class DecimaScheduler(BaseScheduler):
 
 
     @classmethod
-    def _masked_sample(cls, logits, mask):
+    def _masked_sample(cls, logits, mask, greedy):
         logits = cls._apply_mask(logits, mask)
         c = Categorical(logits=logits)
-        samp = c.sample()
+        if greedy:
+            samp = logits.argmax()
+        else:
+            samp = c.sample()
         lgprob = c.log_prob(samp)
         return samp, lgprob
     

@@ -1,42 +1,52 @@
-from typing import Iterator, List
-import pygame
+from typing import Iterator
+
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except:
+    PYGAME_AVAILABLE = False
 import numpy as np
 
 
 class Renderer:
     '''renders frames that visualize the job scheduling simulation in 
     real time. A gantt chart is displayed, with the traces of all the 
-    workers are stacked vertically. Job completions are indicated by 
+    executors are stacked vertically. Job completions are indicated by 
     red markers, and info about the simulation is displayed in text.
     '''
 
     def __init__(
         self,
-        num_workers: int,
-        num_total_jobs: int,
+        num_executors: int,
         window_width: int = 400,
         window_height: int = 300,
         font_name: str = 'couriernew',
         font_size: int = 16,
         render_fps: int = 30
     ):
-        self.num_workers = num_workers
-        self.num_total_jobs = num_total_jobs
+        assert PYGAME_AVAILABLE, 'pygame is unavailable'
+        
+        self.num_executors = num_executors
         self.window_width = window_width
         self.window_height = window_height
         self.font_name = font_name
         self.font_size = font_size
         self.render_fps = render_fps
 
-        self.WORKER_RECT_H = np.ceil(self.window_height / self.num_workers)
+        self.WORKER_RECT_H = np.ceil(self.window_height / self.num_executors)
         self.window = None
         self.clock = None
 
 
 
+    def reset(self, num_total_jobs):
+        self.num_total_jobs = num_total_jobs
+
+
+
     def render_frame(
         self, 
-        worker_histories: Iterator[list], 
+        executor_histories: Iterator[list], 
         job_completion_times: Iterator[float],
         wall_time: float,
         avg_job_duration: float,
@@ -59,7 +69,7 @@ class Renderer:
         # draw canvas
         canvas = pygame.Surface((self.window_width, self.window_height))
         canvas.fill((255, 255, 255))
-        self._draw_worker_histories(canvas, worker_histories, wall_time)
+        self._draw_executor_histories(canvas, executor_histories, wall_time)
         self._draw_job_completion_markers(canvas, job_completion_times, wall_time)
         self.window.blit(canvas, canvas.get_rect())
 
@@ -89,12 +99,12 @@ class Renderer:
 
     ## internal methods
 
-    def _draw_worker_histories(self, 
+    def _draw_executor_histories(self, 
                                canvas, 
-                               worker_histories, 
+                               executor_histories, 
                                wall_time):
 
-        for i, history in enumerate(worker_histories):
+        for i, history in enumerate(executor_histories):
             y_rect = i * self.WORKER_RECT_H
             x_rect = 0
             for i in range(len(history)):

@@ -39,9 +39,9 @@ class BaseAlg(ABC):
         optim_lr: float,
         max_grad_norm: Optional[float],
         gamma: float,
-        mean_time_limit_init: float,
-        mean_time_limit_growth: float,
-        mean_time_limit_ceil: float,
+        max_time_mean_init: float,
+        max_time_mean_growth: float,
+        max_time_mean_ceil: float,
         entropy_weight_init: float,
         entropy_weight_decay: float,
         entropy_weight_min: float
@@ -56,9 +56,9 @@ class BaseAlg(ABC):
         self.model_save_path = model_save_dir
         self.model_save_freq = model_save_freq
 
-        self.mean_time_limit = mean_time_limit_init
-        self.mean_time_limit_growth = mean_time_limit_growth
-        self.mean_time_limit_ceil = mean_time_limit_ceil
+        self.max_time_mean = max_time_mean_init
+        self.max_time_mean_growth = max_time_mean_growth
+        self.max_time_mean_ceil = max_time_mean_ceil
 
         self.entropy_weight = entropy_weight_init
         self.entropy_weight_decay = entropy_weight_decay
@@ -70,6 +70,7 @@ class BaseAlg(ABC):
         self.env_kwargs = env_kwargs
 
         torch.manual_seed(seed)
+        self.np_random_max_time = np.random.RandomState(seed)
         self.dataloader_gen = torch.Generator()
         self.dataloader_gen.manual_seed(seed)
 
@@ -101,21 +102,36 @@ class BaseAlg(ABC):
         best_state = None
 
         for i in range(self.num_iterations):
-            self._log_iteration_start(i)
+            max_time = self.np_random_max_time.exponential(self.max_time_mean)
+            max_time = max(max_time, 1e5)
+
+            self._log_iteration_start(i, max_time)
 
             actor_sd = deepcopy(self.agent.actor.state_dict())
+            # critic_sd = None # self.agent.critic.state_dict()
 
             # move params to GPU for learning
             self.agent.actor.to(device, non_blocking=True)
             
             # scatter
-            env_options = {'mean_time_limit': self.mean_time_limit}
-            for conn in self.conns:
-                conn.send((actor_sd, env_options))
+            env_seed = i
+            env_options = {'max_wall_time': max_time}
+            # N = self.num_envs # // 2
+            for j, conn in enumerate(self.conns):
+                env_seed = i
+                # env_seed = i * N + (j % N)
+                # env_seed = 4*i + int(4 * (j / self.num_envs))
+                conn.send((
+                    actor_sd, 
+                    # critic_sd,
+                    env_seed, 
+                    env_options
+                ))
 
             # gather
             (rollout_buffers,
              avg_job_durations,
+             _,
              completed_job_counts,
              job_arrival_counts) = \
                 zip(*[conn.recv() for conn in self.conns])
@@ -134,13 +150,18 @@ class BaseAlg(ABC):
                     'iteration': i,
                     'avg_num_jobs': np.round(self.return_calc.avg_num_jobs, 3),
                     'state_dict': actor_sd,
-                    'mean_time_limit': int(self.mean_time_limit * 1e-3),
+                    'max_time': int(max_time * 1e-3),
+                    'max_time_mean': int(self.max_time_mean * 1e-3),
                     'completed_job_count': int(np.mean(completed_job_counts))
                 }
 
-            # periodically flush the best state
             if (i+1) % self.model_save_freq == 0:
-                self._save_best_state(i, best_state)
+                dir = f'{self.model_save_path}/{i+1}'
+                os.mkdir(dir)
+                best_sd = best_state.pop('state_dict')
+                torch.save(best_sd, f'{dir}/model.pt')
+                with open(f'{dir}/state.json', 'w') as fp:
+                    json.dump(best_state, fp)
                 best_state = None
 
             if self.summary_writer:
@@ -153,7 +174,9 @@ class BaseAlg(ABC):
                     avg_job_durations,
                     completed_job_counts,
                     job_arrival_counts,
-                    ep_lens
+                    ep_lens,
+                    max_time,
+                    approx_kl_div
                 )
 
             self._update_hyperparams(i)
@@ -207,8 +230,10 @@ class BaseAlg(ABC):
 
 
     @classmethod
-    def _log_iteration_start(cls, i):
+    def _log_iteration_start(cls, i, max_time):
         print_str = f'training on sequence {i+1}'
+        if max_time < np.inf:
+            print_str += f' (max wall time = {max_time*1e-3:.1f}s)'
         print(print_str, flush=True)
 
 
@@ -225,6 +250,7 @@ class BaseAlg(ABC):
                 target=rollout_worker, 
                 args=(
                     rank, 
+                    self.num_envs, 
                     conn_sub, 
                     self.env_kwargs, 
                     self.log_dir
@@ -241,17 +267,6 @@ class BaseAlg(ABC):
         [proc.join() for proc in self.procs]
 
 
-
-    def _save_best_state(self, i, best_state):
-        dir = f'{self.model_save_path}/{i+1}'
-        os.mkdir(dir)
-        best_sd = best_state.pop('state_dict')
-        torch.save(best_sd, f'{dir}/model.pt')
-        with open(f'{dir}/state.json', 'w') as fp:
-            json.dump(best_state, fp)
-
-
-
     def _write_stats(
         self,
         epoch: int,
@@ -261,7 +276,11 @@ class BaseAlg(ABC):
         avg_job_durations: list[float],
         completed_job_counts: list[int],
         job_arrival_counts: list[int],
-        ep_lens: list[int]
+        ep_lens: list[int],
+        max_time: float,
+        approx_kl_div: float
+        # avg_num_jobs,
+        # returns
     ) -> None:
 
         episode_stats = {
@@ -272,8 +291,13 @@ class BaseAlg(ABC):
             'completed jobs count': np.mean([x for x in completed_job_counts if x is not None]),
             'job arrival count': np.mean([x for x in job_arrival_counts if x is not None]),
             'episode length': np.mean(ep_lens),
+            'max time': max_time * 1e-3,
             'rolling avg num jobs': self.return_calc.avg_num_jobs,
-            'entropy weight': self.entropy_weight
+            'entropy weight': self.entropy_weight,
+            'KL div': approx_kl_div
+            # 'avg num jobs': np.mean([x for x in avg_num_jobs if x is not None]),
+            # 'norm. -return': -np.mean(returns),
+            # 'max time mean': self.max_time_mean * 1e-3,
         }
 
         for name, stat in episode_stats.items():
@@ -282,11 +306,14 @@ class BaseAlg(ABC):
 
 
     def _update_hyperparams(self, iteration) -> None:
-        # geometrically increase the mean episode duration
-        self.mean_time_limit = min(
-            self.mean_time_limit * self.mean_time_limit_growth, 
-            self.mean_time_limit_ceil
+        # # geometrically increase the mean episode duration
+        self.max_time_mean = min(
+            self.max_time_mean * self.max_time_mean_growth, 
+            self.max_time_mean_ceil
         )
+
+        # if (iteration+1) % 50 == 0:
+        #     self.num_job_arrivals += 20
 
         # geometrically decrease the entropy weight
         self.entropy_weight = max(

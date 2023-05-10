@@ -19,6 +19,9 @@ class VPG(BaseAlg):
     def __init__(
         self,
         env_kwargs: dict,
+        mean_time_limit_init: float,
+        mean_time_limit_growth: float,
+        mean_time_limit_ceil: float,
         num_iterations: int = 500,
         num_epochs: int = 4,
         batch_size: Optional[int] = 512,
@@ -32,9 +35,6 @@ class VPG(BaseAlg):
         optim_lr: float = 3e-4,
         max_grad_norm: Optional[float] = None,
         gamma: float = .99,
-        max_time_mean_init: float = np.inf,
-        max_time_mean_growth: float = 0.,
-        max_time_mean_ceil: float = 0.,
         entropy_weight_init: float = 1.,
         entropy_weight_decay: float = 1e-3,
         entropy_weight_min: float = 1e-4
@@ -54,9 +54,9 @@ class VPG(BaseAlg):
             optim_lr,
             max_grad_norm,
             gamma,
-            max_time_mean_init,
-            max_time_mean_growth,
-            max_time_mean_ceil,
+            mean_time_limit_init,
+            mean_time_limit_growth,
+            mean_time_limit_ceil,
             entropy_weight_init,
             entropy_weight_decay,
             entropy_weight_min
@@ -69,20 +69,23 @@ class VPG(BaseAlg):
         rollout_buffers: Iterable[RolloutBuffer]
     ) -> tuple[float, float]:
         
-        obsns_list, actions_list, wall_times_list, rewards_list, lgprobs_list = \
+        obsns_list, actions_list, wall_times_list, rewards_list, lgprobs_list, resets_list = \
             zip(*(
                 (
                     buff.obsns, 
                     buff.actions, 
                     buff.wall_times, 
                     buff.rewards,
-                    buff.lgprobs
+                    buff.lgprobs,
+                    buff.resets
                 )
                 for buff in rollout_buffers 
                 if buff is not None
             )) 
 
-        returns_list = self.return_calc(rewards_list, wall_times_list)
+        returns_list = self.return_calc(rewards_list, wall_times_list, resets_list)
+
+        wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
         baselines_list = compute_baselines(wall_times_list, returns_list)
 
         total_loss = 0
@@ -95,16 +98,15 @@ class VPG(BaseAlg):
             actions = torch.tensor(actions)
             lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
-            with torch.no_grad():
-                assert lgprobs.allclose(torch.tensor(old_lgprobs))
+            self._check_lgprobs(lgprobs, torch.tensor(old_lgprobs))
 
             adv = torch.from_numpy(returns - baselines).float()
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            policy_loss = -(lgprobs * adv).sum()
+            policy_loss = -(lgprobs * adv).mean() # .sum()
             policy_losses += [policy_loss.item()]
 
-            entropy_loss = -entropies.sum()
-            entropy_losses += [entropy_loss.item() / adv.numel()]
+            entropy_loss = -entropies.mean() # .sum()
+            entropy_losses += [entropy_loss.item()] # / adv.numel()]
 
             total_loss += policy_loss + self.entropy_weight * entropy_loss
 
@@ -114,3 +116,13 @@ class VPG(BaseAlg):
                np.mean(entropy_losses), \
                0, \
                0
+    
+
+
+    @torch.no_grad()
+    def _check_lgprobs(self, new_lgprobs, old_lgprobs):
+        if not new_lgprobs.allclose(old_lgprobs):
+            print('difference in logprobs')
+            print('original:', old_lgprobs)
+            print('new:', new_lgprobs)
+            print(flush=True)
