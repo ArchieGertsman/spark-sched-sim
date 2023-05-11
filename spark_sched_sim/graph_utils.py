@@ -46,7 +46,7 @@ def subgraph(edge_links, node_mask):
 
 
 def obs_to_torch(obs: ObsType) -> Batch:
-    '''converts an env observation to a PyG `Batch` object'''
+    '''converts an env observation into a tensor dict whose data is fed into the model'''
     obs_dag_batch = obs['dag_batch']
     ptr = np.array(obs_dag_batch['ptr'])
     num_nodes_per_dag = ptr[1:] - ptr[:-1]
@@ -107,12 +107,16 @@ def collate_edge_mask_batches(edge_mask_batches, total_num_edges):
     message passing depth varies between observations, edge mask batches are padded
     to the maximum depth.'''
     max_depth = max(edge_mask_batch.shape[0] for edge_mask_batch in edge_mask_batches)
+
+    # array that will be populated with the mask batches from all the observations
     edge_mask_batch = np.zeros((max_depth, total_num_edges), dtype=bool)
+
     i = 0
     for mask_batch in edge_mask_batches:
+        # copy the data from this mask batch into the large one
         depth, num_edges = mask_batch.shape
         if depth > 0:
-            edge_mask_batch[:depth, i : i+num_edges] = mask_batch
+            edge_mask_batch[:depth, i:(i+num_edges)] = mask_batch
         i += num_edges
     return edge_mask_batch
 
@@ -163,6 +167,10 @@ def collate_dag_batches(dag_batches: list[ObsType]) -> Batch:
 
 
 def construct_message_passing_masks(edge_links, num_nodes):
+    '''returns a batch of edge masks of shape (msg passing depth, num edges), 
+    where the i'th mask indicates which edges participate in the i'th root-to-leaf 
+    message passing step.
+    '''
     G = nx.DiGraph()
     G.add_nodes_from(range(num_nodes))
     G.add_edges_from(edge_links)

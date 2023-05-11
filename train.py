@@ -5,8 +5,8 @@ from trainers import VPG
 
 if __name__ == '__main__':
     trainer = VPG(
-        num_iterations=1,
-        num_envs=4,
+        num_iterations=10000,
+        num_envs=16,
         log_options={
             'proc_dir': 'ignore/log/proc',
             'tensorboard_dir': 'ignore/log/train/'
@@ -34,7 +34,8 @@ if __name__ == '__main__':
         model_kwargs={
             'dim_embed': 8,
             'optim_class': Adam,
-            'optim_lr': .001
+            'optim_lr': .001,
+            'max_grad_norm': 2.
         }
     )
 

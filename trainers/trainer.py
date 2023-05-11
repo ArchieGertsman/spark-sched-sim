@@ -119,6 +119,7 @@ class Trainer(ABC):
 
             if (i+1) % self.model_save_options['freq'] == 0:
                 self._save_best_model(i, best_state)
+                best_state = None
 
             if self.summary_writer:
                 ep_lens = [len(buff) for buff in rollout_buffers if buff]
@@ -204,7 +205,6 @@ class Trainer(ABC):
         torch.save(best_sd, f'{dir}/model.pt')
         with open(f'{dir}/state.json', 'w') as fp:
             json.dump(best_state, fp)
-        best_state = None
 
 
 
