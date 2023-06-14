@@ -15,18 +15,20 @@ class ReturnsCalculator:
 
         
 
-    def __call__(self, rewards_list, times_list):
+    def __call__(self, rewards_list, times_list, resets_list):
         dt_list = [np.array(ts[1:]) - np.array(ts[:-1]) for ts in times_list]
         self._update_avg_num_jobs(dt_list, rewards_list)
 
         diff_returns_list = []
-        for dt, rew in zip(dt_list, rewards_list):
+        for dt, rew, resets in zip(dt_list, rewards_list, resets_list):
             diff_returns = np.zeros(len(rew))
             dr = 0
             for k in reversed(range(dt.size)):
                 job_time = -rew[k]
                 expected_job_time = dt[k] * self.avg_num_jobs
                 diff_rew = -(job_time - expected_job_time)
+                if resets and k in resets:
+                    dr = 0
                 diff_returns[k] = dr = (diff_rew + dr)
             diff_returns_list += [diff_returns]
         return diff_returns_list

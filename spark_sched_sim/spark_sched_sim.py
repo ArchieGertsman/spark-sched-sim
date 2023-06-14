@@ -2,6 +2,7 @@ from typing import Optional
 from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from itertools import chain
+from collections import deque
 
 import numpy as np
 from gymnasium import Env
@@ -48,7 +49,8 @@ class SparkSchedSimEnv(Env):
         job_arrival_cap: int,
         job_arrival_rate: float,
         moving_delay: float,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        **kwargs
     ):
         '''
         Args:
@@ -95,6 +97,8 @@ class SparkSchedSimEnv(Env):
         else:
             self.renderer = None
 
+        self.job_duration_buff = deque(maxlen=200)
+
         self.action_space = Dict({
             # stage selection
             # NOTE: upper bound of this space is dynamic, equal to 
@@ -106,21 +110,19 @@ class SparkSchedSimEnv(Env):
         })
 
         self.observation_space = Dict({
-            'dag_batch': Dict({
-                # shape: (num active stages) x (num node features)
-                # stage features: num remaining tasks, most recent task duration, is stage schedulable
-                # edge features: none
-                'data': Graph(node_space=Box(0, np.inf, (NUM_NODE_FEATURES,)), 
-                              edge_space=Discrete(1)),
+            # shape: (num active stages) x (num node features)
+            # stage features: num remaining tasks, most recent task duration, is stage schedulable
+            # edge features: none
+            'dag_batch': Graph(node_space=Box(0, np.inf, (NUM_NODE_FEATURES,)), 
+                            edge_space=Discrete(1)),
 
-                # length: num active jobs
-                # `ptr[job_idx]` returns the index of the first stage associated with 
-                # that job. E.g., the range of stage indices for a job is given by 
-                # `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
-                # NOTE: upper bound of this space is dynamic, equal to 
-                # the number of active stages. Initialized to 1.
-                'ptr': Sequence(Discrete(1)),
-            }),
+            # length: num active jobs
+            # `ptr[job_idx]` returns the index of the first stage associated with 
+            # that job. E.g., the range of stage indices for a job is given by 
+            # `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
+            # NOTE: upper bound of this space is dynamic, equal to 
+            # the number of active stages. Initialized to 1.
+            'dag_ptr': Sequence(Discrete(1)),
 
             # integer that represents how many executors need to be scheduled
             'num_executors_to_schedule': Discrete(num_executors+1),
@@ -142,11 +144,9 @@ class SparkSchedSimEnv(Env):
         return self.num_completed_jobs == len(self.jobs.keys())
 
 
-
     @property
     def num_completed_jobs(self):
         return len(self.completed_job_ids)
-
 
 
     @property
@@ -154,38 +154,34 @@ class SparkSchedSimEnv(Env):
         return len(self.active_job_ids)
 
 
-
-    @property
-    def done(self):
-        return self.terminated or self.truncated
-
-
-
     @property
     def info(self):
         return {'wall_time': self.wall_time}
+    
+
+    @property
+    def avg_job_duration(self):
+        return np.mean(self.job_duration_buff) * 1e-3
 
 
-
+    def seed(self, seed):
+        super().reset(seed=seed)
+    
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        try:
-            self.time_limit = options['time_limit']
-        except:
-            self.time_limit = np.inf
-
         # simulation wall time in ms
         self.wall_time = 0
-
-        self.terminated = False
-        self.truncated = False
         
         self.datagen.reset(self.np_random)
         self.task_duration_gen.reset(self.np_random)
 
         # priority queue of scheduling events, indexed by wall time
-        self.timeline = self.datagen.new_timeline(self.time_limit)
+        try:
+            time_limit = options['time_limit']
+        except:
+            time_limit = np.inf
+        self.timeline = self.datagen.new_timeline(time_limit)
 
         # timeline is initially filled with all the job arrival events, so extract 
         # all the job objects from there
@@ -220,12 +216,12 @@ class SparkSchedSimEnv(Env):
 
 
     def step(self, action):
-        assert not self.done
-
         self._take_action(action)
 
-        if self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0:
-            # there are still scheduling decisions to be made, so consult the agent again
+        if self.exec_tracker.num_executors_to_schedule() > 0 \
+            and len(self.schedulable_stages) > 0:
+            # there are still scheduling decisions to be made, so consult 
+            # the agent again
             return self._observe(), 0, False, False, self.info
             
         # commitment round has completed, now schedule the free executors
@@ -242,12 +238,12 @@ class SparkSchedSimEnv(Env):
         self._resume_simulation()
 
         reward = self._calculate_reward(old_wall_time, old_active_job_ids)
-        self.terminated = self.all_jobs_complete
-        self.truncated = self.wall_time >= self.time_limit
+        terminated = self.all_jobs_complete
 
-        if not self.done:
+        if not terminated:
             # print('starting new scheduling round', flush=True)
-            assert self.exec_tracker.num_executors_to_schedule() > 0 and len(self.schedulable_stages) > 0
+            assert self.exec_tracker.num_executors_to_schedule() > 0 \
+                and len(self.schedulable_stages) > 0
         # else:
         #     print(f'done at {self.wall_time*1e-3:.1f}s', flush=True)
 
@@ -256,7 +252,7 @@ class SparkSchedSimEnv(Env):
 
         # if the episode isn't done, then start a new scheduling 
         # round at the current executor source
-        return self._observe(), reward, self.terminated, self.truncated, self.info
+        return self._observe(), reward, terminated, False, self.info
 
 
 
@@ -312,8 +308,8 @@ class SparkSchedSimEnv(Env):
         assert stage in self.schedulable_stages, 'the selected stage is not currently schedulable'
 
         num_executors = action['num_exec']
-        assert num_executors >= 1
-        assert num_executors <= self.exec_tracker.num_executors_to_schedule()
+        assert num_executors >= 1, 'too few executors selected'
+        assert num_executors <= self.exec_tracker.num_executors_to_schedule(), 'too many executors selected'
 
         # print('action:', stage.pool_key, num_executors)
 
@@ -377,13 +373,14 @@ class SparkSchedSimEnv(Env):
         self.stage_selection_map.clear()
         
         nodes = []
-        ptr = [0]
+        dag_ptr = [0]
         active_stage_mask = np.zeros(self.num_total_stages, dtype=bool)
         executor_counts = []
         source_job_idx = len(self.active_job_ids)
 
-        for stage in iter(self.schedulable_stages):
-            stage.schedulable = True
+        for i, stage in enumerate(iter(self.schedulable_stages)):
+            self.stage_selection_map[i] = stage
+            stage.is_schedulable = True
 
         for i, job_id in enumerate(self.active_job_ids):
             job = self.jobs[job_id]
@@ -394,14 +391,18 @@ class SparkSchedSimEnv(Env):
             executor_counts += [self.exec_tracker.total_executor_count(job_id)]
 
             for stage in job.active_stages:
-                self.stage_selection_map[len(nodes)] = stage
-                
-                nodes += [(stage.num_remaining_tasks, stage.most_recent_duration, stage.schedulable)]
-                stage.schedulable = False
+                nodes += [
+                    (
+                        stage.num_remaining_tasks, 
+                        stage.most_recent_duration, 
+                        stage.is_schedulable
+                    )
+                ]
+                stage.is_schedulable = False
 
                 active_stage_mask[self.all_job_ptr[job_id] + stage.id_] = 1
 
-            ptr += [len(nodes)]
+            dag_ptr += [len(nodes)]
 
         try:
             nodes = np.vstack(nodes).astype(np.float32)
@@ -417,17 +418,15 @@ class SparkSchedSimEnv(Env):
         num_executors_to_schedule = self.exec_tracker.num_executors_to_schedule()
 
         obs = {
-            'dag_batch': {
-                'data': GraphInstance(nodes, edges, edge_links),
-                'ptr': ptr
-            },
+            'dag_batch': GraphInstance(nodes, edges, edge_links),
+            'dag_ptr': dag_ptr,
             'num_executors_to_schedule': num_executors_to_schedule,
             'source_job_idx': source_job_idx,
             'executor_counts': executor_counts
         }
 
         # update stage action space to reflect the current number of active stages
-        self.observation_space['dag_batch']['ptr'].feature_space.n = len(nodes) + 1
+        self.observation_space['dag_ptr'].feature_space.n = len(nodes) + 1
         self.action_space['stage_idx'].n = len(nodes) + 1
 
         return obs
@@ -772,6 +771,7 @@ class SparkSchedSimEnv(Env):
         self.active_job_ids.remove(job.id_)
         self.completed_job_ids.add(job.id_)
         job.t_completed = self.wall_time
+        self.job_duration_buff.append(job.t_completed - job.t_arrival)
 
 
 

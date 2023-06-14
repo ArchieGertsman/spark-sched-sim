@@ -1,6 +1,6 @@
 import numpy as np
 
-from .scheduler import HeuristicScheduler
+from .heuristic import HeuristicScheduler
 
 
 

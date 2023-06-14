@@ -6,11 +6,12 @@ class Profiler:
     then prints out the function calls sorted by cumulative
     execution time
     '''
-    def __init__(self):
+    def __init__(self, amount=20):
         self.pr = cProfile.Profile()
+        self.amount = amount
 
 
-    def __enter__(self):
+    def __enter__(self, ):
         self.pr.enable()
         return self
 
@@ -22,5 +23,5 @@ class Profiler:
         s = io.StringIO()
         ps = pstats.Stats(self.pr, stream=s) \
                    .sort_stats(SortKey.CUMULATIVE)
-        ps.print_stats()
+        ps.print_stats(self.amount)
         print(s.getvalue(), flush=True)

@@ -18,49 +18,43 @@ class VPG(Trainer):
 
     def __init__(
         self,
-        num_iterations,
-        num_envs,
+        scheduler_cls,
+        device,
         log_options,
-        model_save_options,
-        time_limit_options,
-        entropy_options,
+        checkpoint_options,
         env_kwargs,
         model_kwargs,
-        seed=42
+        seed=42,
+        async_rollouts=False,
+        entropy_coeff=1e-4
     ):  
         super().__init__(
-            num_iterations,
-            num_envs,
+            scheduler_cls,
+            device,
             log_options,
-            model_save_options,
-            time_limit_options,
-            entropy_options,
+            checkpoint_options,
             env_kwargs,
             model_kwargs,
-            seed
+            seed,
+            async_rollouts
         )
+
+        self.entropy_coeff = entropy_coeff
     
 
+    def learn_from_rollouts(self, rollout_buffers):
+        (obsns_list, actions_list, wall_times_list, 
+         rewards_list, lgprobs_list, resets_list) = zip(*(
+            (
+                buff.obsns, buff.actions, buff.wall_times, 
+                buff.rewards, buff.lgprobs, buff.resets
+            )
+            for buff in rollout_buffers 
+            if buff is not None
+        )) 
 
-    def _learn_from_rollouts(
-        self,
-        rollout_buffers: Iterable[RolloutBuffer]
-    ) -> tuple[float, float]:
-        
-        obsns_list, actions_list, wall_times_list, rewards_list, lgprobs_list = \
-            zip(*(
-                (
-                    buff.obsns, 
-                    buff.actions, 
-                    buff.wall_times, 
-                    buff.rewards,
-                    buff.lgprobs
-                )
-                for buff in rollout_buffers 
-                if buff is not None
-            )) 
-
-        returns_list = self.return_calc(rewards_list, wall_times_list)
+        returns_list = self.return_calc(
+            rewards_list, wall_times_list, resets_list)
 
         wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
         baselines_list = compute_baselines(wall_times_list, returns_list)
@@ -74,20 +68,26 @@ class VPG(Trainer):
             actions = torch.tensor(actions)
             lgprobs, entropies = self.agent.evaluate_actions(obsns, actions)
 
+            # re-computed log-probs don't exactly match the original ones,
+            # but it doesn't seem to affect training
             # with torch.no_grad():
+            #     diff = (lgprobs - torch.tensor(old_lgprobs)).abs()
             #     assert lgprobs.allclose(torch.tensor(old_lgprobs))
 
             adv = torch.from_numpy(returns - baselines).float()
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            policy_loss = -(lgprobs * adv).sum()
+            policy_loss = -(lgprobs * adv).mean()
             policy_losses += [policy_loss.item()]
 
-            entropy_loss = -entropies.sum()
-            entropy_losses += [entropy_loss.item() / adv.numel()]
+            entropy_loss = -entropies.mean()
+            entropy_losses += [entropy_loss.item()]
 
-            loss = policy_loss + self.entropy_weight * entropy_loss
+            loss = policy_loss + self.entropy_coeff * entropy_loss
             loss.backward()
 
         self.agent.update_parameters()
         
-        return np.mean(policy_losses), np.mean(entropy_losses)
+        return {
+            'policy loss': np.mean(policy_losses),
+            'entropy': np.mean(entropy_losses)
+        }

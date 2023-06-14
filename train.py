@@ -1,42 +1,41 @@
-from torch.optim import Adam
+import torch
+from torch import optim
 
-from trainers import VPG
+from trainers import *
+from spark_sched_sim.schedulers import *
 
 
 if __name__ == '__main__':
-    trainer = VPG(
-        num_iterations=10000,
-        num_envs=16,
-        log_options={
+    trainer = PPO(
+        scheduler_cls = DecimaScheduler,
+
+        device = torch.device(
+            'cuda:1' if torch.cuda.is_available() else 'cpu'),
+
+        log_options = {
             'proc_dir': 'ignore/log/proc',
-            'tensorboard_dir': 'ignore/log/train/'
+            # 'tensorboard_dir': 'ignore/log/train/'
         },
-        model_save_options={
+
+        checkpoint_options = {
             'dir': 'ignore/models',
-            'freq': 100
+            'freq': 50
         },
-        time_limit_options={
-            'init': 2e6,
-            'factor': 1.0008,
-            'ceil': 2e7
-        },
-        entropy_options={
-            'init': 1.,
-            'delta': 1e-3,
-            'floor': 1e-4
-        },
-        env_kwargs={
+
+        env_kwargs = {
             'num_executors': 50,
             'job_arrival_cap': 200,
             'job_arrival_rate': 1/25000,
-            'moving_delay': 2000.
+            'moving_delay': 2000.,
+            'mean_time_limit': 2e7
         },
-        model_kwargs={
-            'dim_embed': 8,
-            'optim_class': Adam,
-            'optim_lr': .001,
-            'max_grad_norm': 2.
+
+        model_kwargs = {
+            'dim_embed': 16,
+            'optim_class': optim.Adam,
+            'optim_lr': .0005,
+            'max_grad_norm': .5
         }
     )
 
-    trainer.train()
+    trainer.train(num_iterations=1, num_envs=16)

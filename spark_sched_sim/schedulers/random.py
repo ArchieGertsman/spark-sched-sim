@@ -1,6 +1,6 @@
 import numpy as np
 
-from .scheduler import HeuristicScheduler
+from .heuristic import HeuristicScheduler
 
 
 
@@ -10,11 +10,9 @@ class RandomScheduler(HeuristicScheduler):
         super().__init__('Random')
         self.set_seed(seed)
 
-
     
     def set_seed(self, seed):
         self.np_random = np.random.RandomState(seed)
-
     
 
     def schedule(self, obs):

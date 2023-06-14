@@ -8,7 +8,7 @@ from torch.multiprocessing import set_start_method, Pool
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-from spark_sched_sim.wrappers.decima_wrappers import DecimaObsWrapper, DecimaActWrapper
+from spark_sched_sim.wrappers import *
 from spark_sched_sim.metrics import avg_job_duration
 from trainers.utils import HiddenPrints
 from spark_sched_sim.schedulers import *
@@ -28,34 +28,38 @@ def main():
     base_seed = 20000
 
 
-    fifo_scheduler = RoundRobinScheduler(num_executors, dynamic_partition=False)
-    fair_scheduler = RoundRobinScheduler(num_executors, dynamic_partition=True)
-    random_scheduler = RandomScheduler()
-    # model_dir = 'ignore/models/1000'
-    # model_name = 'model.pt'
+
+    fair_kwargs = {
+        'num_executors': num_executors,
+        'dynamic_partition': True
+    }
+
+    model_dir = 'ignore/models/700'
+    model_name = 'model.pt'
     # decima_scheduler = \
     #     DecimaScheduler(
     #         num_executors,
-    #         training_mode=False, 
     #         state_dict_path=f'{model_dir}/{model_name}'
     #     )
+    # dagnn_scheduler = DAGNNScheduler(
+    #     num_executors, state_dict_path=f'{model_dir}/{model_name}', dim_embed=16)
+    dagformer_kwargs = {
+        'num_executors': num_executors, 
+        'state_dict_path': f'{model_dir}/{model_name}', 
+        'dim_embed': 16
+    }
 
     env_kwargs = {
         'num_executors': num_executors,
-        'job_arrival_cap': 500,
+        'job_arrival_cap': 1000,
         'job_arrival_rate': 1/25000,
         'moving_delay': 2000.
     }
 
-    env_id = 'spark_sched_sim:SparkSchedSimEnv-v0'
-    base_env = gym.make(env_id, **env_kwargs)
-    # wrapped_env = DecimaActWrapper(DecimaObsWrapper(base_env))
-
     test_instances = [
-        (fifo_scheduler, base_env, num_tests, base_seed),
-        (fair_scheduler, base_env, num_tests, base_seed),
-        (random_scheduler, base_env, num_tests, base_seed),
-        # (decima_scheduler, wrapped_env, num_tests, base_seed)
+        (RoundRobinScheduler, fair_kwargs, env_kwargs, num_tests, base_seed),
+        (RandomScheduler, {}, env_kwargs, num_tests, base_seed),
+        (DAGformerScheduler, dagformer_kwargs, env_kwargs, num_tests, base_seed)
     ]
 
     # run tests in parallel using multiprocessing
@@ -77,7 +81,15 @@ def test(instance):
     sys.stdout = open(f'ignore/log/proc_test/main.out', 'a')
     torch.set_num_threads(1)
 
-    sched, env, num_tests, base_seed = instance
+    sched_cls, sched_kwargs, env_kwargs, num_tests, base_seed = instance
+
+    sched = sched_cls(**sched_kwargs)
+
+    env = gym.make(
+        'spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
+    if isinstance(sched, NeuralScheduler):
+        env = NeuralActWrapper(env)
+        env = sched.obs_wrapper_cls(env)
 
     avg_job_durations = []
 
@@ -116,7 +128,7 @@ def run_episode(env, sched, seed):
     rewards = []
     
     while not done:
-        if isinstance(sched, DecimaScheduler):
+        if isinstance(sched, NeuralScheduler):
             action, *_ = sched(obs)
         else:
             action = sched(obs)
