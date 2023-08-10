@@ -14,6 +14,8 @@ class StochasticTimeLimit(Wrapper):
 
     def reset(self, seed=None, options=None):
         '''samples a new time limit prior to resetting'''
+        if seed:
+            self.np_random = np.random.RandomState(seed)
         self.time_limit = self.np_random.exponential(self.mean_time_limit)
         print(f'resetting. seed={seed}, timelim={int(self.time_limit*1e-3)}s', 
               flush=True)

@@ -1,4 +1,6 @@
 
+import os.path as osp
+
 import numpy as np
 import networkx as nx
 
@@ -7,20 +9,29 @@ from ..components import Job, Stage
 
 
 
-QUERY_BASE_PATH = 'spark_sched_sim/datagen/tpch_dataset'
 TPCH_SIZES = ['2g','5g','10g','20g','50g','80g','100g']
 NUM_QUERIES = 22
 
 
 class TPCHJobSequenceGen(BaseJobSequenceGen):
+    def __init__(self, job_arrival_rate, job_arrival_cap, query_dir):
+        super().__init__(job_arrival_rate, job_arrival_cap)
+        self.query_dir = query_dir
+
 
     def generate_job(self, job_id, t_arrival):
+        # query_num = 1 + self.np_random.randint(NUM_QUERIES)
         query_num = 1 + self.np_random.integers(NUM_QUERIES)
         query_size = self.np_random.choice(TPCH_SIZES)
-        query_path = f'{QUERY_BASE_PATH}/{query_size}'
+        query_path = osp.join(self.query_dir, str(query_size))
         
-        adj_matrix = np.load(f'{query_path}/adj_mat_{query_num}.npy', allow_pickle=True)
-        task_durations = np.load(f'{query_path}/task_duration_{query_num}.npy', allow_pickle=True).item()
+        adj_matrix = np.load(
+            osp.join(query_path, f'adj_mat_{query_num}.npy'), 
+            allow_pickle=True)
+        
+        task_durations = np.load(
+            osp.join(query_path, f'task_duration_{query_num}.npy'), 
+            allow_pickle=True).item()
         
         assert adj_matrix.shape[0] == adj_matrix.shape[1]
         assert adj_matrix.shape[0] == len(task_durations)

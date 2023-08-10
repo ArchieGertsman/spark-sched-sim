@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from .trainer import Trainer
-from .utils import compute_baselines
 from spark_sched_sim import graph_utils
 
 
@@ -23,8 +22,8 @@ class RolloutDataset(Dataset):
         return len(self.obsns)
     
     def __getitem__(self, idx):
-        return self.obsns[idx], self.acts[idx], self.advgs[idx], \
-               self.lgprobs[idx]
+        return self.obsns[idx], self.acts[idx], \
+               self.advgs[idx], self.lgprobs[idx]
     
 
 def collate_fn(batch):
@@ -42,54 +41,26 @@ class PPO(Trainer):
 
     def __init__(
         self,
-        scheduler_cls,
-        device,
-        log_options,
-        checkpoint_options,
-        env_kwargs,
-        model_kwargs,
-        seed=42,
-        async_rollouts=False,
-        entropy_coeff=1e-4,
-        clip_range=.2,
-        target_kl=.01,
-        num_epochs=3,
-        num_batches=10
+        agent_cfg,
+        env_cfg,
+        train_cfg
     ):  
         super().__init__(
-            scheduler_cls,
-            device,
-            log_options,
-            checkpoint_options,
-            env_kwargs,
-            model_kwargs,
-            seed,
-            async_rollouts
+            agent_cfg,
+            env_cfg,
+            train_cfg
         )
 
-        self.entropy_coeff = entropy_coeff
-        self.clip_range = clip_range
-        self.target_kl = target_kl
-        self.num_epochs = num_epochs
-        self.num_batches = num_batches
-    
+        self.entropy_coeff = train_cfg.get('entropy_coeff', 0.)
+        self.clip_range = train_cfg.get('clip_range', .2)
+        self.target_kl = train_cfg.get('target_kl', .01)
+        self.num_epochs = train_cfg.get('num_epochs', 10)
+        self.num_batches = train_cfg.get('num_batches', 3)
 
-    def learn_from_rollouts(self, rollout_buffers):
-        (obsns_list, actions_list, wall_times_list, 
-         rewards_list, lgprobs_list, resets_list) = zip(*(
-            (
-                buff.obsns, buff.actions, buff.wall_times, 
-                buff.rewards, buff.lgprobs, buff.resets
-            )
-            for buff in rollout_buffers 
-            if buff is not None
-        )) 
 
-        returns_list = self.return_calc(
-            rewards_list, wall_times_list, resets_list)
-
-        wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
-        baselines_list = compute_baselines(wall_times_list, returns_list)
+    def train_on_rollouts(self, rollout_buffers):
+        obsns_list, actions_list, returns_list, baselines_list, lgprobs_list = \
+            self._preprocess_rollouts(rollout_buffers)
 
         returns = np.array(list(chain(*returns_list)))
         baselines = np.concatenate(baselines_list)
@@ -99,17 +70,17 @@ class PPO(Trainer):
             acts = torch.tensor(list(chain(*actions_list))),
             advgs = torch.from_numpy(returns - baselines).float(),
             lgprobs = torch.tensor(list(chain(*lgprobs_list))))
-
+        
         dataloader = DataLoader(
             dataset,
             batch_size = len(dataset) // self.num_batches + 1,
             shuffle = True,
             collate_fn = collate_fn)
 
-        return self._learn(dataloader)
+        return self._train(dataloader)
     
 
-    def _learn(self, dataloader):
+    def _train(self, dataloader):
         policy_losses = []
         entropy_losses = []
         approx_kl_divs = []

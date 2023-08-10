@@ -1,13 +1,8 @@
-from typing import Optional, Iterable
-from torch import Tensor
-
 import numpy as np
 import torch
 import torch.profiler
 
 from .trainer import Trainer
-from .rollout_worker import RolloutBuffer
-from .utils import compute_baselines
 from spark_sched_sim.graph_utils import collate_obsns
 
 
@@ -18,46 +13,22 @@ class VPG(Trainer):
 
     def __init__(
         self,
-        scheduler_cls,
-        device,
-        log_options,
-        checkpoint_options,
-        env_kwargs,
-        model_kwargs,
-        seed=42,
-        async_rollouts=False,
-        entropy_coeff=1e-4
+        agent_cfg,
+        env_cfg,
+        train_cfg
     ):  
         super().__init__(
-            scheduler_cls,
-            device,
-            log_options,
-            checkpoint_options,
-            env_kwargs,
-            model_kwargs,
-            seed,
-            async_rollouts
+            agent_cfg,
+            env_cfg,
+            train_cfg
         )
 
-        self.entropy_coeff = entropy_coeff
+        self.entropy_coeff = train_cfg.get('entropy_coeff', 0.)
     
 
-    def learn_from_rollouts(self, rollout_buffers):
-        (obsns_list, actions_list, wall_times_list, 
-         rewards_list, lgprobs_list, resets_list) = zip(*(
-            (
-                buff.obsns, buff.actions, buff.wall_times, 
-                buff.rewards, buff.lgprobs, buff.resets
-            )
-            for buff in rollout_buffers 
-            if buff is not None
-        )) 
-
-        returns_list = self.return_calc(
-            rewards_list, wall_times_list, resets_list)
-
-        wall_times_list = [wall_times[:-1] for wall_times in wall_times_list]
-        baselines_list = compute_baselines(wall_times_list, returns_list)
+    def train_on_rollouts(self, rollout_buffers):
+        obsns_list, actions_list, returns_list, baselines_list, lgprobs_list = \
+            self._preprocess_rollouts(rollout_buffers)
 
         policy_losses = []
         entropy_losses = []

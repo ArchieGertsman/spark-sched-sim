@@ -1,3 +1,4 @@
+from typing import Optional
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -7,21 +8,18 @@ from ..components import Job
 
 
 class BaseJobSequenceGen(ABC):
-
     def __init__(
-        self, 
-        job_arrival_cap: int, 
-        job_arrival_rate: float
+        self,
+        job_arrival_rate: float,
+        job_arrival_cap: Optional[int]
     ):
-        self.job_arrival_cap = job_arrival_cap
         self.mean_interarrival_time = 1 / job_arrival_rate
+        self.job_arrival_cap = job_arrival_cap
         self.np_random = None
-
 
 
     def reset(self, np_random: np.random.RandomState):
         self.np_random = np_random
-
 
 
     def new_timeline(self, max_time) -> Timeline:
@@ -33,22 +31,20 @@ class BaseJobSequenceGen(ABC):
 
         t = 0
         job_idx = 0
-        while t < max_time and job_idx < self.job_arrival_cap:
+        while t < max_time \
+            and (not self.job_arrival_cap or job_idx < self.job_arrival_cap):
             job = self.generate_job(job_idx, t)
-            timeline.push(
-                t, 
-                TimelineEvent(
-                    type = TimelineEvent.Type.JOB_ARRIVAL, 
-                    data = {'job': job}
-                )
-            )
+            # print(job)
+
+            timeline.push(t, TimelineEvent(
+                type = TimelineEvent.Type.JOB_ARRIVAL, 
+                data = {'job': job}))
 
             # sample time in ms until next arrival
             t += self.np_random.exponential(self.mean_interarrival_time)
             job_idx += 1
 
         return timeline
-
 
 
     @abstractmethod

@@ -54,6 +54,10 @@ class Job:
         self.init_frontier()
 
 
+    def __str__(self):
+         return f'TPCH_{self.query_num}_{self.query_size}'
+
+
 
     @property
     def pool_key(self):

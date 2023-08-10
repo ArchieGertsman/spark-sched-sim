@@ -1,7 +1,7 @@
 
 
 
-GENERAL_POOL_KEY = (None, None)
+COMMON_POOL_KEY = (None, None)
 
 
 class ExecutorTracker:
@@ -14,7 +14,7 @@ class ExecutorTracker:
     - Placeholder pool (key `None`): not an actual pool; it never contains any executors. 
       the executor source is set to null pool when no pool is ready to schedule its executors.
     - General pool (key `(None, None)`): the pool where executors reside when they are not at 
-      any job. All executors start out in the general pool.
+      any job. All executors start out in the common pool.
     - Job pool (key `(job_id, None)`): pool of idle executors at a job
     - Operation pool (key `(job_id, stage_id)`): pool of executors at a stage, including idle 
       and busy
@@ -29,7 +29,7 @@ class ExecutorTracker:
         # executor id -> key of pool where the executor
         # currently resides
         self._executor_locations = {
-            executor_id: GENERAL_POOL_KEY
+            executor_id: COMMON_POOL_KEY
             for executor_id in range(self.num_executors)
         }
 
@@ -37,7 +37,7 @@ class ExecutorTracker:
         # reside at this pool
         self._pools = {
             None: set(),
-            GENERAL_POOL_KEY: set(range(self.num_executors))
+            COMMON_POOL_KEY: set(range(self.num_executors))
         }
 
         # pool key A -> 
@@ -46,19 +46,19 @@ class ExecutorTracker:
         #       pool A to pool B)
         self._commitments = {
             None: {},
-            GENERAL_POOL_KEY: {}
+            COMMON_POOL_KEY: {}
         }
 
         # pool key -> total number of outgoing commitments
         # from this pool
         self._num_commitments_from = {
             None: 0,
-            GENERAL_POOL_KEY: 0
+            COMMON_POOL_KEY: 0
         }
 
         # stage pool key -> total number of commitments to stage
         self._num_commitments_to_stage = {
-            GENERAL_POOL_KEY: 0
+            COMMON_POOL_KEY: 0
         }
 
         # stage pool key -> number of executors moving to stage
@@ -72,7 +72,7 @@ class ExecutorTracker:
         }
 
         # initialize executor source
-        self._curr_source = GENERAL_POOL_KEY
+        self._curr_source = COMMON_POOL_KEY
 
 
 
@@ -101,14 +101,14 @@ class ExecutorTracker:
 
 
     def source_job_id(self):
-        if self._curr_source in [None, GENERAL_POOL_KEY]:
+        if self._curr_source in [None, COMMON_POOL_KEY]:
             return None
         else:
             return self._curr_source[0]
 
 
 
-    def num_executors_to_schedule(self):
+    def num_committable_execs(self):
         num_uncommitted = \
             len(self._pools[self._curr_source]) - \
             self._num_commitments_from[self._curr_source]
@@ -117,8 +117,8 @@ class ExecutorTracker:
 
 
 
-    def general_pool_has_executors(self):
-        return len(self._pools[GENERAL_POOL_KEY]) > 0
+    def common_pool_has_executors(self):
+        return len(self._pools[COMMON_POOL_KEY]) > 0
 
 
 
@@ -132,7 +132,7 @@ class ExecutorTracker:
 
 
     
-    def total_executor_count(self, job_id):
+    def exec_supply(self, job_id):
         return self._total_executor_count[job_id]
 
 

@@ -3,17 +3,14 @@ import numpy as np
 
 
 class TaskDurationGen:
-
-    def __init__(self, exec_cap, warmup_delay=1000):
+    def __init__(self, exec_cap, warmup_delay):
         self.warmup_delay = warmup_delay
         self._init_executor_intervals(exec_cap)
         self.np_random = None
 
 
-
     def reset(self, np_random):
         self.np_random = np_random
-
 
 
     def sample(
@@ -53,7 +50,6 @@ class TaskDurationGen:
             return self._sample('fresh_durations', executor_key)
 
 
-
     def _sample(self, wave, executor_key, warmup=False):
         '''raises an exception if `executor_key` is not found in the durations from `wave`'''
         durations = self.task_duration_data[wave][executor_key]
@@ -61,7 +57,6 @@ class TaskDurationGen:
         if warmup:
             duration += self.warmup_delay
         return duration
-
 
 
     def _sample_executor_key(self, num_local_executors):
@@ -72,7 +67,7 @@ class TaskDurationGen:
         if left_exec == right_exec:
             executor_key = left_exec
         else:
-            # rand_pt = self.np_random.integers(1, right_exec - left_exec + 1)
+            # rand_pt = self.np_random.randint(1, right_exec - left_exec + 1)
             rand_pt = self.np_random.integers(1, right_exec - left_exec + 1)
             if rand_pt <= num_local_executors - left_exec:
                 executor_key = left_exec
@@ -85,7 +80,6 @@ class TaskDurationGen:
 
         return executor_key
     
-
 
     def _init_executor_intervals(self, exec_cap):
         exec_levels = np.array([5, 10, 20, 40, 50, 60, 80, 100])

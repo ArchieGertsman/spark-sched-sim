@@ -1,2 +1,2 @@
 #!/bin/sh
-nohup python train.py > ignore/log/nohup.out &
+nohup python train.py -f $1 > artifacts/nohup.out &

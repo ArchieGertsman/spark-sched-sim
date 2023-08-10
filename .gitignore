@@ -3,4 +3,6 @@ __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
 
-ignore/
+artifacts/
+count_params.py
+eval*

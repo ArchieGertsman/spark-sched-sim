@@ -1,34 +1,61 @@
-from typing import List, Tuple
 import numpy as np
 
 
-def compute_baselines(
-    ts_list: List[np.ndarray], 
-    ys_list: List[np.ndarray]
-) -> Tuple[List[np.ndarray]]:
-    '''linearly interpolated baselines
 
-    args:
-    - `ts_list`: list of wall time arrays (len: num envs)
-    - 'ys_list': list of value (e.g. return) arrays (len: num envs)
-    
-    returns: list of basline arrays (len: num envs)
-    '''
-    ts_unique = np.unique(np.hstack(ts_list))
+class Baseline:
+    def __init__(self, num_sequences, num_rollouts):
+        self.num_sequences = num_sequences
+        self.num_rollouts = num_rollouts
 
-    # shape: (num envs, len(ts_unique))
-    # y_hats[i, t] is the linear interpolation of 
-    # (ts_list[i], ys_list[i]) at time t
-    y_hats = np.vstack([
-        np.interp(ts_unique, ts, ys) 
-        for ts, ys in zip(ts_list, ys_list)
-    ])
 
-    # find baseline at each unique time point
-    baselines = {}
-    for t, y_hat in zip(ts_unique, y_hats.T):
-        baselines[t] = y_hat.mean()
+    def __call__(self, ts_list, ys_list):
+        return self.average(ts_list, ys_list)
 
-    baselines_list = [np.array([baselines[t] for t in ts]) for ts in ts_list]
 
-    return baselines_list
+    def average(self, ts_list, ys_list):
+        baseline_list = []
+        for j in range(self.num_sequences):
+            start = j * self.num_rollouts
+            end = start + self.num_rollouts
+            baseline_list += self._average(
+                ts_list[start:end], ys_list[start:end])
+        return baseline_list
+
+
+    def _average(self, ts_list, ys_list):
+        ts_unique = np.unique(np.hstack(ts_list))
+
+        # shape: (num envs, len(ts_unique))
+        # y_hats[i, t] is the linear interpolation of (ts_list[i], ys_list[i]) 
+        # at time t
+        y_hats = np.vstack([
+            np.interp(ts_unique, ts, ys) 
+            for ts, ys in zip(ts_list, ys_list)
+        ])
+
+        # find baseline at each unique time point
+        baseline = {}
+        for t, y_hat in zip(ts_unique, y_hats.T):
+            baseline[t] = y_hat.mean()
+
+        baseline_list = [
+            np.array([baseline[t] for t in ts]) 
+            for ts in ts_list]
+
+        return baseline_list
+
+
+# def pairwise_average(ts_list, ys_list):
+#     num_envs = len(ts_list)
+
+#     baseline_list = [None] * num_envs
+
+#     for i, j in zip(np.arange(num_envs//2), 
+#                     np.arange(num_envs//2, num_envs)):
+#         baseline_list[i] = \
+#             .5 * (ys_list[i] + np.interp(ts_list[i], ts_list[j], ys_list[j]))
+        
+#         baseline_list[j] = \
+#             .5 * (ys_list[j] + np.interp(ts_list[j], ts_list[i], ys_list[i]))
+
+#     return baseline_list

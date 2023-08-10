@@ -16,3 +16,7 @@ def avg_job_duration(env):
 
 def avg_num_jobs(env):
     return sum(job_durations(env)) / env.wall_time
+
+def job_duration_percentiles(env):
+    jd = job_durations(env)
+    return np.percentile(jd, [25, 50, 75, 100])

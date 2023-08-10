@@ -1,12 +1,15 @@
 import sys
 from abc import ABC, abstractmethod
+import os.path as osp
 
 import gymnasium as gym
 from gymnasium.core import ObsType, ActType
 import torch
 
 from spark_sched_sim.wrappers import *
+from spark_sched_sim.schedulers import *
 from .utils import Profiler, HiddenPrints
+from spark_sched_sim.metrics import *
 
 
 
@@ -36,25 +39,34 @@ class RolloutBuffer:
 
 
 class RolloutWorker(ABC):
+    def __init__(self):
+        self.reset_count = 0
+
+
     def __call__(
         self,
         rank, 
         conn,
-        scheduler_cls, 
+        agent_cls, 
         env_kwargs, 
-        model_kwargs, 
-        log_dir
+        agent_kwargs, 
+        stdout_dir,
+        base_seed,
+        seed_step
     ):
         self.rank = rank
         self.conn = conn
+        self.base_seed = base_seed
+        self.seed_step = seed_step
+        self.reset_count = 0
 
         # log each of the processes to separate files
-        sys.stdout = open(f'{log_dir}/{rank}.out', 'a')
+        sys.stdout = open(osp.join(stdout_dir, f'{rank}.out'), 'a')
 
         # torch multiprocessing is very slow without this
         torch.set_num_threads(1)
 
-        self.agent = scheduler_cls(env_kwargs['num_executors'], **model_kwargs)
+        self.agent = make_scheduler(agent_kwargs)
         self.agent.actor.eval()
 
         env = gym.make('spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
@@ -71,13 +83,14 @@ class RolloutWorker(ABC):
 
 
     def run(self):
+        # self.agent.actor.to('cuda:1', non_blocking=True)
         while data := self.conn.recv():
             # load updated model parameters
             self.agent.actor.load_state_dict(data['actor_sd'])
             
             try:
-                # with Profiler(50): #, HiddenPrints():
-                rollout_buffer = self.collect_rollout()
+                with Profiler(100): #, HiddenPrints():
+                    rollout_buffer = self.collect_rollout()
 
                 self.conn.send({
                     'rollout_buffer': rollout_buffer, 
@@ -93,10 +106,16 @@ class RolloutWorker(ABC):
     def collect_rollout(self) -> RolloutBuffer:
         pass
 
+
+    @property
+    def seed(self):
+        return self.base_seed + self.seed_step * self.reset_count
+
     
     def collect_stats(self):
         return {
             'avg_job_duration': self.env.avg_job_duration,
+            'avg_num_jobs': avg_num_jobs(self.env),
             'num_completed_jobs': self.env.num_completed_jobs,
             'num_job_arrivals': \
                 self.env.num_completed_jobs + self.env.num_active_jobs
@@ -106,14 +125,11 @@ class RolloutWorker(ABC):
 
 class RolloutWorkerSync(RolloutWorker):
     '''model updates are synchronized with environment resets'''
-    def __init__(self):
-        self.reset_count = 0
-
 
     def collect_rollout(self):
         rollout_buffer = RolloutBuffer()
 
-        obs, _ = self.env.reset(seed=self.reset_count)
+        obs, _ = self.env.reset(seed=self.seed)
         self.reset_count += 1
         
         wall_time = 0
@@ -141,9 +157,9 @@ class RolloutWorkerAsync(RolloutWorker):
     '''model updates occur at regular intervals, regardless of when the 
     environment resets
     '''
-    def __init__(self, rollout_duration=2e6):
+    def __init__(self, rollout_duration):
+        super().__init__()
         self.rollout_duration = rollout_duration
-        self.reset_count = 0
         self.next_obs = None
         self.next_wall_time = 0.
 
@@ -152,7 +168,7 @@ class RolloutWorkerAsync(RolloutWorker):
         rollout_buffer = RolloutBuffer(async_rollouts=True)
 
         if self.reset_count == 0:
-            self.next_obs, _ = self.env.reset(seed=0)
+            self.next_obs, _ = self.env.reset(seed=self.seed)
             self.reset_count += 1
 
         elapsed_time = 0
@@ -174,7 +190,7 @@ class RolloutWorkerAsync(RolloutWorker):
             elapsed_time += self.next_wall_time - wall_time
 
             if terminated or truncated:
-                self.next_obs, _ = self.env.reset(seed=self.reset_count)
+                self.next_obs, _ = self.env.reset(seed=self.seed)
                 self.reset_count += 1
                 self.next_wall_time = 0
                 rollout_buffer.add_reset(step)
