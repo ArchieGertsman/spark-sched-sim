@@ -4,7 +4,7 @@ An Apache Spark job scheduling simulator, implemented as a [Gymnasium](https://g
 
 | ![](https://i.imgur.com/w5YqUf4.jpg)| 
 |:--:| 
-| *10 executors processing jobs in parallel across the vertical dimension, where each job is identified by a unique color. Decima achieves better resource packing and lower average job completion time than Spark's standard fair scheduler.* |
+| *Multiple executors processing jobs in parallel (vertical axis) over time (horizontal axis), where each job is identified by a unique color. Decima achieves better resource packing and lower average job completion time than Spark's standard fair scheduler.* |
 
 _What is job scheduling in Spark?_
 - A Spark _application_ is a long-running program within the cluster that submits _jobs_ to be processed by its share of the cluster's resources. Each job encodes a directed acyclic graph (DAG) of _stages_ that depend on each other, where a dependency $A\to B$ means that stage $A$ must finish executing before stage $B$ can begin. Each stage consists of many identical _tasks_ which are units of work that operate over different shards of data. Tasks are processed by _executors_, which are JVM's running on the cluster's _worker_ nodes.
