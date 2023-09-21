@@ -2,7 +2,7 @@
 
 An Apache Spark job scheduling simulator, implemented as a [Gymnasium](https://github.com/Farama-Foundation/Gymnasium) environment.
 
-| ![schedulers](https://imgur.com/a/5zeATR2)| 
+| ![](https://i.imgur.com/w5YqUf4.jpg)| 
 |:--:| 
 | *10 executors processing jobs in parallel across the vertical dimension, where each job is identified by a unique color. Decima achieves better resource packing and lower average job completion time than Spark's standard fair scheduler.* |
 
