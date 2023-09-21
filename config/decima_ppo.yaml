@@ -22,7 +22,7 @@ trainer:
   device: 'cuda:1'
   trainer_cls: 'PPO'
   seed: 2000
-  num_iterations: 1
+  num_iterations: 500
   num_sequences: 4
   num_rollouts: 4
   artifacts_dir: 'artifacts'
