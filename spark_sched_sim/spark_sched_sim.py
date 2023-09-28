@@ -39,18 +39,16 @@ class SparkSchedSimEnv(Env):
         job_arrival_rate: float,
         moving_delay: float,
         warmup_delay: float,
-        query_dir: str,
+        dataset: str,
+        beta: float = 0,
         job_arrival_cap: Optional[int] = None,
         render_mode: Optional[str] = None,
-        beta: Optional[float] = 0,
         **kwargs
     ):
         '''
         Args:
             num_executors (int): number of simulated executors. More executors
                 means a higher possible level of parallelism.
-            job_arrival_cap: (int): limit on the number of jobs that arrive 
-                throughout the simulation
             job_arrival_rate (float): non-negative number that controls how
                 quickly new jobs arrive into the system. This is the parameter
                 of an exponential distributions, and so its inverse is the
@@ -60,6 +58,13 @@ class SparkSchedSimEnv(Env):
             warmup_delay (float): an executor is slower on its first task from 
                 a stage if it was previously idle or moving jobs, which is
                 caputred by adding a warmup delay to the task duration
+            dataset (str): choice of dataset to generate jobs from. Currently,
+                only 'tpch' is supported.
+            beta (float): continuous discount factor in [0,+inf). If set to 0,
+                then rewards are not discounted.
+            job_arrival_cap: (optional int): limit on the number of jobs that 
+                arrive throughout the simulation. If set to `None`, then the
+                episode ends when a time limit is reached.
             render_mode (optional str): if set to 'human', then a visualization
                 of the simulation is rendred in real time
         '''
@@ -69,8 +74,11 @@ class SparkSchedSimEnv(Env):
         self.job_arrival_cap = job_arrival_cap
         self.beta = beta
 
-        self.datagen = TPCHJobSequenceGen(
-            job_arrival_rate, job_arrival_cap, query_dir)
+        if dataset == 'tpch':
+            self.datagen = TPCHJobSequenceGen(
+                job_arrival_rate, job_arrival_cap)
+        else:
+            raise ValueError('unsupported dataset.')
 
         self.task_duration_gen = TaskDurationGen(
             self.num_executors, warmup_delay)

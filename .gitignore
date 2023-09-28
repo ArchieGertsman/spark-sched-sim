@@ -4,5 +4,6 @@ __pycache__/
 *.egg-info/
 
 artifacts/
+data/
 count_params.py
 eval*

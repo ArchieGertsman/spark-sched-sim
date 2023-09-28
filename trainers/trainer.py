@@ -9,7 +9,7 @@ import json
 
 import numpy as np
 import torch
-from torch.multiprocessing import Pipe, Process
+from multiprocessing import Pipe, Process, Lock, Barrier
 from torch.utils.tensorboard import SummaryWriter
 
 from spark_sched_sim.schedulers import *
@@ -196,7 +196,7 @@ class Trainer(ABC):
         os.mkdir(self.checkpointing_dir)
 
         # torch
-        torch.multiprocessing.set_start_method('forkserver')
+        torch.multiprocessing.set_start_method('spawn')
         # print('cuda available:', torch.cuda.is_available())
         # torch.autograd.set_detect_anomaly(True)
 
@@ -244,6 +244,7 @@ class Trainer(ABC):
         base_seeds = self.seed + np.arange(self.num_sequences)
         base_seeds = np.repeat(base_seeds, self.num_rollouts)
         seed_step = self.num_sequences
+        lock = Lock()
         for rank, base_seed in enumerate(base_seeds):
             conn_main, conn_sub = Pipe()
             self.conns += [conn_main]
@@ -259,11 +260,14 @@ class Trainer(ABC):
                     self.agent_cfg,
                     self.stdout_dir,
                     int(base_seed),
-                    seed_step
+                    seed_step,
+                    lock
                 ))
 
             self.procs += [proc]
             proc.start()
+
+        [proc.join(5) for proc in self.procs]
 
 
 

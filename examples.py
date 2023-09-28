@@ -19,12 +19,15 @@ ENV_KWARGS = {
     'job_arrival_rate': 4.e-5,
     'moving_delay': 2000.,
     'warmup_delay': 1000.,
-    'query_dir': 'data/tpch',
+    'dataset': 'tpch',
     'render_mode': 'human'
 }
 
 
 def main():
+    # save final rendering to artifacts dir
+    pathlib.Path('artifacts').mkdir(parents=True, exist_ok=True) 
+
     parser = ArgumentParser(
         description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
     
@@ -42,9 +45,6 @@ def main():
         'fair': fair_example,
         'decima': decima_example
     }
-
-    # save final rendering to artifacts dir
-    pathlib.Path('artifacts').mkdir(parents=True, exist_ok=True) 
 
     sched_map[args.sched]()
 
@@ -68,7 +68,7 @@ def fair_example():
 
 
 def decima_example():
-    cfg = load(filename=osp.join('config', 'decima_ppo.yaml'))
+    cfg = load(filename=osp.join('config', 'decima_tpch.yaml'))
 
     agent_cfg = cfg['agent'] \
         | {'num_executors': ENV_KWARGS['num_executors'],

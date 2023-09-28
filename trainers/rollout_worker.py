@@ -52,7 +52,8 @@ class RolloutWorker(ABC):
         agent_kwargs, 
         stdout_dir,
         base_seed,
-        seed_step
+        seed_step,
+        lock
     ):
         self.rank = rank
         self.conn = conn
@@ -63,13 +64,16 @@ class RolloutWorker(ABC):
         # log each of the processes to separate files
         sys.stdout = open(osp.join(stdout_dir, f'{rank}.out'), 'a')
 
-        # torch multiprocessing is very slow without this
-        torch.set_num_threads(1)
-
         self.agent = make_scheduler(agent_kwargs)
         self.agent.actor.eval()
 
-        env = gym.make('spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
+        # might need to download dataset, and only one process should do this.
+        # we achieve this using a lock, such that the first process to acquire
+        # it downloads the dataset, and any subsequent processes notices that
+        # the dataset is already present once it acquires the lock.
+        with lock:
+            env = gym.make('spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
+
         env = StochasticTimeLimit(env, env_kwargs['mean_time_limit'])
         env = NeuralActWrapper(env)
         env = self.agent.obs_wrapper_cls(env)
@@ -79,12 +83,18 @@ class RolloutWorker(ABC):
         # determined by the rng seed
         torch.manual_seed(rank)
 
+        # torch multiprocessing is very slow without this
+        torch.set_num_threads(1)
+
+        # barrier.wait()
+
         self.run()
 
 
     def run(self):
-        # self.agent.actor.to('cuda:1', non_blocking=True)
+        print('HERE', flush=True)
         while data := self.conn.recv():
+            print('BRUH', flush=True)
             # load updated model parameters
             self.agent.actor.load_state_dict(data['actor_sd'])
             
