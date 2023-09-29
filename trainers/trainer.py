@@ -9,7 +9,7 @@ import json
 
 import numpy as np
 import torch
-from multiprocessing import Pipe, Process, Lock, Barrier
+from multiprocessing import Pipe, Process, Lock
 from torch.utils.tensorboard import SummaryWriter
 
 from spark_sched_sim.schedulers import *

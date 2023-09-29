@@ -68,9 +68,9 @@ class RolloutWorker(ABC):
         self.agent.actor.eval()
 
         # might need to download dataset, and only one process should do this.
-        # we achieve this using a lock, such that the first process to acquire
-        # it downloads the dataset, and any subsequent processes notices that
-        # the dataset is already present once it acquires the lock.
+        # this can be achieved using a lock, such that the first process to 
+        # acquire it downloads the dataset, and any subsequent processes notices 
+        # that the dataset is already present once it acquires the lock.
         with lock:
             env = gym.make('spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
 
@@ -92,9 +92,7 @@ class RolloutWorker(ABC):
 
 
     def run(self):
-        print('HERE', flush=True)
         while data := self.conn.recv():
-            print('BRUH', flush=True)
             # load updated model parameters
             self.agent.actor.load_state_dict(data['actor_sd'])
             
