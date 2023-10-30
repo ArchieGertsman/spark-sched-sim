@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -97,7 +99,7 @@ class NeuralScheduler(Scheduler):
 
     def _sample(self, logits):
         pi = F.softmax(logits, 0).numpy()
-        idx = np.random.choice(np.arange(pi.size), p=pi)
+        idx = random.choices(np.arange(pi.size), pi)[0]
         lgprob = np.log(pi[idx])
         return idx, lgprob
 

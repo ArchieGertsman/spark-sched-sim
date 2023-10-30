@@ -1,5 +1,6 @@
 
 import os.path as osp
+import random
 
 import numpy as np
 import networkx as nx
@@ -20,7 +21,6 @@ class TPCHJobSequenceGen(BaseJobSequenceGen):
 
 
     def generate_job(self, job_id, t_arrival):
-        # query_num = 1 + self.np_random.randint(NUM_QUERIES)
         query_num = 1 + self.np_random.integers(NUM_QUERIES)
         query_size = self.np_random.choice(TPCH_SIZES)
         query_path = osp.join(self.query_dir, str(query_size))

@@ -1,6 +1,7 @@
 import sys
 from abc import ABC, abstractmethod
 import os.path as osp
+import random
 
 import gymnasium as gym
 from gymnasium.core import ObsType, ActType
@@ -78,6 +79,7 @@ class RolloutWorker(ABC):
         # IMPORTANT! Each worker needs to produce unique rollouts, which are 
         # determined by the rng seed
         torch.manual_seed(rank)
+        random.seed(rank)
 
         self.run()
 

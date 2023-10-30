@@ -1,4 +1,5 @@
 import numpy as np
+import random
 
 
 
@@ -53,7 +54,7 @@ class TaskDurationGen:
     def _sample(self, wave, executor_key, warmup=False):
         '''raises an exception if `executor_key` is not found in the durations from `wave`'''
         durations = self.task_duration_data[wave][executor_key]
-        duration = self.np_random.choice(durations)
+        duration = random.choice(durations)
         if warmup:
             duration += self.warmup_delay
         return duration
@@ -67,8 +68,8 @@ class TaskDurationGen:
         if left_exec == right_exec:
             executor_key = left_exec
         else:
-            # rand_pt = self.np_random.randint(1, right_exec - left_exec + 1)
-            rand_pt = self.np_random.integers(1, right_exec - left_exec + 1)
+            # faster than random.randint
+            rand_pt = 1 + int(random.random() * (right_exec - left_exec))
             if rand_pt <= num_local_executors - left_exec:
                 executor_key = left_exec
             else:
@@ -82,7 +83,7 @@ class TaskDurationGen:
     
 
     def _init_executor_intervals(self, exec_cap):
-        exec_levels = np.array([5, 10, 20, 40, 50, 60, 80, 100])
+        exec_levels = [5, 10, 20, 40, 50, 60, 80, 100]
 
         intervals = np.zeros((exec_cap+1, 2))
 
@@ -90,7 +91,7 @@ class TaskDurationGen:
         intervals[:exec_levels[0]+1] = exec_levels[0]
 
         # get the center map
-        for i in range(exec_levels.size - 1):
+        for i in range(len(exec_levels) - 1):
             intervals[exec_levels[i]+1 : exec_levels[i+1]] = (exec_levels[i], exec_levels[i+1])
             
             if exec_levels[i+1] > exec_cap:
