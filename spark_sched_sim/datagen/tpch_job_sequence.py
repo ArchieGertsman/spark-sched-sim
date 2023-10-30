@@ -1,6 +1,9 @@
 
 import os.path as osp
-import random
+import pathlib
+from io import BytesIO
+from zipfile import ZipFile
+from urllib.request import urlopen
 
 import numpy as np
 import networkx as nx
@@ -10,20 +13,33 @@ from ..components import Job, Stage
 
 
 
-TPCH_SIZES = ['2g','5g','10g','20g','50g','80g','100g']
+TPCH_URL = 'https://bit.ly/3F1Go8t'
+QUERY_SIZES = ['2g','5g','10g','20g','50g','80g','100g']
 NUM_QUERIES = 22
 
 
 class TPCHJobSequenceGen(BaseJobSequenceGen):
-    def __init__(self, job_arrival_rate, job_arrival_cap, query_dir):
+    def __init__(self, job_arrival_rate, job_arrival_cap):
         super().__init__(job_arrival_rate, job_arrival_cap)
-        self.query_dir = query_dir
+
+        if not osp.isdir('data/tpch'):
+            self.download()
+            
+
+    def download(self):
+        print('Downloading the TPC-H dataset...', flush=True)
+        # pathlib.Path('data/tpch').mkdir(parents=True, exist_ok=True) 
+        pathlib.Path('data').mkdir(parents=True, exist_ok=True) 
+        with urlopen(TPCH_URL) as zipresp:
+            with ZipFile(BytesIO(zipresp.read())) as zfile:
+                zfile.extractall('data')
+        print('Done.', flush=True)
 
 
     def generate_job(self, job_id, t_arrival):
         query_num = 1 + self.np_random.integers(NUM_QUERIES)
-        query_size = self.np_random.choice(TPCH_SIZES)
-        query_path = osp.join(self.query_dir, str(query_size))
+        query_size = self.np_random.choice(QUERY_SIZES)
+        query_path = osp.join('data/tpch', str(query_size))
         
         adj_matrix = np.load(
             osp.join(query_path, f'adj_mat_{query_num}.npy'), 
@@ -71,7 +87,7 @@ class TPCHJobSequenceGen(BaseJobSequenceGen):
         clean_first_wave = {}
         for e in task_duration['first_wave']:
             clean_first_wave[e] = []
-            fresh_durations = SetWithCount()
+            fresh_durations = MultiSet()
             # O(1) access
             for d in task_duration['fresh_durations'][e]:
                 fresh_durations.add(d)
@@ -95,7 +111,7 @@ class TPCHJobSequenceGen(BaseJobSequenceGen):
 
 
 
-class SetWithCount(object):
+class MultiSet(object):
     """
     allow duplication in set
     """

@@ -16,13 +16,13 @@ env:
   job_arrival_rate: 4.e-5
   moving_delay: 2000.
   warmup_delay: 1000.
-  query_dir: 'data/tpch'
+  dataset: 'tpch'
   mean_time_limit: 2.e+7
 trainer:
   device: 'cuda:1'
   trainer_cls: 'PPO'
   seed: 2000
-  num_iterations: 1
+  num_iterations: 500
   num_sequences: 4
   num_rollouts: 4
   artifacts_dir: 'artifacts'
