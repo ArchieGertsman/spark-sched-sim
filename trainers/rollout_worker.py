@@ -114,10 +114,11 @@ class RolloutWorker(ABC):
 
     def collect_stats(self):
         return {
-            "avg_job_duration": self.env.avg_job_duration,
+            "avg_job_duration": self.env.unwrapped.avg_job_duration,
             "avg_num_jobs": avg_num_jobs(self.env),
-            "num_completed_jobs": self.env.num_completed_jobs,
-            "num_job_arrivals": self.env.num_completed_jobs + self.env.num_active_jobs,
+            "num_completed_jobs": self.env.unwrapped.num_completed_jobs,
+            "num_job_arrivals": self.env.unwrapped.num_completed_jobs
+            + self.env.unwrapped.num_active_jobs,
         }
 
 
