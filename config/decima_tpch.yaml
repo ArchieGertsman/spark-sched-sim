@@ -1,3 +1,68 @@
+trainer:
+  # where the training happens (cpu, cuda, cuda:0, ...)
+  # note: rollouts are always collected using only the CPU
+  device: 'cuda'
+
+  # name of the trainer's class
+  trainer_cls: 'PPO'
+
+  # number of training iterations
+  num_iterations: 500
+
+  # number of unique job sequences sampled per training iteration
+  num_sequences: 4
+
+  # number of rollouts experienced per unique job sequence
+  # `num_sequences` x `num_rollouts`
+  #  = total number of rollouts per training iteration
+  #  = number of rollout workers running in parallel
+  num_rollouts: 4
+
+  # base random seed; each worker gets its own seed which is offset from this.
+  seed: 42
+
+  # name of directory where all training artifacts are saved (e.g. tensorboard)
+  artifacts_dir: 'artifacts'
+
+  # if checkpointing_freq = n, then every n iterations, the best model from the
+  # past m iterations is saved
+  checkpointing_freq: 50
+
+  # if true, then records training metrics to a tensorboard file
+  use_tensorboard: False
+
+  # PPO: number of times to train through all of the data from the most recent
+  # iteration
+  num_epochs: 3
+
+  # PPO: number of batches to split the last iteration's training data into
+  num_batches: 10
+
+  # PPO: hyperparameter for clamping the importance sampling ratio
+  clip_range: .2
+
+  # PPO: end training cycle if approximate KL divergence exceeds `target_kl`
+  target_kl: .01
+
+  # PPO: coefficient of entropy bonus term (if 0 then no entropy bonus)
+  entropy_coeff: .04
+
+  # discount factor for (continuously) discounted returns
+  beta_discount: 5.e-3
+
+  # max reward window size for differential returns
+  # reward_buff_cap: 200000
+
+  # note: only one of `beta_discount` and `reward_buff_cap` must be specified,
+  # indicating whether to use discounted or differential returns
+
+  # optimizer settings
+  opt_cls: 'Adam'
+  opt_kwargs: 
+    lr: 3.e-4
+  max_grad_norm: .5
+
+
 agent:
   agent_cls: 'DecimaScheduler'
   embed_dim: 16
@@ -10,6 +75,8 @@ agent:
   policy_mlp_kwargs:
     hid_dims: [64, 64]
     act_cls: 'Tanh'
+
+
 env:
   num_executors: 50
   job_arrival_cap: 200
@@ -18,25 +85,3 @@ env:
   warmup_delay: 1000.
   dataset: 'tpch'
   mean_time_limit: 2.e+7
-trainer:
-  device: 'cuda:1'
-  trainer_cls: 'PPO'
-  seed: 2000
-  num_iterations: 500
-  num_sequences: 4
-  num_rollouts: 4
-  artifacts_dir: 'artifacts'
-  checkpointing_freq: 50
-  use_tensorboard: False
-  num_epochs: 3
-  num_batches: 10
-  clip_range: .2
-  target_kl: .01
-  entropy_coeff: .04
-  beta_discount: 5.e-3      # discounted returns
-  # reward_buff_cap: 200000 # differential returns
-  opt_cls: 'Adam'
-  opt_kwargs: 
-    lr: 3.e-4
-  max_grad_norm: .5
-    

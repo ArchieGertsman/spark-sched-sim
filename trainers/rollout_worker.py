@@ -13,7 +13,6 @@ from .utils import Profiler, HiddenPrints
 from spark_sched_sim.metrics import *
 
 
-
 class RolloutBuffer:
     def __init__(self, async_rollouts=False):
         self.obsns: list[ObsType] = []
@@ -31,30 +30,28 @@ class RolloutBuffer:
         self.lgprobs += [lgprob]
 
     def add_reset(self, step):
-        assert self.resets is not None, 'resets are for async rollouts only.'
+        assert self.resets is not None, "resets are for async rollouts only."
         self.resets.add(step)
 
     def __len__(self):
         return len(self.obsns)
 
 
-
 class RolloutWorker(ABC):
     def __init__(self):
         self.reset_count = 0
 
-
     def __call__(
         self,
-        rank, 
+        rank,
         conn,
-        agent_cls, 
-        env_kwargs, 
-        agent_kwargs, 
+        agent_cls,
+        env_kwargs,
+        agent_kwargs,
         stdout_dir,
         base_seed,
         seed_step,
-        lock
+        lock,
     ):
         self.rank = rank
         self.conn = conn
@@ -63,24 +60,24 @@ class RolloutWorker(ABC):
         self.reset_count = 0
 
         # log each of the processes to separate files
-        sys.stdout = open(osp.join(stdout_dir, f'{rank}.out'), 'a')
+        sys.stdout = open(osp.join(stdout_dir, f"{rank}.out"), "a")
 
         self.agent = make_scheduler(agent_kwargs)
         self.agent.actor.eval()
 
         # might need to download dataset, and only one process should do this.
-        # this can be achieved using a lock, such that the first process to 
-        # acquire it downloads the dataset, and any subsequent processes notices 
+        # this can be achieved using a lock, such that the first process to
+        # acquire it downloads the dataset, and any subsequent processes notices
         # that the dataset is already present once it acquires the lock.
         with lock:
-            env = gym.make('spark_sched_sim:SparkSchedSimEnv-v0', **env_kwargs)
+            env = gym.make("spark_sched_sim:SparkSchedSimEnv-v0", **env_kwargs)
 
-        env = StochasticTimeLimit(env, env_kwargs['mean_time_limit'])
+        env = StochasticTimeLimit(env, env_kwargs["mean_time_limit"])
         env = NeuralActWrapper(env)
         env = self.agent.obs_wrapper_cls(env)
         self.env = env
 
-        # IMPORTANT! Each worker needs to produce unique rollouts, which are 
+        # IMPORTANT! Each worker needs to produce unique rollouts, which are
         # determined by the rng seed
         torch.manual_seed(rank)
         random.seed(rank)
@@ -90,67 +87,58 @@ class RolloutWorker(ABC):
 
         self.run()
 
-
     def run(self):
         while data := self.conn.recv():
             # load updated model parameters
-            self.agent.actor.load_state_dict(data['actor_sd'])
-            
+            self.agent.actor.load_state_dict(data["actor_sd"])
+
             try:
-                with Profiler(100): #, HiddenPrints():
+                with Profiler(100):  # , HiddenPrints():
                     rollout_buffer = self.collect_rollout()
 
-                self.conn.send({
-                    'rollout_buffer': rollout_buffer, 
-                    'stats': self.collect_stats()
-                })
+                self.conn.send(
+                    {"rollout_buffer": rollout_buffer, "stats": self.collect_stats()}
+                )
 
             except AssertionError as msg:
-                print(msg, '\naborting rollout.', flush=True)
+                print(msg, "\naborting rollout.", flush=True)
                 self.conn.send(None)
 
-    
     @abstractmethod
     def collect_rollout(self) -> RolloutBuffer:
         pass
-
 
     @property
     def seed(self):
         return self.base_seed + self.seed_step * self.reset_count
 
-    
     def collect_stats(self):
         return {
-            'avg_job_duration': self.env.avg_job_duration,
-            'avg_num_jobs': avg_num_jobs(self.env),
-            'num_completed_jobs': self.env.num_completed_jobs,
-            'num_job_arrivals': \
-                self.env.num_completed_jobs + self.env.num_active_jobs
+            "avg_job_duration": self.env.avg_job_duration,
+            "avg_num_jobs": avg_num_jobs(self.env),
+            "num_completed_jobs": self.env.num_completed_jobs,
+            "num_job_arrivals": self.env.num_completed_jobs + self.env.num_active_jobs,
         }
 
 
-
 class RolloutWorkerSync(RolloutWorker):
-    '''model updates are synchronized with environment resets'''
+    """model updates are synchronized with environment resets"""
 
     def collect_rollout(self):
         rollout_buffer = RolloutBuffer()
 
         obs, _ = self.env.reset(seed=self.seed)
         self.reset_count += 1
-        
+
         wall_time = 0
         terminated = truncated = False
         while not (terminated or truncated):
             action, lgprob = self.agent(obs)
 
-            new_obs, reward, terminated, truncated, info = \
-                self.env.step(action)
-            next_wall_time = info['wall_time']
+            new_obs, reward, terminated, truncated, info = self.env.step(action)
+            next_wall_time = info["wall_time"]
 
-            rollout_buffer.add(
-                obs, wall_time, list(action.values()), lgprob, reward)
+            rollout_buffer.add(obs, wall_time, list(action.values()), lgprob, reward)
 
             obs = new_obs
             wall_time = next_wall_time
@@ -160,17 +148,16 @@ class RolloutWorkerSync(RolloutWorker):
         return rollout_buffer
 
 
-
 class RolloutWorkerAsync(RolloutWorker):
-    '''model updates occur at regular intervals, regardless of when the 
+    """model updates occur at regular intervals, regardless of when the
     environment resets
-    '''
+    """
+
     def __init__(self, rollout_duration):
         super().__init__()
         self.rollout_duration = rollout_duration
         self.next_obs = None
-        self.next_wall_time = 0.
-
+        self.next_wall_time = 0.0
 
     def collect_rollout(self):
         rollout_buffer = RolloutBuffer(async_rollouts=True)
@@ -186,14 +173,12 @@ class RolloutWorkerAsync(RolloutWorker):
 
             action, lgprob = self.agent(obs)
 
-            self.next_obs, reward, terminated, truncated, info = \
-                self.env.step(action)
-            
-            self.next_wall_time = info['wall_time']
+            self.next_obs, reward, terminated, truncated, info = self.env.step(action)
 
-            rollout_buffer.add(
-                obs, elapsed_time, list(action.values()), lgprob, reward)
-            
+            self.next_wall_time = info["wall_time"]
+
+            rollout_buffer.add(obs, elapsed_time, list(action.values()), lgprob, reward)
+
             # add the duration of the this step to the total
             elapsed_time += self.next_wall_time - wall_time
 
