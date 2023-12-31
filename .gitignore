@@ -2,9 +2,11 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 *.egg-info/
+.DS_Store
 
 artifacts/
 data/
 count_params.py
 eval*
 config/test.yaml
+test/old_test.py

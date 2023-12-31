@@ -16,8 +16,8 @@ class TimelineEvent:
     data: dict
 
 
-
 # heap-based timeline
+
 
 class Timeline:
     def __init__(self):
@@ -27,15 +27,12 @@ class Timeline:
         # tie breaker
         self._counter = itertools.count()
 
-
     def __len__(self):
         return len(self._pq)
-    
 
     @property
     def empty(self):
         return len(self) == 0
-    
 
     def peek(self):
         try:
@@ -44,10 +41,8 @@ class Timeline:
         except:
             return None, None
 
-
     def push(self, key, item):
         heapq.heappush(self._pq, (key, next(self._counter), item))
-        
 
     def pop(self):
         if len(self._pq) > 0:
@@ -55,12 +50,10 @@ class Timeline:
             return key, item
         else:
             return None, None
-        
 
     def reset(self):
-        self._pq = []
+        self._pq.clear()
         self._counter = itertools.count()
 
-    
     def events(self):
         return (event for (*_, event) in self._pq)

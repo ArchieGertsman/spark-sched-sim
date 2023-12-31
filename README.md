@@ -28,11 +28,6 @@ Enhancements include:
 
 ---
 
-After cloning this repo, please run `pip install -r requirements.txt` to install the project's dependencies. Then, please manually install `torch_scatter` and `torch_sparse` by running e.g.
-```
-pip install --no-index torch-scatter -f https://pytorch-geometric.com/whl/torch-2.0.1+cpu.html
-pip install --no-index torch-sparse -f https://pytorch-geometric.com/whl/torch-2.0.1+cpu.html
-```
-They are commented out in `requirements.txt` because `torch` needs to be installed first. See [here](https://github.com/pyg-team/pytorch_geometric/issues/861) for more.
+After cloning this repo, please run `pip install -r requirements.txt` to install the project's dependencies.
 
 To start out, try running examples via `examples.py --sched [fair|decima]`. To train Decima from scratch, modify the provided config file `config/decima_tpch.yaml` as needed, then provide the config to `train.py -f CFG_FILE`.
