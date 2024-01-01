@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Iterable
+from typing import Iterable
 import shutil
 import os
 import os.path as osp
@@ -13,9 +13,9 @@ import torch
 from multiprocessing import Pipe, Process, Lock
 from torch.utils.tensorboard import SummaryWriter
 
-from spark_sched_sim.schedulers import *
-from .rollout_worker import *
-from .utils import *
+from spark_sched_sim.schedulers import make_scheduler, NeuralScheduler
+from .rollout_worker import RolloutWorkerSync, RolloutWorkerAsync, RolloutBuffer
+from .utils import Baseline, ReturnsCalculator
 
 
 class Trainer(ABC):
@@ -137,8 +137,8 @@ class Trainer(ABC):
                 ep_lens = [len(buff) for buff in rollout_buffers if buff]
                 self._write_stats(i, learning_stats, rollout_stats_list, ep_lens)
 
-            if self.agent.lr_scheduler:
-                self.agent.lr_scheduler.step()
+            # if self.agent.lr_scheduler:
+            #     self.agent.lr_scheduler.step()
 
             print(
                 f"Iteration {i+1} complete. Avg. # jobs: " f"{avg_num_jobs:.3f}",

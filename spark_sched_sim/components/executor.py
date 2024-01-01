@@ -4,7 +4,6 @@ from .task import Task
 
 
 class Executor:
-    
     def __init__(self, id_: int):
         # index of this operation within its operation
         self.id_ = id_
@@ -27,30 +26,21 @@ class Executor:
         # NOTE: only used for rendering
         self.history: List[list] = [[None, -1]]
 
-
-    
     @property
     def is_idle(self):
         return self.task is None
-    
-
 
     def is_at_job(self, job_id):
         return self.job_id == job_id
 
-
-
     def add_history(self, wall_time, job_id):
-        '''should be called whenever this executor is released from a job'''
+        """should be called whenever this executor is released from a job"""
         if self.history is None:
             self.history = []
 
         if len(self.history) > 0:
             # add release time to most recent history
             self.history[-1][0] = wall_time
-        
+
         # add new history
         self.history += [[None, job_id]]
-
-    
-

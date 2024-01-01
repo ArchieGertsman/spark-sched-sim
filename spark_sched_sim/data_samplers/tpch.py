@@ -87,7 +87,7 @@ class TPCHDataSampler(BaseDataSampler):
             # the executor was just sitting idly or moving between jobs, so it needs time to warm up
             try:
                 return self._sample_task_duration(data, "fresh_durations", executor_key)
-            except:
+            except (ValueError, KeyError):
                 return self._sample_task_duration(
                     data, "first_wave", executor_key, warmup=True
                 )
@@ -96,13 +96,13 @@ class TPCHDataSampler(BaseDataSampler):
             # the executor is continuing work on the same stage, which is relatively fast
             try:
                 return self._sample_task_duration(data, "rest_wave", executor_key)
-            except:
+            except (ValueError, KeyError):
                 pass
 
         # the executor is new to this stage (or 'rest_wave' data was not available)
         try:
             return self._sample_task_duration(data, "first_wave", executor_key)
-        except:
+        except (ValueError, KeyError):
             return self._sample_task_duration(data, "fresh_durations", executor_key)
 
     @classmethod
@@ -162,7 +162,7 @@ class TPCHDataSampler(BaseDataSampler):
     def _rough_task_duration(cls, task_duration_data):
         def durations(key):
             durations = task_duration_data[key].values()
-            durations = [i for l in durations for i in l]
+            durations = [t for ts in durations for t in ts]
             return durations
 
         all_durations = (

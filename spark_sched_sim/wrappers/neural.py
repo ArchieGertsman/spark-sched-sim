@@ -1,6 +1,6 @@
 import numpy as np
 from gymnasium import ObservationWrapper, ActionWrapper
-from gymnasium.spaces import *
+import gymnasium.spaces as sp
 
 from .. import graph_utils as utils
 
@@ -14,11 +14,11 @@ class NeuralActWrapper(ActionWrapper):
     def __init__(self, env):
         super().__init__(env)
 
-        self.action_space = Dict(
+        self.action_space = sp.Dict(
             {
-                "stage_idx": Discrete(1),
-                "job_idx": Discrete(1),
-                "num_exec": Discrete(env.unwrapped.num_executors),
+                "stage_idx": sp.Discrete(1),
+                "job_idx": sp.Discrete(1),
+                "num_exec": sp.Discrete(env.unwrapped.num_executors),
             }
         )
 
@@ -38,15 +38,15 @@ class NeuralObsWrapper(ObservationWrapper):
         self.work_scale = work_scale
         self.num_executors = env.unwrapped.num_executors
 
-        self.observation_space = Dict(
+        self.observation_space = sp.Dict(
             {
-                "dag_batch": Graph(
-                    node_space=Box(-np.inf, np.inf, (NUM_NODE_FEATURES,)),
-                    edge_space=Discrete(1),
+                "dag_batch": sp.Graph(
+                    node_space=sp.Box(-np.inf, np.inf, (NUM_NODE_FEATURES,)),
+                    edge_space=sp.Discrete(1),
                 ),
-                "dag_ptr": Sequence(Discrete(1)),
-                "stage_mask": Sequence(Discrete(2)),
-                "exec_mask": Sequence(MultiBinary(self.num_executors)),
+                "dag_ptr": sp.Sequence(sp.Discrete(1)),
+                "stage_mask": sp.Sequence(sp.Discrete(2)),
+                "exec_mask": sp.Sequence(sp.MultiBinary(self.num_executors)),
             }
         )
 
@@ -65,7 +65,7 @@ class NeuralObsWrapper(ObservationWrapper):
         if j_src < num_jobs:
             commit_caps[j_src] = num_committable_execs
 
-        graph_instance = GraphInstance(
+        graph_instance = sp.GraphInstance(
             nodes=self._build_node_features(obs, commit_caps),
             edges=dag_batch.edges,
             edge_links=dag_batch.edge_links,
@@ -131,7 +131,7 @@ class DAGNNObsWrapper(NeuralObsWrapper):
     def __init__(self, env):
         super().__init__(env)
 
-        self.observation_space["edge_masks"] = MultiBinary((1, 1))
+        self.observation_space["edge_masks"] = sp.MultiBinary((1, 1))
 
         # cache edge masks, because dag batch doesn't always change
         # between observations
@@ -173,7 +173,7 @@ class TransformerObsWrapper(NeuralObsWrapper):
         super().__init__(env)
 
         max_depth = 100
-        self.observation_space["node_depth"] = Sequence(Discrete(max_depth))
+        self.observation_space["node_depth"] = sp.Sequence(sp.Discrete(max_depth))
 
         self._cache = {
             "num_nodes": -1,
@@ -190,7 +190,7 @@ class TransformerObsWrapper(NeuralObsWrapper):
         node_depth = self._cache["node_depth"]
 
         dag_batch = obs["dag_batch"]
-        obs["dag_batch"] = GraphInstance(
+        obs["dag_batch"] = sp.GraphInstance(
             dag_batch.nodes, dag_batch.edges, edge_links_tc
         )
         obs["node_depth"] = node_depth

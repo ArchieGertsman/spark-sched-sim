@@ -8,8 +8,12 @@ import gymnasium as gym
 import pathlib
 
 from cfg_loader import load
-from spark_sched_sim.schedulers import *
-from spark_sched_sim.wrappers import *
+from spark_sched_sim.schedulers import (
+    RoundRobinScheduler,
+    NeuralScheduler,
+    make_scheduler,
+)
+from spark_sched_sim.wrappers import NeuralActWrapper
 from spark_sched_sim import metrics
 
 
@@ -51,7 +55,7 @@ def fair_example():
     # Fair scheduler
     scheduler = RoundRobinScheduler(ENV_CFG["num_executors"], dynamic_partition=True)
 
-    print(f"Example: Fair Scheduler")
+    print("Example: Fair Scheduler")
     print("Env settings:")
     pprint(ENV_CFG)
 
@@ -72,7 +76,7 @@ def decima_example():
 
     scheduler = make_scheduler(agent_cfg)
 
-    print(f"Example: Decima")
+    print("Example: Decima")
     print("Env settings:")
     pprint(ENV_CFG)
 

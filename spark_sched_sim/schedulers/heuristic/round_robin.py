@@ -3,16 +3,12 @@ import numpy as np
 from .heuristic import HeuristicScheduler
 
 
-
 class RoundRobinScheduler(HeuristicScheduler):
-
     def __init__(self, num_executors, dynamic_partition=True):
-        name = 'Fair' if dynamic_partition else 'FIFO'
+        name = "Fair" if dynamic_partition else "FIFO"
         super().__init__(name)
         self.num_executors = num_executors
         self.dynamic_partition = dynamic_partition
-
-    
 
     def schedule(self, obs):
         obs = self.preprocess_obs(obs)
@@ -30,31 +26,23 @@ class RoundRobinScheduler(HeuristicScheduler):
 
             if selected_stage_idx != -1:
                 return {
-                    'stage_idx': selected_stage_idx,
-                    'num_exec': obs.num_committable_execs
+                    "stage_idx": selected_stage_idx,
+                    "num_exec": obs.num_committable_execs,
                 }
 
         # search through jobs by order of arrival.
         for j in range(num_active_jobs):
-            if obs.exec_supplies[j] >= executor_cap or \
-               j == obs.source_job_idx:
-               continue
+            if obs.exec_supplies[j] >= executor_cap or j == obs.source_job_idx:
+                continue
 
             selected_stage_idx = self.find_stage(obs, j)
             if selected_stage_idx == -1:
                 continue
 
             num_exec = min(
-                obs.num_committable_execs,
-                executor_cap - obs.exec_supplies[j]
+                obs.num_committable_execs, executor_cap - obs.exec_supplies[j]
             )
-            return {
-                'stage_idx': selected_stage_idx,
-                'num_exec': num_exec
-            }
+            return {"stage_idx": selected_stage_idx, "num_exec": num_exec}
 
         # didn't find any stages to schedule
-        return {
-            'stage_idx': -1,
-            'num_exec': obs.num_committable_execs
-        }
+        return {"stage_idx": -1, "num_exec": obs.num_committable_execs}

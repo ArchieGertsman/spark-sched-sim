@@ -7,16 +7,17 @@ def load(filename=None):
         args = make_parser().parse_args()
         filename = args.filename
 
-    with open(filename, 'r') as stream:
+    with open(filename, "r") as stream:
         cfg = yaml.safe_load(stream)
-        
+
     return cfg
 
 
 def make_parser():
     parser = ArgumentParser(
-        description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
-    
+        description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter
+    )
+
     parser.add_argument(
         "-f",
         "--file",

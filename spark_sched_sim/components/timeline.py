@@ -38,7 +38,7 @@ class Timeline:
         try:
             key, _, item = self._pq[0]
             return key, item
-        except:
+        except IndexError:
             return None, None
 
     def push(self, key, item):

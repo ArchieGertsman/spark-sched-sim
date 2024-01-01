@@ -1,10 +1,9 @@
-from typing import Optional
 from bisect import bisect_left, bisect_right
 from collections import deque
 
 import numpy as np
 from gymnasium import Env
-from gymnasium.spaces import *
+import gymnasium.spaces as sp
 
 from .components.executor_tracker import ExecutorTracker, COMMON_POOL_KEY
 from .components.timeline import Timeline, TimelineEvent
@@ -13,7 +12,7 @@ from .components import Executor
 # from .data_samplers.tpch_job_sequence import TPCHJobSequenceGen
 # from .data_samplers.task_duration import TaskDurationGen
 # from .datagen import make_data_sampler
-from .data_samplers import *
+from .data_samplers import make_data_sampler
 from . import graph_utils
 from . import metrics
 
@@ -21,7 +20,7 @@ try:
     from .components.renderer import Renderer
 
     PYGAME_AVAILABLE = True
-except:
+except ImportError:
     PYGAME_AVAILABLE = False
 
 
@@ -82,26 +81,26 @@ class SparkSchedSimEnv(Env):
 
         self.job_duration_buff = deque(maxlen=200)
 
-        self.action_space = Dict(
+        self.action_space = sp.Dict(
             {
                 # stage selection
                 # NOTE: upper bound of this space is dynamic, equal to
                 # the number of active stages. Initialized to 1.
-                "stage_idx": Discrete(1, start=-1),
+                "stage_idx": sp.Discrete(1, start=-1),
                 # parallelism limit selection
-                "num_exec": Discrete(self.num_executors, start=1),
+                "num_exec": sp.Discrete(self.num_executors, start=1),
             }
         )
 
-        self.observation_space = Dict(
+        self.observation_space = sp.Dict(
             {
                 # shape: (num active stages) x (num node features)
                 # stage features: num remaining tasks, most recent task duration,
                 # is stage schedulable
                 # edge features: none
-                "dag_batch": Graph(
-                    node_space=Box(0, np.inf, (NUM_NODE_FEATURES,)),
-                    edge_space=Discrete(1),
+                "dag_batch": sp.Graph(
+                    node_space=sp.Box(0, np.inf, (NUM_NODE_FEATURES,)),
+                    edge_space=sp.Discrete(1),
                 ),
                 # length: num active jobs
                 # `ptr[job_idx]` returns the index of the first stage associated
@@ -109,16 +108,18 @@ class SparkSchedSimEnv(Env):
                 # given by `ptr[job_idx], ..., (ptr[job_idx+1]-1)`
                 # NOTE: upper bound of this space is dynamic, equal to
                 # the number of active stages. Initialized to 1.
-                "dag_ptr": Sequence(Discrete(1), stack=True),
+                "dag_ptr": sp.Sequence(sp.Discrete(1), stack=True),
                 # integer that represents how many executors need to be scheduled
-                "num_committable_execs": Discrete(self.num_executors + 1),
+                "num_committable_execs": sp.Discrete(self.num_executors + 1),
                 # index of job who is releasing executors, if any.
                 # set to `self.num_total_jobs` if source is common pool.
-                "source_job_idx": Discrete(self.job_arrival_cap + 1),
+                "source_job_idx": sp.Discrete(self.job_arrival_cap + 1),
                 # length: num active jobs
                 # count of executors associated with each active job,
                 # including moving executors and commitments from other jobs
-                "exec_supplies": Sequence(Discrete(2 * self.num_executors), stack=True),
+                "exec_supplies": sp.Sequence(
+                    sp.Discrete(2 * self.num_executors), stack=True
+                ),
             }
         )
 
@@ -135,7 +136,7 @@ class SparkSchedSimEnv(Env):
         # priority queue of scheduling events, indexed by wall time
         try:
             time_limit = options["time_limit"]
-        except:
+        except (TypeError, KeyError):
             assert (
                 self.job_arrival_cap is not None
             ), "must either have a limit on job arrivals or time."
@@ -241,7 +242,7 @@ class SparkSchedSimEnv(Env):
     def avg_job_duration(self):
         return np.mean(self.job_duration_buff) * 1e-3
 
-    ## internal methods
+    # internal methods
 
     def _reset_edge_links(self):
         edge_links = []
@@ -260,10 +261,13 @@ class SparkSchedSimEnv(Env):
             if wall_time > 0:
                 break
             self.timeline.pop()
+
             try:
-                self._handle_job_arrival(event.data["job"])
-            except:
+                job = event.data["job"]
+            except KeyError:
                 raise Exception("initial timeline must only contain jobs")
+
+            self._handle_job_arrival(job)
 
         self.schedulable_stages = self._find_schedulable_stages()
 
@@ -368,7 +372,7 @@ class SparkSchedSimEnv(Env):
 
         try:
             nodes = np.vstack(nodes).astype(np.float32)
-        except:
+        except ValueError:
             # there are no active stages
             nodes = np.zeros((0, NUM_NODE_FEATURES), dtype=np.float32)
 
@@ -380,7 +384,7 @@ class SparkSchedSimEnv(Env):
         num_committable_execs = self.exec_tracker.num_committable_execs()
 
         obs = {
-            "dag_batch": GraphInstance(nodes, edges, edge_links),
+            "dag_batch": sp.GraphInstance(nodes, edges, edge_links),
             "dag_ptr": dag_ptr,
             "num_committable_execs": num_committable_execs,
             "source_job_idx": source_job_idx,
@@ -410,7 +414,7 @@ class SparkSchedSimEnv(Env):
             self.num_completed_jobs,
         )
 
-    ## event handlers
+    # event handlers
 
     def _handle_job_arrival(self, job):
         self.active_job_ids += [job.id_]
@@ -468,7 +472,7 @@ class SparkSchedSimEnv(Env):
         # executor source may need to be updated
         self._update_executor_source(stage, had_commitment, did_job_frontier_change)
 
-    ## Other helper functions
+    # Other helper functions
 
     def _commit_remaining_executors(self):
         """There may be executors at the current source pool that weren't

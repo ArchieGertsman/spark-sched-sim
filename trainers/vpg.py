@@ -6,29 +6,22 @@ from .trainer import Trainer
 from spark_sched_sim.graph_utils import collate_obsns
 
 
-
-
 class VPG(Trainer):
-    '''Vanilla Policy Gradient'''
+    """Vanilla Policy Gradient"""
 
-    def __init__(
-        self,
-        agent_cfg,
-        env_cfg,
-        train_cfg
-    ):  
-        super().__init__(
-            agent_cfg,
-            env_cfg,
-            train_cfg
-        )
+    def __init__(self, agent_cfg, env_cfg, train_cfg):
+        super().__init__(agent_cfg, env_cfg, train_cfg)
 
-        self.entropy_coeff = train_cfg.get('entropy_coeff', 0.)
-    
+        self.entropy_coeff = train_cfg.get("entropy_coeff", 0.0)
 
     def train_on_rollouts(self, rollout_buffers):
-        obsns_list, actions_list, returns_list, baselines_list, lgprobs_list = \
-            self._preprocess_rollouts(rollout_buffers)
+        (
+            obsns_list,
+            actions_list,
+            returns_list,
+            baselines_list,
+            lgprobs_list,
+        ) = self._preprocess_rollouts(rollout_buffers)
 
         policy_losses = []
         entropy_losses = []
@@ -57,8 +50,8 @@ class VPG(Trainer):
             loss.backward()
 
         self.agent.update_parameters()
-        
+
         return {
-            'policy loss': np.mean(policy_losses),
-            'entropy': np.mean(entropy_losses)
+            "policy loss": np.mean(policy_losses),
+            "entropy": np.mean(entropy_losses),
         }
