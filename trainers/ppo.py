@@ -1,11 +1,13 @@
+from collections.abc import Iterable
 from itertools import chain
+from typing import SupportsFloat
+from torch import Tensor
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 from .trainer import Trainer
-from spark_sched_sim import graph_utils
 
 
 EPS = 1e-8
@@ -25,13 +27,13 @@ class RolloutDataset(Dataset):
         return self.obsns[idx], self.acts[idx], self.advgs[idx], self.lgprobs[idx]
 
 
-def collate_fn(batch):
-    obsns, acts, advgs, lgprobs = zip(*batch)
-    obsns = graph_utils.collate_obsns(obsns)
-    acts = torch.stack(acts)
-    advgs = torch.stack(advgs)
-    lgprobs = torch.stack(lgprobs)
-    return obsns, acts, advgs, lgprobs
+# def collate_fn(batch):
+#     obsns, acts, advgs, lgprobs = zip(*batch)
+#     obsns = collate_obsns(obsns)
+#     acts = torch.stack(acts)
+#     advgs = torch.stack(advgs)
+#     lgprobs = torch.stack(lgprobs)
+#     return obsns, acts, advgs, lgprobs
 
 
 class PPO(Trainer):
@@ -47,29 +49,23 @@ class PPO(Trainer):
         self.num_batches = train_cfg.get("num_batches", 3)
 
     def train_on_rollouts(self, rollout_buffers):
-        (
-            obsns_list,
-            actions_list,
-            returns_list,
-            baselines_list,
-            lgprobs_list,
-        ) = self._preprocess_rollouts(rollout_buffers)
+        data = self._preprocess_rollouts(rollout_buffers)
 
-        returns = np.array(list(chain(*returns_list)))
-        baselines = np.concatenate(baselines_list)
+        returns = np.array(list(chain(*data["returns_list"])))
+        baselines = np.concatenate(data["baselines_list"])
 
         dataset = RolloutDataset(
-            obsns=list(chain(*obsns_list)),
-            acts=torch.tensor(list(chain(*actions_list))),
-            advgs=torch.from_numpy(returns - baselines).float(),
-            lgprobs=torch.tensor(list(chain(*lgprobs_list))),
+            obsns=list(chain(*data["obsns_list"])),
+            acts=list(chain(*data["actions_list"])),
+            advgs=returns - baselines,
+            lgprobs=list(chain(*data["lgprobs_list"])),
         )
 
         dataloader = DataLoader(
             dataset,
             batch_size=len(dataset) // self.num_batches + 1,
             shuffle=True,
-            collate_fn=collate_fn,
+            collate_fn=lambda batch: zip(*batch),
         )
 
         return self._train(dataloader)
@@ -85,26 +81,20 @@ class PPO(Trainer):
                 break
 
             for obsns, actions, advgs, old_lgprobs in dataloader:
-                (
-                    total_loss,
-                    policy_loss,
-                    entropy_loss,
-                    approx_kl_div,
-                ) = self._compute_loss(obsns, actions, advgs, old_lgprobs)
+                loss, info = self._compute_loss(obsns, actions, advgs, old_lgprobs)
 
-                policy_losses += [policy_loss]
-                entropy_losses += [entropy_loss]
-                approx_kl_divs.append(approx_kl_div)
+                kl = info["approx_kl_div"]
 
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    print(
-                        f"Early stopping due to reaching max kl: "
-                        f"{approx_kl_div:.3f}"
-                    )
+                policy_losses += [info["policy_loss"]]
+                entropy_losses += [info["entropy_loss"]]
+                approx_kl_divs.append(kl)
+
+                if self.target_kl is not None and kl > 1.5 * self.target_kl:
+                    print(f"Early stopping due to reaching max kl: " f"{kl:.3f}")
                     continue_training = False
                     break
 
-                self.agent.update_parameters(total_loss)
+                self.scheduler.update_parameters(loss)
 
         return {
             "policy loss": np.abs(np.mean(policy_losses)),
@@ -112,12 +102,20 @@ class PPO(Trainer):
             "approx kl div": np.abs(np.mean(approx_kl_divs)),
         }
 
-    def _compute_loss(self, obsns, acts, advgs, old_lgprobs):
+    def _compute_loss(
+        self,
+        obsns: Iterable[dict],
+        acts: Iterable[tuple],
+        advantages: Iterable[SupportsFloat],
+        old_lgprobs: Iterable[SupportsFloat],
+    ) -> tuple[Tensor, dict[str, SupportsFloat]]:
         """CLIP loss"""
-        lgprobs, entropies = self.agent.evaluate_actions(obsns, acts)
+        eval_res = self.scheduler.evaluate_actions(obsns, acts)
 
+        advgs = torch.tensor(advantages).float()
         advgs = (advgs - advgs.mean()) / (advgs.std() + EPS)
-        log_ratio = lgprobs - old_lgprobs
+
+        log_ratio = eval_res["lgprobs"] - torch.tensor(old_lgprobs)
         ratio = log_ratio.exp()
 
         policy_loss1 = advgs * ratio
@@ -126,11 +124,15 @@ class PPO(Trainer):
         )
         policy_loss = -torch.min(policy_loss1, policy_loss2).mean()
 
-        entropy_loss = -entropies.mean()
+        entropy_loss = -eval_res["entropies"].mean()
 
         loss = policy_loss + self.entropy_coeff * entropy_loss
 
         with torch.no_grad():
             approx_kl_div = ((ratio - 1) - log_ratio).mean().item()
 
-        return loss, policy_loss.item(), entropy_loss.item(), approx_kl_div
+        return loss, {
+            "policy_loss": policy_loss.item(),
+            "entropy_loss": entropy_loss.item(),
+            "approx_kl_div": approx_kl_div,
+        }

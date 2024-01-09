@@ -8,12 +8,7 @@ import gymnasium as gym
 import pathlib
 
 from cfg_loader import load
-from spark_sched_sim.schedulers import (
-    RoundRobinScheduler,
-    NeuralScheduler,
-    make_scheduler,
-)
-from spark_sched_sim.wrappers import NeuralActWrapper
+from schedulers import RoundRobinScheduler, make_scheduler
 from spark_sched_sim import metrics
 
 
@@ -88,18 +83,15 @@ def decima_example():
 
 def run_episode(env_cfg, scheduler, seed=1234):
     env = gym.make("spark_sched_sim:SparkSchedSimEnv-v0", env_cfg=env_cfg)
-    if isinstance(scheduler, NeuralScheduler):
-        env = NeuralActWrapper(env)
-        env = scheduler.obs_wrapper_cls(env)
+
+    if scheduler.env_wrapper_cls:
+        env = scheduler.env_wrapper_cls(env)
 
     obs, _ = env.reset(seed=seed, options=None)
     terminated = truncated = False
 
     while not (terminated or truncated):
-        if isinstance(scheduler, NeuralScheduler):
-            action, *_ = scheduler(obs)
-        else:
-            action = scheduler(obs)
+        action, _ = scheduler.schedule(obs)
         obs, _, terminated, truncated, _ = env.step(action)
 
     avg_job_duration = metrics.avg_job_duration(env) * 1e-3

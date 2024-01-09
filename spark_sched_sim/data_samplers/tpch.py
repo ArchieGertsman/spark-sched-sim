@@ -7,7 +7,7 @@ from urllib.request import urlopen
 import numpy as np
 import networkx as nx
 
-from .base_data_sampler import BaseDataSampler
+from .data_sampler import DataSampler
 from ..components import Job, Stage
 
 TPCH_URL = "https://bit.ly/3F1Go8t"
@@ -15,7 +15,7 @@ QUERY_SIZES = ["2g", "5g", "10g", "20g", "50g", "80g", "100g"]
 NUM_QUERIES = 22
 
 
-class TPCHDataSampler(BaseDataSampler):
+class TPCHDataSampler(DataSampler):
     def __init__(
         self,
         job_arrival_rate: float,
@@ -48,7 +48,7 @@ class TPCHDataSampler(BaseDataSampler):
         if not osp.isdir("data/tpch"):
             self._download_tpch_dataset()
 
-    def reset(self, np_random: np.random.RandomState):
+    def reset(self, np_random: np.random.Generator):
         self.np_random = np_random
 
     def job_sequence(self, max_time):

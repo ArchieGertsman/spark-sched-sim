@@ -1,19 +1,17 @@
-from typing import Optional, List
-
 from .task import Task
 
 
 class Executor:
-    def __init__(self, id_: int):
+    def __init__(self, id_: int) -> None:
         # index of this operation within its operation
         self.id_ = id_
 
         # task that this executor is or just finished executing,
         # or `None` if the executor is idle
-        self.task: Optional[Task] = None
+        self.task: Task | None = None
 
         # id of current job that this executor is local to, if any
-        self.job_id: Optional[int] = None
+        self.job_id: int | None = None
 
         # whether or not this executing is executing a task.
         # NOTE: can be `False` while `self.task is not None`,
@@ -24,16 +22,16 @@ class Executor:
         # was released from job with id `job_id`, or `None` if it has not been released
         # yet. `job_id` is -1 if the executor is at the general pool.
         # NOTE: only used for rendering
-        self.history: List[list] = [[None, -1]]
+        self.history: list[list] = [[None, -1]]
 
     @property
-    def is_idle(self):
+    def is_idle(self) -> bool:
         return self.task is None
 
-    def is_at_job(self, job_id):
+    def is_at_job(self, job_id: int) -> bool:
         return self.job_id == job_id
 
-    def add_history(self, wall_time, job_id):
+    def add_history(self, wall_time: float, job_id: int) -> None:
         """should be called whenever this executor is released from a job"""
         if self.history is None:
             self.history = []

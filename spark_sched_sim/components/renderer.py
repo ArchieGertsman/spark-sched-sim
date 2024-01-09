@@ -12,7 +12,7 @@ class Renderer:
     def __init__(
         self,
         num_workers: int,
-        num_total_jobs: int,
+        num_total_jobs: int | None = None,
         window_width: int = 400,
         window_height: int = 300,
         font_name: str = "couriernew",
@@ -28,8 +28,19 @@ class Renderer:
         self.render_fps = render_fps
 
         self.WORKER_RECT_H = np.ceil(self.window_height / self.num_workers)
-        self.window = None
-        self.clock = None
+        self.clock = pygame.time.Clock()
+
+    @property
+    def window(self) -> pygame.Surface:
+        """lazy-init the window"""
+        if not getattr(self, "_window", None):
+            pygame.init()
+            pygame.display.init()
+            self._window = pygame.display.set_mode(
+                (self.window_width, self.window_height)
+            )
+            self.font = pygame.font.SysFont(self.font_name, self.font_size)
+        return self._window
 
     def render_frame(
         self,
@@ -40,16 +51,7 @@ class Renderer:
         num_active_jobs: int,
         num_jobs_completed: int,
     ) -> None:
-        if self.window is None:
-            pygame.init()
-            pygame.display.init()
-            self.window = pygame.display.set_mode(
-                (self.window_width, self.window_height)
-            )
-            self.font = pygame.font.SysFont(self.font_name, self.font_size)
-
-        if self.clock is None:
-            self.clock = pygame.time.Clock()
+        assert self.num_total_jobs
 
         # draw canvas
         canvas = pygame.Surface((self.window_width, self.window_height))

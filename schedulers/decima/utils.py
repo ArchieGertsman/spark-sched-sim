@@ -1,14 +1,70 @@
-from gymnasium.core import ObsType
+from collections.abc import Iterable
+from typing import Any
+from torch import Tensor
+from numpy import ndarray
 
-import numpy as np
+import random
+
 import torch
-from torch_geometric.data import Batch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric as pyg
 from torch_sparse import SparseTensor
 from torch_scatter import segment_csr
 import networkx as nx
+from torch.distributions.utils import clamp_probs
+import numpy as np
 
 
-def make_adj(edge_index, num_nodes):
+def sample(logits: Tensor) -> tuple[int, float]:
+    pi = F.softmax(logits, 0).numpy()
+    idx = random.choices(np.arange(pi.size), pi)[0]
+    lgprob = np.log(pi[idx])
+    return idx, lgprob
+
+
+def evaluate(
+    scores: Tensor, counts: Tensor, selections: Tensor
+) -> tuple[Tensor, Tensor]:
+    """
+    scores: scores that the model assigned to each action at each step
+    counts: count of available actions at each step
+    selections: actions that the scheduler sampled at each step
+    """
+    ptr = counts.cumsum(0)
+    ptr = torch.cat([torch.tensor([0]), ptr], 0)
+    selections += ptr[:-1]
+    probs = pyg.utils.softmax(scores, ptr=ptr)
+    probs = clamp_probs(probs)
+    log_probs = probs.log()
+    selection_log_probs = log_probs[selections]
+    entropies = -segment_csr(log_probs * probs, ptr)
+    return selection_log_probs, entropies
+
+
+def make_mlp(
+    input_dim: int,
+    hid_dims: list[int],
+    output_dim: int,
+    act_cls: str,
+    act_kwargs: dict[str, Any] | None = None,
+) -> nn.Module:
+    act_clss = getattr(torch.nn.modules.activation, act_cls)
+
+    mlp = nn.Sequential()
+    prev_dim = input_dim
+    hid_dims = hid_dims + [output_dim]
+    for i, dim in enumerate(hid_dims):
+        mlp.append(nn.Linear(prev_dim, dim))
+        if i == len(hid_dims) - 1:
+            break
+        act_fn = act_clss(**(act_kwargs or {}))
+        mlp.append(act_fn)
+        prev_dim = dim
+    return mlp
+
+
+def make_adj(edge_index: Tensor, num_nodes: int) -> SparseTensor:
     """returns a sparse COO adjacency matrix"""
     return SparseTensor(
         row=edge_index[0],
@@ -19,48 +75,24 @@ def make_adj(edge_index, num_nodes):
     )
 
 
-def make_edge_mask(edge_links, node_mask):
-    return node_mask[edge_links[:, 0]] & node_mask[edge_links[:, 1]]
-
-
-def subgraph(edge_links, node_mask):
-    """
-    Minimal numpy version of PyG's subgraph utility function
-    Args:
-        edge_links: array of edges of shape (num_edges, 2),
-            following the convention of gymnasium Graph space
-        node_mask: indicates which nodes should be used for
-            inducing the subgraph
-    """
-    edge_mask = make_edge_mask(edge_links, node_mask)
-    edge_links = edge_links[edge_mask]
-
-    # relabel the nodes
-    node_idx = np.zeros(node_mask.size, dtype=int)
-    node_idx[node_mask] = np.arange(node_mask.sum())
-    edge_links = node_idx[edge_links]
-
-    return edge_links
-
-
 def ptr_to_counts(ptr):
     return ptr[1:] - ptr[:-1]
 
 
-def counts_to_ptr(x):
+def counts_to_ptr(x: Tensor) -> Tensor:
     ptr = x.cumsum(0)
     ptr = torch.cat([torch.tensor([0]), ptr], 0)
     return ptr
 
 
-def obs_to_pyg(obs: ObsType) -> Batch:
+def obs_to_pyg(obs: dict[str, Any]) -> pyg.data.Batch:
     """converts an env observation into a PyG `Batch` object"""
     obs_dag_batch = obs["dag_batch"]
     ptr = np.array(obs["dag_ptr"])
     num_nodes_per_dag = ptr_to_counts(ptr)
     num_active_jobs = len(num_nodes_per_dag)
 
-    dag_batch = Batch(
+    dag_batch = pyg.data.Batch(
         x=torch.from_numpy(obs_dag_batch.nodes),
         edge_index=torch.from_numpy(obs_dag_batch.edge_links.T),
         ptr=torch.from_numpy(ptr),
@@ -70,7 +102,7 @@ def obs_to_pyg(obs: ObsType) -> Batch:
         _num_graphs=num_active_jobs,
     )
 
-    dag_batch["stage_mask"] = torch.tensor(obs["stage_mask"], dtype=bool)
+    dag_batch["stage_mask"] = torch.tensor(obs["stage_mask"], dtype=torch.bool)
     dag_batch["exec_mask"] = torch.from_numpy(obs["exec_mask"])
     dag_batch["num_nodes_per_dag"] = ptr_to_counts(dag_batch.ptr)
 
@@ -83,7 +115,7 @@ def obs_to_pyg(obs: ObsType) -> Batch:
     return dag_batch
 
 
-def collate_obsns(obsns: list[ObsType]):
+def collate_obsns(obsns: Iterable[dict[str, Any]]) -> pyg.data.Batch:
     keys = ["dag_batch", "dag_ptr", "stage_mask", "exec_mask"]
     dag_batches, dag_ptrs, stage_masks, exec_masks = zip(
         *([obs[key] for key in keys] for obs in obsns)
@@ -101,12 +133,12 @@ def collate_obsns(obsns: list[ObsType]):
     # number of available exec actions at each step
     dag_batch["num_exec_acts"] = dag_batch["exec_mask"].sum(-1)
 
-    if "edge_masks" in obsns[0]:
+    if "edge_masks" in next(iter(obsns)):
         edge_masks_list = [obs["edge_masks"] for obs in obsns]
         total_num_edges = dag_batch.edge_index.shape[1]
         dag_batch["edge_masks"] = collate_edge_masks(edge_masks_list, total_num_edges)
 
-    if "node_depth" in obsns[0]:
+    if "node_depth" in next(iter(obsns)):
         node_depth_list = [obs["node_depth"] for obs in obsns]
         dag_batch["node_depth"] = torch.from_numpy(
             np.concatenate(node_depth_list)
@@ -115,7 +147,9 @@ def collate_obsns(obsns: list[ObsType]):
     return dag_batch
 
 
-def collate_edge_masks(edge_masks_list, total_num_edges):
+def collate_edge_masks(
+    edge_masks_list: Iterable[ndarray], total_num_edges: int
+) -> ndarray:
     """collates list of edge mask batches from each message passing path. Since the
     message passing depth varies between observations, edge mask batches are padded
     to the maximum depth."""
@@ -135,23 +169,25 @@ def collate_edge_masks(edge_masks_list, total_num_edges):
     return edge_masks
 
 
-def collate_dag_batches(dag_batches, dag_ptrs) -> Batch:
+def collate_dag_batches(
+    dag_batches: Iterable[pyg.data.Batch], dag_ptrs: Iterable[ndarray]
+) -> pyg.data.Batch:
     """collates the dag batches from each observation into one large dag batch"""
-    num_dags_per_obs, num_nodes_per_dag = zip(
+    num_dags_per_obs_tup, num_nodes_per_dag_tup = zip(
         *(
             (len(dag_ptr) - 1, ptr_to_counts(torch.tensor(dag_ptr)))
             for dag_ptr in dag_ptrs
         )
     )
-    num_dags_per_obs = torch.tensor(num_dags_per_obs)
-    num_nodes_per_dag = torch.cat(num_nodes_per_dag)
+    num_dags_per_obs = torch.tensor(num_dags_per_obs_tup)
+    num_nodes_per_dag = torch.cat(num_nodes_per_dag_tup)
     obs_ptr = counts_to_ptr(num_dags_per_obs)
     num_nodes_per_obs = segment_csr(num_nodes_per_dag, obs_ptr)
-    num_graphs = num_dags_per_obs.sum()
+    num_graphs = num_dags_per_obs.sum().item()
 
     x = torch.from_numpy(np.concatenate([dag_batch.nodes for dag_batch in dag_batches]))
 
-    dag_batch = Batch(
+    dag_batch = pyg.data.Batch(
         x=x,
         edge_index=collate_edges(dag_batches, num_nodes_per_obs),
         ptr=counts_to_ptr(num_nodes_per_dag),
@@ -170,15 +206,17 @@ def collate_dag_batches(dag_batches, dag_ptrs) -> Batch:
     return dag_batch
 
 
-def collate_edges(dag_batches, num_nodes_per_obs):
-    edge_counts, edge_links_list = zip(
+def collate_edges(
+    dag_batches: Iterable[pyg.data.Batch], num_nodes_per_obs: Tensor
+) -> Tensor:
+    edge_counts_tup, edge_links_tup = zip(
         *(
             (dag_batch.edge_links.shape[0], dag_batch.edge_links)
             for dag_batch in dag_batches
         )
     )
-    edge_counts = torch.tensor(edge_counts)
-    edge_links = np.concatenate(edge_links_list)
+    edge_counts = torch.tensor(edge_counts_tup)
+    edge_links = np.concatenate(edge_links_tup)
 
     edge_index = torch.from_numpy(edge_links.T)
 
@@ -193,13 +231,21 @@ def collate_edges(dag_batches, num_nodes_per_obs):
     return edge_index
 
 
-def make_dag_layer_edge_masks(G=None, edge_links=None, num_nodes=None):
+def make_edge_mask(edge_links: ndarray, node_mask: ndarray) -> ndarray:
+    return node_mask[edge_links[:, 0]] & node_mask[edge_links[:, 1]]
+
+
+def make_dag_layer_edge_masks(
+    graph_or_data: nx.DiGraph | tuple[ndarray, int]
+) -> ndarray:
     """returns a batch of edge masks of shape (msg passing depth, num edges),
     where the i'th mask indicates which edges participate in the i'th root-to-leaf
     message passing step.
     """
-    if not G:
-        assert edge_links is not None and num_nodes is not None
+    if isinstance(graph_or_data, nx.DiGraph):
+        G = graph_or_data
+    else:
+        edge_links, num_nodes = graph_or_data
         G = np_to_nx(edge_links, num_nodes)
 
     node_levels = list(nx.topological_generations(G))
@@ -221,43 +267,7 @@ def make_dag_layer_edge_masks(G=None, edge_links=None, num_nodes=None):
     return np.stack(edge_masks)
 
 
-def transitive_closure(
-    G=None,
-    edge_links=None,
-    num_nodes=None,
-    bidirectional=True,
-):
-    if not G:
-        assert edge_links is not None and edge_links.shape[0] > 0
-        assert num_nodes is not None
-        G = np_to_nx(edge_links, num_nodes)
-
-    G_tc = nx.transitive_closure_dag(G)
-    edge_links_tc = np.array(G_tc.edges)
-
-    if bidirectional:
-        edge_links_tc_reverse = edge_links_tc[:, [1, 0]]
-        return np.concatenate([edge_links_tc, edge_links_tc_reverse])
-    else:
-        return edge_links_tc
-
-
-def node_depth(G=None, edge_links=None, num_nodes=None):
-    if not G:
-        assert edge_links is not None and edge_links.shape[0] > 0
-        assert num_nodes is not None
-        G = np_to_nx(edge_links, num_nodes)
-
-    depth = np.zeros(len(G))
-
-    for d, topo_gen in enumerate(nx.topological_generations(G)):
-        for u in topo_gen:
-            depth[u] = d
-
-    return depth
-
-
-def np_to_nx(edge_links, num_nodes):
+def np_to_nx(edge_links: ndarray, num_nodes: int) -> nx.DiGraph:
     G = nx.DiGraph()
     G.add_nodes_from(range(num_nodes))
     G.add_edges_from(edge_links)

@@ -1,7 +1,8 @@
-__all__ = ["TPCHDataSampler", "make_data_sampler"]
+__all__ = ["DataSampler", "TPCHDataSampler", "make_data_sampler"]
 
 from copy import deepcopy
 
+from .data_sampler import DataSampler
 from .tpch import TPCHDataSampler
 
 

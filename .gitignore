@@ -8,5 +8,4 @@ artifacts/
 data/
 count_params.py
 eval*
-config/test.yaml
 test/old_test.py

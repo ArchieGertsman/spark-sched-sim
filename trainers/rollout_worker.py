@@ -1,58 +1,66 @@
+from typing import Any, SupportsFloat
+from multiprocessing.synchronize import Lock
+from multiprocessing.connection import Connection
 import sys
 from abc import ABC, abstractmethod
 import os.path as osp
 import random
 
 import gymnasium as gym
-from gymnasium.core import ObsType, ActType
 import torch
 
-from spark_sched_sim.wrappers import NeuralActWrapper, StochasticTimeLimit
-from spark_sched_sim.schedulers import make_scheduler
+from spark_sched_sim.wrappers import StochasticTimeLimit
+from schedulers import make_scheduler
 from .utils import Profiler  # , HiddenPrints
 from spark_sched_sim.metrics import avg_num_jobs
 
 
 class RolloutBuffer:
-    def __init__(self, async_rollouts=False):
-        self.obsns: list[ObsType] = []
+    def __init__(self, async_rollouts: bool = False) -> None:
+        self.obsns: list[dict] = []
         self.wall_times: list[float] = []
-        self.actions: list[ActType] = []
+        self.actions: list[tuple] = []
         self.lgprobs: list[float] = []
-        self.rewards: list[float] = []
-        self.resets = set() if async_rollouts else None
+        self.rewards: list[SupportsFloat] = []
+        self.resets: set[int] | None = set() if async_rollouts else None
 
-    def add(self, obs, wall_time, action, lgprob, reward):
+    def add(
+        self,
+        obs: dict,
+        wall_time: float,
+        action: tuple,
+        lgprob: float,
+        reward: SupportsFloat,
+    ) -> None:
         self.obsns += [obs]
         self.wall_times += [wall_time]
         self.actions += [action]
         self.rewards += [reward]
         self.lgprobs += [lgprob]
 
-    def add_reset(self, step):
+    def add_reset(self, step: int) -> None:
         assert self.resets is not None, "resets are for async rollouts only."
         self.resets.add(step)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.obsns)
 
 
 class RolloutWorker(ABC):
-    def __init__(self):
+    def __init__(self) -> None:
         self.reset_count = 0
 
     def __call__(
         self,
-        rank,
-        conn,
-        agent_cls,
-        env_cfg,
-        agent_kwargs,
-        stdout_dir,
-        base_seed,
-        seed_step,
-        lock,
-    ):
+        rank: int,
+        conn: Connection,
+        env_cfg: dict[str, Any],
+        scheduler_kwargs: dict[str, Any],
+        stdout_dir: str,
+        base_seed: int,
+        seed_step: int,
+        lock: Lock,
+    ) -> None:
         self.rank = rank
         self.conn = conn
         self.base_seed = base_seed
@@ -62,8 +70,8 @@ class RolloutWorker(ABC):
         # log each of the processes to separate files
         sys.stdout = open(osp.join(stdout_dir, f"{rank}.out"), "a")
 
-        self.agent = make_scheduler(agent_kwargs)
-        self.agent.actor.eval()
+        self.scheduler = make_scheduler(scheduler_kwargs)
+        self.scheduler.eval()
 
         # might need to download dataset, and only one process should do this.
         # this can be achieved using a lock, such that the first process to
@@ -73,8 +81,7 @@ class RolloutWorker(ABC):
             env = gym.make("spark_sched_sim:SparkSchedSimEnv-v0", env_cfg=env_cfg)
 
         env = StochasticTimeLimit(env, env_cfg["mean_time_limit"])
-        env = NeuralActWrapper(env)
-        env = self.agent.obs_wrapper_cls(env)
+        env = self.scheduler.env_wrapper_cls(env)
         self.env = env
 
         # IMPORTANT! Each worker needs to produce unique rollouts, which are
@@ -87,10 +94,10 @@ class RolloutWorker(ABC):
 
         self.run()
 
-    def run(self):
+    def run(self) -> None:
         while data := self.conn.recv():
             # load updated model parameters
-            self.agent.actor.load_state_dict(data["actor_sd"])
+            self.scheduler.load_state_dict(data["state_dict"])
 
             try:
                 with Profiler(100):  # , HiddenPrints():
@@ -100,19 +107,19 @@ class RolloutWorker(ABC):
                     {"rollout_buffer": rollout_buffer, "stats": self.collect_stats()}
                 )
 
-            except AssertionError as msg:
-                print(msg, "\naborting rollout.", flush=True)
-                self.conn.send(None)
+            except Exception as e:
+                print(repr(e), "\nAborting rollout.", flush=True)
+                self.conn.send(e)
 
     @abstractmethod
     def collect_rollout(self) -> RolloutBuffer:
         pass
 
     @property
-    def seed(self):
+    def seed(self) -> int:
         return self.base_seed + self.seed_step * self.reset_count
 
-    def collect_stats(self):
+    def collect_stats(self) -> dict[str, Any]:
         return {
             "avg_job_duration": self.env.unwrapped.avg_job_duration,
             "avg_num_jobs": avg_num_jobs(self.env),
@@ -125,7 +132,7 @@ class RolloutWorker(ABC):
 class RolloutWorkerSync(RolloutWorker):
     """model updates are synchronized with environment resets"""
 
-    def collect_rollout(self):
+    def collect_rollout(self) -> RolloutBuffer:
         rollout_buffer = RolloutBuffer()
 
         obs, _ = self.env.reset(seed=self.seed)
@@ -134,12 +141,13 @@ class RolloutWorkerSync(RolloutWorker):
         wall_time = 0
         terminated = truncated = False
         while not (terminated or truncated):
-            action, lgprob = self.agent(obs)
+            action, info = self.scheduler.schedule(obs)
+            lgprob = info["lgprob"]
 
             new_obs, reward, terminated, truncated, info = self.env.step(action)
             next_wall_time = info["wall_time"]
 
-            rollout_buffer.add(obs, wall_time, list(action.values()), lgprob, reward)
+            rollout_buffer.add(obs, wall_time, tuple(action.values()), lgprob, reward)
 
             obs = new_obs
             wall_time = next_wall_time
@@ -154,13 +162,13 @@ class RolloutWorkerAsync(RolloutWorker):
     environment resets
     """
 
-    def __init__(self, rollout_duration):
+    def __init__(self, rollout_duration: float) -> None:
         super().__init__()
         self.rollout_duration = rollout_duration
         self.next_obs = None
         self.next_wall_time = 0.0
 
-    def collect_rollout(self):
+    def collect_rollout(self) -> RolloutBuffer:
         rollout_buffer = RolloutBuffer(async_rollouts=True)
 
         if self.reset_count == 0:
@@ -172,12 +180,14 @@ class RolloutWorkerAsync(RolloutWorker):
         while elapsed_time < self.rollout_duration:
             obs, wall_time = self.next_obs, self.next_wall_time
 
-            action, lgprob = self.agent(obs)
+            action, info = self.scheduler.schedule(obs)
+            lgprob = info["lgprob"]
 
             self.next_obs, reward, terminated, truncated, info = self.env.step(action)
 
             self.next_wall_time = info["wall_time"]
 
+            assert obs
             rollout_buffer.add(obs, elapsed_time, list(action.values()), lgprob, reward)
 
             # add the duration of the this step to the total
